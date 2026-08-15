@@ -1,0 +1,9 @@
+# Rust build output
+/target
+
+# Raw generated art (16 MB, regenerable via codex imagegen + `cargo run --bin prep_art`).
+# The processed art that the game actually loads lives in assets/art and IS committed.
+/art_raw
+
+# Dev screenshots / scratch
+*.png.tmp

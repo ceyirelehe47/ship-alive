@@ -1,0 +1,16 @@
+[package]
+name = "ship_alive"
+version = "0.1.0"
+edition = "2021"
+default-run = "ship_alive"
+
+[dependencies]
+bevy = "0.16"
+# Used by the `prep_art` tool for background removal / crop / resize of generated art.
+image = "0.25"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

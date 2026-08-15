@@ -9,7 +9,7 @@
 
 use crate::crew::{Crew, CrewTask, HaulPhase, Movement};
 use crate::input::Selection;
-use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil};
+use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::map::{ShipMap, TilePos};
 use crate::storage::StorageCell;
 use bevy::prelude::*;
@@ -41,6 +41,7 @@ pub struct HasVisual;
 #[derive(Resource)]
 pub struct Markers {
     pub selection: Entity,
+    pub hover: Entity,
     pub target: Entity,
     pub dots: Vec<Entity>,
 }
@@ -118,7 +119,7 @@ pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (spawn_tile_visuals, spawn_markers));
+        app.add_systems(Startup, (spawn_tile_visuals, spawn_room_labels, spawn_markers));
         app.add_systems(
             Update,
             (
@@ -150,6 +151,44 @@ pub fn spawn_tile_visuals(mut commands: Commands, map: Res<ShipMap>, art: Res<Ar
     }
 }
 
+/// Room name labels and a faint tint over the storage bay, so the ship layout
+/// reads at a glance without any tutorial.
+fn spawn_room_labels(mut commands: Commands) {
+    let rooms: [(&str, i32, i32, i32, i32); 6] = [
+        ("CARGO HOLD", 1, 1, 10, 5),
+        ("CREW QUARTERS", 12, 1, 21, 5),
+        ("ORE BAY", 23, 1, 34, 5),
+        ("PARTS ROOM", 1, 10, 10, 17),
+        ("HOLD B", 12, 10, 21, 17),
+        ("STORAGE", 23, 10, 34, 17),
+    ];
+    for (name, x0, y0, x1, y1) in rooms {
+        // Tile-rect → world rect.
+        let left = x0 as f32 * crate::TILE;
+        let right = (x1 + 1) as f32 * crate::TILE;
+        let top = -(y0 as f32) * crate::TILE;
+        let bottom = -((y1 + 1) as f32) * crate::TILE;
+        let center = Vec2::new((left + right) * 0.5, (top + bottom) * 0.5);
+        let size = Vec2::new(right - left, top - bottom);
+
+        if name == "STORAGE" {
+            commands.spawn((
+                Sprite::from_color(Color::srgba(1.0, 0.72, 0.25, 0.06), size),
+                Transform::from_translation(center.extend(0.01)),
+            ));
+        }
+        commands.spawn((
+            Text2d::new(name),
+            TextFont {
+                font_size: 13.0,
+                ..default()
+            },
+            TextColor(Color::srgba(0.62, 0.68, 0.78, 0.5)),
+            Transform::from_translation((center + Vec2::new(0.0, size.y * 0.5 - 14.0)).extend(0.02)),
+        ));
+    }
+}
+
 /// Marker pool for the current selection.
 pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
     let selection = commands
@@ -161,6 +200,18 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
                 ..default()
             },
             Transform::from_translation(Vec3::Z * 0.9),
+            Visibility::Hidden,
+        ))
+        .id();
+    let hover = commands
+        .spawn((
+            Sprite {
+                image: art.ring.clone(),
+                custom_size: Some(Vec2::splat(crate::TILE * 1.05)),
+                color: Color::srgba(0.9, 0.95, 1.0, 0.7),
+                ..default()
+            },
+            Transform::from_translation(Vec3::Z * 0.85),
             Visibility::Hidden,
         ))
         .id();
@@ -192,7 +243,7 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
                 .id()
         })
         .collect();
-    commands.insert_resource(Markers { selection, target, dots });
+    commands.insert_resource(Markers { selection, hover, target, dots });
 }
 
 /// Spawn visuals for logic entities that do not have them yet.
@@ -272,17 +323,19 @@ fn crew_world_pos(map: &ShipMap, pos: &TilePos, mov: &Movement) -> Vec2 {
 }
 
 /// Crew sprites interpolate between tiles; labels and carry icons follow.
+/// Idle crew are dimmed so working vs. standing-around reads at a glance.
 #[allow(clippy::type_complexity)]
 fn sync_crew_visuals_system(
     map: Res<ShipMap>,
     art: Res<Art>,
-    crews: Query<(Entity, &TilePos, &Movement)>,
+    crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &Movement)>,
     items: Query<(&CarriedBy, &Item)>,
     mut sprites: Query<(&Visual, &mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
     mut labels: Query<(&Visual, &mut Transform), With<Text2d>>,
 ) {
-    for (e, pos, mov) in crews.iter() {
+    for (e, crew, task, pos, mov) in crews.iter() {
         let p = crew_world_pos(&map, pos, mov);
+        let idle = matches!(task, CrewTask::Idle(_));
         for (v, mut tf) in labels.iter_mut() {
             if v.target != e {
                 continue;
@@ -296,7 +349,10 @@ fn sync_crew_visuals_system(
                 continue;
             }
             match v.role {
-                Role::CrewSprite => tf.translation = p.extend(0.6),
+                Role::CrewSprite => {
+                    tf.translation = p.extend(0.6);
+                    sprite.color = if idle { dimmed(crew.tint) } else { crew.tint };
+                }
                 Role::CrewCarry => {
                     let carried = items.iter().find(|(c, _)| c.0 == e).map(|(_, i)| i.kind);
                     if let Some(kind) = carried {
@@ -313,8 +369,16 @@ fn sync_crew_visuals_system(
     }
 }
 
-/// Item sprites sit on their tile; rings show marked/unreachable state;
-/// carried items disappear from the ground.
+/// Idle crews render at reduced brightness.
+fn dimmed(c: Color) -> Color {
+    let s = Srgba::from(c);
+    Color::srgba(s.red * 0.45, s.green * 0.45, s.blue * 0.45, 1.0)
+}
+
+/// Item sprites sit on their tile; rings show marked state (tinted with the
+/// claimer's color once a crew member has claimed the item, red while the
+/// claim system considers it unreachable); carried items disappear from the
+/// ground and ride along above their carrier.
 #[allow(clippy::type_complexity)]
 fn sync_item_visuals_system(
     map: Res<ShipMap>,
@@ -324,24 +388,26 @@ fn sync_item_visuals_system(
             Entity,
             &TilePos,
             Option<&MarkedForHaul>,
+            Option<&ReservedBy>,
             Option<&CarriedBy>,
             Option<&NoPathUntil>,
         ),
         With<Item>,
     >,
+    crews: Query<(Entity, &Crew)>,
     mut sprites: Query<(&Visual, &mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
 ) {
     let now = time.elapsed().as_secs_f64();
     // Stack offset so several items on one tile remain visible.
     let mut per_tile: std::collections::HashMap<TilePos, usize> = std::collections::HashMap::new();
-    for (_, pos, _, carried, _) in items.iter() {
+    for (_, pos, _, _, carried, _) in items.iter() {
         if carried.is_none() {
             *per_tile.entry(*pos).or_insert(0) += 1;
         }
     }
     let mut seen: std::collections::HashMap<TilePos, usize> = std::collections::HashMap::new();
 
-    for (e, pos, marked, carried, cooled) in items.iter() {
+    for (e, pos, marked, reserved, carried, cooled) in items.iter() {
         let carried_now = carried.is_some();
         let mut p = map.world_pos(*pos);
         if !carried_now && *per_tile.get(pos).unwrap_or(&1) > 1 {
@@ -351,6 +417,10 @@ fn sync_item_visuals_system(
         }
         let ring_color = if cooled.is_some_and(|c| c.0 > now) {
             Color::srgb(1.0, 0.3, 0.25)
+        } else if let Some(claimer_tint) = reserved.and_then(|r| {
+            crews.iter().find(|(ce, _)| *ce == r.0).map(|(_, c)| c.tint)
+        }) {
+            claimer_tint
         } else {
             Color::WHITE
         };
@@ -392,11 +462,12 @@ fn sync_rack_labels_system(
     }
 }
 
-/// Selection ring, path preview dots and job target marker.
+/// Selection ring, path preview dots, job target marker and hover ring.
 #[allow(clippy::type_complexity)]
 fn sync_selection_system(
     map: Res<ShipMap>,
     selection: Res<Selection>,
+    hovered: Res<crate::input::Hovered>,
     markers: Res<Markers>,
     crews: Query<(Entity, &TilePos, &Movement, &CrewTask), With<Crew>>,
     items: Query<&TilePos, With<Item>>,
@@ -405,11 +476,29 @@ fn sync_selection_system(
 ) {
     // Hide everything first.
     for e in std::iter::once(markers.selection)
+        .chain(std::iter::once(markers.hover))
         .chain(std::iter::once(markers.target))
         .chain(markers.dots.iter().copied())
     {
         if let Ok((_, mut vis)) = marker_q.get_mut(e) {
             *vis = Visibility::Hidden;
+        }
+    }
+
+    // Hover ring (white, softer than the selection ring).
+    let hover_pos = match hovered.0 {
+        Some(crate::input::Selected::Crew(e)) => crews
+            .get(e)
+            .ok()
+            .map(|(_, pos, mov, _)| crew_world_pos(&map, pos, mov)),
+        Some(crate::input::Selected::Item(e)) => items.get(e).ok().map(|p| map.world_pos(*p)),
+        Some(crate::input::Selected::Rack(e)) => racks.get(e).ok().map(|(_, p)| map.world_pos(*p)),
+        None => None,
+    };
+    if let Some(p) = hover_pos {
+        if let Ok((mut tf, mut vis)) = marker_q.get_mut(markers.hover) {
+            tf.translation = p.extend(0.85);
+            *vis = Visibility::Visible;
         }
     }
 

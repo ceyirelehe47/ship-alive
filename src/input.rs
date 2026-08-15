@@ -1,14 +1,16 @@
-//! Mouse/keyboard input: selection, camera control and hotkeys.
+//! Mouse/keyboard input: selection, box-select marking, camera control,
+//! hotkeys and hover detection.
 //!
-//! World picking is done by mapping the cursor to a tile and asking the
-//! queries who stands there (priority: crew > item > rack). Clicks that land
-//! on UI panels are ignored — any `Interaction` in hover state marks the
-//! pointer as being over UI.
+//! World picking maps the cursor to a tile and asks the queries who stands
+//! there (priority: crew > item > rack). Left click selects; dragging on the
+//! map draws a box that marks every item inside for hauling on release.
+//! Right-drag pans the camera. Pointer positions over UI panels are ignored —
+//! any `Interaction` in hover state marks the pointer as being over UI.
 
 use crate::jobs::Action;
 use crate::map::{ShipMap, TilePos};
-use bevy::prelude::*;
 use bevy::input::mouse::MouseWheel;
+use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 #[derive(Clone, Copy, Debug)]
@@ -21,26 +23,78 @@ pub enum Selected {
 #[derive(Resource, Default, Debug)]
 pub struct Selection(pub Option<Selected>);
 
+/// What the cursor currently hovers over (None over empty floor or UI).
+#[derive(Resource, Default, Debug)]
+pub struct Hovered(pub Option<Selected>);
+
+/// Screen-space anchor of an in-progress left-drag box select.
+#[derive(Resource, Default, Debug)]
+pub struct BoxSelect {
+    pub anchor: Option<Vec2>,
+    pub current: Vec2,
+    pub over_ui_at_press: bool,
+}
+
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<Selection>();
+        app.init_resource::<Hovered>();
+        app.init_resource::<BoxSelect>();
         app.add_systems(
             Update,
-            (click_select_system, action_keys_system, camera_control_system)
+            (
+                select_and_box_system,
+                hover_system,
+                action_keys_system,
+                camera_control_system,
+            )
                 .in_set(crate::Set::Input),
         );
     }
 }
 
 fn pointer_over_ui(ui: &Query<&Interaction, With<Node>>) -> bool {
-    ui.iter().any(|i| matches!(i, Interaction::Hovered | Interaction::Pressed))
+    ui.iter()
+        .any(|i| matches!(i, Interaction::Hovered | Interaction::Pressed))
 }
 
+/// Shared cursor→target picking (priority: crew > item > rack).
+#[allow(clippy::type_complexity)]
+fn pick_at_cursor(
+    window: &Window,
+    camera: &Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    map: &ShipMap,
+    crews: &Query<(Entity, &TilePos), With<crate::crew::Crew>>,
+    items: &Query<(Entity, &TilePos), With<crate::items::Item>>,
+    racks: &Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
+) -> Option<(Selected, Vec2)> {
+    let cursor = window.cursor_position()?;
+    let Ok((cam, cam_gt)) = camera.single() else {
+        return None;
+    };
+    let world = cam.viewport_to_world_2d(cam_gt, cursor).ok()?;
+    let Some(tile) = map.tile_at_world(world) else {
+        return None;
+    };
+    let target = if let Some((e, _)) = crews.iter().find(|(_, p)| **p == tile) {
+        Some(Selected::Crew(e))
+    } else if let Some((e, _)) = items.iter().find(|(_, p)| **p == tile) {
+        Some(Selected::Item(e))
+    } else if let Some((e, _)) = racks.iter().find(|(_, p)| **p == tile) {
+        Some(Selected::Rack(e))
+    } else {
+        None
+    };
+    target.map(|t| (t, world))
+}
+
+/// Left click selects a target; dragging further than a few pixels turns into
+/// a box select that marks all items inside the rectangle for hauling.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
-fn click_select_system(
+fn select_and_box_system(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -50,40 +104,80 @@ fn click_select_system(
     items: Query<(Entity, &TilePos), With<crate::items::Item>>,
     racks: Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
     mut selection: ResMut<Selection>,
+    mut box_select: ResMut<BoxSelect>,
+    mut actions: EventWriter<Action>,
 ) {
     let Ok(window) = windows.single() else {
         return;
     };
-    let Some(cursor) = window.cursor_position() else {
-        return;
-    };
-    if !buttons.just_pressed(MouseButton::Left) || pointer_over_ui(&ui) {
-        return;
+    if buttons.just_pressed(MouseButton::Left) {
+        box_select.anchor = window.cursor_position();
+        box_select.over_ui_at_press = pointer_over_ui(&ui);
+        box_select.current = box_select.anchor.unwrap_or_default();
     }
-    let Ok((cam, cam_gt)) = camera.single() else {
-        return;
-    };
-    let Some(world) = cam.viewport_to_world_2d(cam_gt, cursor).ok() else {
-        return;
-    };
-    let Some(tile) = map.tile_at_world(world) else {
-        selection.0 = None;
-        return;
-    };
 
-    if let Some((e, _)) = crews.iter().find(|(_, p)| **p == tile) {
-        selection.0 = Some(Selected::Crew(e));
-    } else if let Some((e, _)) = items.iter().find(|(_, p)| **p == tile) {
-        selection.0 = Some(Selected::Item(e));
-    } else if let Some((e, _)) = racks.iter().find(|(_, p)| **p == tile) {
-        selection.0 = Some(Selected::Rack(e));
-    } else {
-        selection.0 = None;
+    if let Some(anchor) = box_select.anchor {
+        if let Some(cursor) = window.cursor_position() {
+            box_select.current = cursor;
+        }
+        if buttons.just_released(MouseButton::Left) {
+            let dist = box_select.current.distance(anchor);
+            if !box_select.over_ui_at_press && dist > 10.0 {
+                // Box select: mark items between the two world-space corners.
+                let Ok((cam, cam_gt)) = camera.single() else {
+                    box_select.anchor = None;
+                    return;
+                };
+                if let (Ok(from), Ok(to)) = (
+                    cam.viewport_to_world_2d(cam_gt, anchor),
+                    cam.viewport_to_world_2d(cam_gt, box_select.current),
+                ) {
+                    actions.write(Action::MarkArea { from, to });
+                }
+            } else if !box_select.over_ui_at_press && dist <= 10.0 {
+                // Plain click: select (or deselect on empty ground).
+                if let Some((target, _)) =
+                    pick_at_cursor(window, &camera, &map, &crews, &items, &racks)
+                {
+                    selection.0 = Some(target);
+                } else {
+                    selection.0 = None;
+                }
+            }
+            box_select.anchor = None;
+        }
     }
+}
+
+/// Track what the cursor hovers over (drives the hover ring and tooltip).
+#[allow(clippy::type_complexity)]
+fn hover_system(
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    ui: Query<&Interaction, With<Node>>,
+    map: Res<ShipMap>,
+    crews: Query<(Entity, &TilePos), With<crate::crew::Crew>>,
+    items: Query<(Entity, &TilePos), With<crate::items::Item>>,
+    racks: Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
+    mut hovered: ResMut<Hovered>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    if window.cursor_position().is_none()
+        || buttons.pressed(MouseButton::Left)
+        || pointer_over_ui(&ui)
+    {
+        hovered.0 = None;
+        return;
+    }
+    hovered.0 = pick_at_cursor(window, &camera, &map, &crews, &items, &racks).map(|(t, _)| t);
 }
 
 fn action_keys_system(
     keys: Res<ButtonInput<KeyCode>>,
+    debug: Option<Res<crate::ui::DebugBarVisible>>,
     mut selection: ResMut<Selection>,
     mut actions: EventWriter<Action>,
 ) {
@@ -98,7 +192,8 @@ fn action_keys_system(
             actions.write(Action::ToggleMark { item });
         }
     }
-    if keys.just_pressed(KeyCode::KeyX) {
+    // X deletes entities — debug only, available while the debug bar is shown.
+    if keys.just_pressed(KeyCode::KeyX) && debug.is_some_and(|d| d.0) {
         if let Some(Selected::Item(item)) = selection.0 {
             actions.write(Action::DeleteItem { item });
         }
@@ -110,10 +205,14 @@ fn action_keys_system(
 
 fn camera_control_system(
     keys: Res<ButtonInput<KeyCode>>,
+    buttons: Res<ButtonInput<MouseButton>>,
+    windows: Query<&Window, With<PrimaryWindow>>,
     mut wheel_events: EventReader<MouseWheel>,
     time: Res<Time>,
     map: Res<ShipMap>,
     mut camera: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
+    mut last_cursor: Local<Option<Vec2>>,
+    mut zoom_target: Local<f32>,
 ) {
     let Ok((mut transform, mut projection)) = camera.single_mut() else {
         return;
@@ -137,28 +236,46 @@ fn camera_control_system(
     if keys.pressed(KeyCode::KeyD) || keys.pressed(KeyCode::ArrowRight) {
         dir.x += 1.0;
     }
-
     if dir != Vec2::ZERO {
         let step = 420.0 * scale * time.delta().as_secs_f32();
         transform.translation.x += dir.x * step;
         transform.translation.y += dir.y * step;
     }
 
-    // Wheel zoom (2.0 = half size, 0.5 = double size).
+    // Right-drag pan: camera follows the pointer one-to-one.
+    if let Ok(window) = windows.single() {
+        let cursor = window.cursor_position();
+        if buttons.pressed(MouseButton::Right) {
+            if let (Some(cur), Some(prev)) = (cursor, *last_cursor) {
+                transform.translation.x -= (cur.x - prev.x) * scale;
+                transform.translation.y += (cur.y - prev.y) * scale;
+            }
+            *last_cursor = cursor;
+        } else {
+            *last_cursor = cursor;
+        }
+    }
+
+    // Wheel zoom, smoothed toward the target scale.
+    if *zoom_target == 0.0 {
+        *zoom_target = scale; // first frame initialization
+    }
     let mut zoom_delta = 0.0;
     for scroll in wheel_events.read() {
         zoom_delta += scroll.y;
     }
     if zoom_delta != 0.0 {
-        if let Projection::Orthographic(ref mut o) = *projection {
-            o.scale = (o.scale * (1.0 - 0.1 * zoom_delta)).clamp(0.6, 3.0);
-        }
+        *zoom_target = (*zoom_target * (1.0 - 0.15 * zoom_delta)).clamp(0.6, 3.0);
+    }
+    if let Projection::Orthographic(ref mut o) = *projection {
+        let t = (time.delta().as_secs_f32() * 12.0).min(1.0);
+        o.scale += (*zoom_target - o.scale) * t;
     }
 
     // Keep the camera loosely within the ship bounds.
     let half_w = map.width as f32 * crate::TILE;
     let half_h = map.height as f32 * crate::TILE;
-    let margin = 300.0 * scale;
+    let margin = 220.0 * scale;
     transform.translation.x = transform.translation.x.clamp(-margin, half_w + margin);
     transform.translation.y = transform.translation.y.clamp(-half_h - margin, margin);
 }

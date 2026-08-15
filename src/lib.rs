@@ -23,6 +23,7 @@ pub mod setup;
 pub mod storage;
 pub mod time_ctrl;
 pub mod ui;
+pub mod ui_overlay;
 
 /// World-space size of one map tile.
 pub const TILE: f32 = 32.0;

@@ -23,12 +23,17 @@ pub enum Action {
     ToggleMark { item: Entity },
     /// Mark every ground item for hauling.
     MarkAll,
+    /// Box-select: mark every (uncarried) ground item whose world position is
+    /// inside the rectangle spanned by the two world-space corners.
+    MarkArea { from: Vec2, to: Vec2 },
     /// Unmark everything and cancel all running haul jobs (drop carried items).
     CancelAll,
     /// Debug: remove the selected item entity from the world.
     DeleteItem { item: Entity },
     /// Debug: spawn one item of `kind` on a random free tile of the cargo hold.
     SpawnItem { kind: ItemKind },
+    /// UI-only: show/hide the developer toolbar (consumed by the UI plugin).
+    ToggleDebug,
     /// Set simulation speed by index into [`crate::SPEED_STEPS`].
     SetSpeed { index: usize },
 }
@@ -101,6 +106,24 @@ pub fn actions_system(
                 }
                 log.push(now, LogKind::Info, format!("Marked {n} items for hauling"));
             }
+            Action::MarkArea { from, to } => {
+                let (min_x, max_x) = (from.x.min(to.x), from.x.max(to.x));
+                let (min_y, max_y) = (from.y.min(to.y), from.y.max(to.y));
+                let mut n = 0;
+                for (e, pos, marked) in items.iter() {
+                    if marked.is_some() {
+                        continue;
+                    }
+                    let p = map.world_pos(*pos);
+                    if p.x >= min_x && p.x <= max_x && p.y >= min_y && p.y <= max_y {
+                        commands.entity(e).insert(MarkedForHaul);
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    log.push(now, LogKind::Info, format!("Marked {n} items for hauling (box select)"));
+                }
+            }
             Action::CancelAll => {
                 for (e, _, marked) in items.iter() {
                     if marked.is_some() {
@@ -164,6 +187,9 @@ pub fn actions_system(
             }
             Action::SetSpeed { .. } => {
                 // Consumed by time_ctrl::speed_action_system.
+            }
+            Action::ToggleDebug => {
+                // Consumed by ui::debug_toggle_system.
             }
         }
     }

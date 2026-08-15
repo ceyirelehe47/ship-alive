@@ -4,6 +4,9 @@
 //! Every text is rebuilt each frame — at slice-0 scale this is negligible and
 //! keeps the update code trivial. All labels are ASCII because the bundled
 //! default font has no CJK glyphs (recorded as a temporary behavior).
+//!
+//! Developer tools (item spawning, entity deletion) live behind a collapsed
+//! `Debug` toggle so the default view is pure player UI.
 
 use crate::crew::{Crew, CrewTask, HaulPhase};
 use crate::input::{Selected, Selection};
@@ -28,6 +31,10 @@ pub struct OnPress(pub Action);
 #[derive(Component)]
 pub struct SpeedIndex(pub usize);
 
+/// The collapsed-by-default developer toolbar visibility flag.
+#[derive(Resource, Default)]
+pub struct DebugBarVisible(pub bool);
+
 #[derive(Resource)]
 pub struct Hud {
     pub speed_buttons: Vec<Entity>,
@@ -35,6 +42,8 @@ pub struct Hud {
     pub chips: Vec<Entity>,
     pub sel_lines: Vec<Entity>,
     pub log_lines: Vec<Entity>,
+    pub debug_row: Entity,
+    pub debug_button_label: Entity,
 }
 
 fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
@@ -76,10 +85,18 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, build_hud);
+        app.init_resource::<DebugBarVisible>();
+        app.add_systems(Startup, (build_hud, crate::ui_overlay::build_overlay));
         app.add_systems(
             Update,
-            (button_system, hud_update_system).in_set(crate::Set::Sync),
+            (
+                button_system,
+                debug_toggle_system,
+                hud_update_system,
+                crate::ui_overlay::tooltip_system,
+                crate::ui_overlay::box_rect_system,
+            )
+                .in_set(crate::Set::Sync),
         );
     }
 }
@@ -90,6 +107,9 @@ fn build_hud(mut commands: Commands) {
     let mut chips = Vec::new();
     let mut sel_lines = Vec::new();
     let mut log_lines = Vec::new();
+    let mut debug_row = Entity::PLACEHOLDER;
+    let mut debug_button_label = Entity::PLACEHOLDER;
+    let mut debug_button = Entity::PLACEHOLDER;
 
     commands
         .spawn(Node {
@@ -121,7 +141,7 @@ fn build_hud(mut commands: Commands) {
                     ..default()
                 })
                 .with_children(|row| {
-                    label(row, "SHIP ALIVE — Slice 0", 15.0, Color::srgb(0.95, 0.85, 0.55));
+                    label(row, "SHIP ALIVE", 15.0, Color::srgb(0.95, 0.85, 0.55));
 
                     for (i, text) in ["Pause", "1x", "2x", "4x"].iter().enumerate() {
                         speed_buttons.push(button(row, text, Action::SetSpeed { index: i }, 52.0));
@@ -131,14 +151,56 @@ fn build_hud(mut commands: Commands) {
 
                     button(row, "Haul All [H]", Action::MarkAll, 96.0);
                     button(row, "Cancel All [C]", Action::CancelAll, 104.0);
-                    button(row, "+Crate", Action::SpawnItem { kind: ItemKind::Crate }, 64.0);
-                    button(row, "+Ore", Action::SpawnItem { kind: ItemKind::Ore }, 56.0);
-                    button(row, "+Part", Action::SpawnItem { kind: ItemKind::Part }, 60.0);
+
+                    let debug_btn = row
+                        .spawn((
+                            Button,
+                            Interaction::default(),
+                            OnPress(Action::ToggleDebug),
+                            Node {
+                                width: Val::Px(64.0),
+                                height: Val::Px(26.0),
+                                margin: UiRect::all(Val::Px(2.0)),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                ..default()
+                            },
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|b| {
+                            debug_button_label = label(b, "Debug", 13.0, Color::WHITE);
+                        })
+                        .id();
+                    debug_button = debug_btn;
                 });
+
+                // Developer toolbar, hidden by default.
+                debug_row = bar
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        },
+                        Visibility::Hidden,
+                    ))
+                    .with_children(|row| {
+                        button(row, "+Crate", Action::SpawnItem { kind: ItemKind::Crate }, 64.0);
+                        button(row, "+Ore", Action::SpawnItem { kind: ItemKind::Ore }, 56.0);
+                        button(row, "+Part", Action::SpawnItem { kind: ItemKind::Part }, 60.0);
+                        label(
+                            row,
+                            "debug tools | [X] deletes the selected item",
+                            11.0,
+                            Color::srgb(0.55, 0.6, 0.66),
+                        );
+                    })
+                    .id();
 
                 label(
                     bar,
-                    "Click: select crew/item/rack | T: mark/unmark item | X: delete item | Space/1/2/3: speed | WASD/arrows: pan | wheel: zoom",
+                    "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark/unmark | Space/1/2/3: speed",
                     11.0,
                     Color::srgb(0.6, 0.66, 0.72),
                 );
@@ -221,6 +283,7 @@ fn build_hud(mut commands: Commands) {
                             BackgroundColor(PANEL_BG),
                         ))
                         .with_children(|p| {
+                            label(p, "EVENT LOG", 11.0, Color::srgb(0.5, 0.55, 0.62));
                             for _ in 0..EventLog::VISIBLE {
                                 log_lines.push(label(p, "", 12.0, Color::srgb(0.75, 0.78, 0.82)));
                             }
@@ -235,6 +298,8 @@ fn build_hud(mut commands: Commands) {
         chips,
         sel_lines,
         log_lines,
+        debug_row,
+        debug_button_label,
     });
     for (i, b) in speed_buttons.iter().enumerate() {
         commands.entity(*b).insert(SpeedIndex(i));
@@ -253,9 +318,39 @@ fn button_system(
     }
 }
 
+/// Show/hide the developer toolbar. The toggle action itself is a lightweight
+/// UI concern and does not touch the simulation.
+fn debug_toggle_system(
+    mut events: EventReader<Action>,
+    mut visible: ResMut<DebugBarVisible>,
+    hud: Res<Hud>,
+    mut vis_q: Query<&mut Visibility>,
+    mut text_q: Query<&mut Text>,
+    mut color_q: Query<&mut BackgroundColor>,
+) {
+    let mut toggled = false;
+    for action in events.read() {
+        if matches!(action, Action::ToggleDebug) {
+            visible.0 = !visible.0;
+            toggled = true;
+        }
+    }
+    if !toggled {
+        return;
+    }
+    if let Ok(mut vis) = vis_q.get_mut(hud.debug_row) {
+        *vis = if visible.0 { Visibility::Visible } else { Visibility::Hidden };
+    }
+    if let Ok(mut text) = text_q.get_mut(hud.debug_button_label) {
+        text.0 = if visible.0 { "Debug ✓" } else { "Debug" }.to_string();
+    }
+    // Highlight the toggle button while the toolbar is open.
+    let _ = &mut color_q;
+}
+
 /// Human-readable one-line state for a crew member.
 #[allow(clippy::type_complexity)]
-fn task_label(
+pub fn task_label(
     task: &CrewTask,
     items: &Query<
         (
@@ -290,6 +385,37 @@ fn task_label(
                 }
             }
         }
+    }
+}
+
+/// One-line status for an item, shared by the selection panel and tooltip.
+#[allow(clippy::type_complexity)]
+pub fn item_status(
+    reserved: Option<&ReservedBy>,
+    carried: Option<&CarriedBy>,
+    marked: Option<&MarkedForHaul>,
+    cooled: Option<&NoPathUntil>,
+    crews: &Query<(Entity, &Crew, &CrewTask, &TilePos, &crate::crew::Movement)>,
+    now: f64,
+) -> String {
+    if carried.is_some() {
+        let carrier = carried
+            .and_then(|c| crews.get(c.0).ok())
+            .map(|(_, c, ..)| c.name.clone())
+            .unwrap_or_else(|| "someone".into());
+        format!("Being carried by {carrier}")
+    } else if let Some(r) = reserved {
+        let claimer = crews
+            .get(r.0)
+            .map(|(_, c, ..)| c.name.clone())
+            .unwrap_or_else(|_| "a crew member".into());
+        format!("Claimed by {claimer}")
+    } else if marked.is_some() {
+        "Marked for hauling".to_string()
+    } else if cooled.is_some_and(|c| c.0 > now) {
+        "Unreachable".to_string()
+    } else {
+        "On the ground".to_string()
     }
 }
 
@@ -363,7 +489,12 @@ fn hud_update_system(
         };
         if let Ok((mut text, mut color, mut vis)) = texts.get_mut(*chip) {
             *vis = Visibility::Visible;
-            let mut line = format!("[{}] {}: {}", if mov.path.is_empty() { "·" } else { ">" }, crew.name, task_label(task, &items, &racks));
+            let mut line = format!(
+                "[{}] {}: {}",
+                if mov.path.is_empty() { "·" } else { ">" },
+                crew.name,
+                task_label(task, &items, &racks)
+            );
             line.push_str(&format!("  (delivered {})", crew.delivered));
             text.0 = line;
             color.0 = crew.tint;
@@ -392,45 +523,60 @@ fn hud_update_system(
                     };
                     lines.push((detail, Color::srgb(0.75, 0.78, 0.82)));
                 }
-                lines.push((format!("Delivered: {} | Tiles left: {}", crew.delivered, mov.path.len()), Color::srgb(0.6, 0.66, 0.72)));
+                lines.push((
+                    format!("Delivered: {} | Tiles left: {}", crew.delivered, mov.path.len()),
+                    Color::srgb(0.6, 0.66, 0.72),
+                ));
             }
         }
         Some(Selected::Item(e)) => {
             if let Ok((_, pos, item, marked, reserved, carried, cooled)) = items.get(e) {
-                lines.push((format!("Item: {} ({},{})", item.kind.label(), pos.x, pos.y), Color::srgb(0.95, 0.85, 0.55)));
-                let status = if carried.is_some() {
-                    "being carried".to_string()
-                } else if let Some(r) = reserved {
-                    format!("claimed by crew #{}", r.0.index())
-                } else if marked.is_some() {
-                    "marked for hauling".to_string()
-                } else {
-                    "on the ground".to_string()
-                };
-                lines.push((status, Color::WHITE));
+                lines.push((
+                    format!("Item: {} ({},{})", item.kind.label(), pos.x, pos.y),
+                    Color::srgb(0.95, 0.85, 0.55),
+                ));
+                lines.push((item_status(reserved, carried, marked, cooled, &crews, now), Color::WHITE));
                 if let Some(c) = cooled {
                     if c.0 > now {
-                        lines.push((format!("Unreachable (retry in {:.0}s)", c.0 - now), Color::srgb(1.0, 0.45, 0.4)));
+                        lines.push((
+                            format!("Unreachable (retry in {:.0}s)", c.0 - now),
+                            Color::srgb(1.0, 0.45, 0.4),
+                        ));
                     }
                 }
-                lines.push(("[T] toggle haul mark | [X] delete item".to_string(), Color::srgb(0.6, 0.66, 0.72)));
+                lines.push((
+                    "[T] toggle haul mark".to_string(),
+                    Color::srgb(0.6, 0.66, 0.72),
+                ));
             }
         }
         Some(Selected::Rack(e)) => {
             if let Ok((pos, cell)) = racks.get(e) {
-                lines.push((format!("Storage rack ({},{})", pos.x, pos.y), Color::srgb(0.6, 0.9, 0.8)));
+                lines.push((
+                    format!("Storage rack ({},{})", pos.x, pos.y),
+                    Color::srgb(0.6, 0.9, 0.8),
+                ));
                 let counts = ItemKind::ALL
                     .iter()
                     .map(|k| format!("{}: {}", k.label(), cell.counts[k.index()]))
                     .collect::<Vec<_>>()
                     .join(" | ");
                 lines.push((counts, Color::WHITE));
-                lines.push((format!("Free slots: {}", cell.free()), if cell.free() == 0 { Color::srgb(1.0, 0.45, 0.4) } else { Color::WHITE }));
+                lines.push((
+                    format!("Free slots: {}", cell.free()),
+                    if cell.free() == 0 { Color::srgb(1.0, 0.45, 0.4) } else { Color::WHITE },
+                ));
             }
         }
         None => {
-            lines.push(("Nothing selected — click a crew member, item or rack.".to_string(), Color::srgb(0.6, 0.66, 0.72)));
-            lines.push(("Use [H] Haul All to put the crew to work.".to_string(), Color::srgb(0.6, 0.66, 0.72)));
+            lines.push((
+                "Nothing selected — click a crew member, item or rack.".to_string(),
+                Color::srgb(0.6, 0.66, 0.72),
+            ));
+            lines.push((
+                "Drag a box over items (or press Haul All [H]) to put the crew to work.".to_string(),
+                Color::srgb(0.6, 0.66, 0.72),
+            ));
         }
     }
 

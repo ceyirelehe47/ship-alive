@@ -290,3 +290,43 @@ fn carried_item_is_flagged_and_targeted() {
         assert!(matches!(job.phase, HaulPhase::ToStorage | HaulPhase::Storing));
     }
 }
+
+#[test]
+fn box_select_marks_only_items_inside_rect() {
+    let mut h = Harness::new();
+    spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    // World coords: tile (x, y) center = ((x+0.5)*32, -((y+0.5)*32)).
+    let inside1 = spawn_item(&mut h.world, TilePos::new(3, 3), false);
+    let inside2 = spawn_item(&mut h.world, TilePos::new(4, 3), false);
+    let outside = spawn_item(&mut h.world, TilePos::new(1, 3), false);
+    let _rack = spawn_rack(&mut h.world, tile_of('S'), 0);
+
+    // A box covering tiles x=3..4, y=3 (world x 96..160, world y -128..-96).
+    h.send(Action::MarkArea {
+        from: bevy::math::Vec2::new(90.0, -130.0),
+        to: bevy::math::Vec2::new(165.0, -90.0),
+    });
+    h.step(0.05);
+
+    assert!(h.world.get::<MarkedForHaul>(inside1).is_some());
+    assert!(h.world.get::<MarkedForHaul>(inside2).is_some());
+    assert!(h.world.get::<MarkedForHaul>(outside).is_none());
+}
+
+#[test]
+fn box_select_is_idempotent_and_can_reselect_dropped() {
+    let mut h = Harness::new();
+    let item = spawn_item(&mut h.world, TilePos::new(3, 3), false);
+    let p = bevy::math::Vec2::new(112.0, -112.0);
+    h.send(Action::MarkArea { from: p, to: p });
+    h.step(0.05);
+    assert!(h.world.get::<MarkedForHaul>(item).is_some());
+
+    // Unmark, then box-select the same tile again.
+    h.send(Action::ToggleMark { item });
+    h.step(0.05);
+    assert!(h.world.get::<MarkedForHaul>(item).is_none());
+    h.send(Action::MarkArea { from: p, to: p });
+    h.step(0.05);
+    assert!(h.world.get::<MarkedForHaul>(item).is_some());
+}

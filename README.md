@@ -1,15 +1,25 @@
-# Ship Alive — Playable Slice 0 / 0B
+# Ship Alive — Playable Slice 1 / Ship Operations
 
-一个用 **Rust + Bevy 0.16** 实现的飞船殖民模拟切片：4 名船员在固定布局的
-Starter Ship 中自动领取搬运工作，走到物品、拾取、搬运并入库。
-0B 轮补齐了正式玩家交互：框选批量搬运、悬停信息卡、房间标注与仓储高亮、
-任务五态可视化（标记/领取者颜色/携带/入库）、空闲船员变暗、
-右键拖拽平移、调试工具折叠。
+一个用 **Rust + Bevy 0.16** 实现的飞船殖民模拟切片。4 名船员在一艘固定
+Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改造自己的飞船**：
+
+**调整舰内布局 → 建造/拆除设施 → 配置仓储过滤 → 安排工作优先级 →
+生产 Machinery Part → 观察物流瓶颈 → 改造布局 → 明显改善运营效率。**
+
+- 舰内建造：Wall / Door / Storage Rack / Fabricator（2×2 多格机械）
+- 真实施工：蓝图 → 自动物流送料（地面/货架库存）→ 船员施工 → 完成即影响寻路
+- 拆除返还全部建材（含货架内存货），鼓励反复试验布局
+- 最小生产链：**2 Asteroid Ore → Fabricator → 1 Machinery Part**，
+  缺料自动供料、需要船员实地操作、产出自动入库；Output blocked 可视化
+- 仓储过滤：每个货架可勾选接收的物品种类（原料架贴机器、成品架守出口）
+- 三类工作（Haul / Build / Operate）× 每名船员 Off/Low/Normal/High 优先级
+- 0B 全部交互保留：框选搬运、悬停信息卡、相机、时间控制、Debug 工具折叠
 
 ```bash
-cargo run                # 启动游戏（玩法见 PLAYTEST.md）
-cargo test               # 19 个单元/集成测试
-SLICE0_SCENARIO=A cargo run   # 自动跑验收场景 A（B–F 同理）
+cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
+cargo test                     # 44 个单元/集成测试
+SLICE0_SCENARIO=A cargo run    # 自动验收场景 A（B–L、P1/P2/M 同理）
+cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
 ## 目录结构
@@ -17,23 +27,30 @@ SLICE0_SCENARIO=A cargo run   # 自动跑验收场景 A（B–F 同理）
 ```
 src/
   lib.rs         模块组织 + 帧内系统顺序（Input→Jobs→Move→Sync）
-  map.rs         固定舰船布局（字符画）→ 稠密网格 ShipMap
+  map.rs         固定舰船布局（字符画）→ 稠密网格 ShipMap（含 BuiltWall/Door/Machine 格）
   path.rs        网格 A*（4 向，支持动态阻挡）
-  crew.rs        船员组件：Crew / CrewTask(Idle|Haul) / Movement
-  items.rs       地面物品组件：Item / MarkedForHaul / ReservedBy / CarriedBy
-  storage.rs     货架格 StorageCell（容量逻辑）
-  jobs.rs        核心：玩家动作、任务推进、领取/预约
-  movement.rs    逐格移动 + 软避让（等待→绕路→穿行）
+  crew.rs        船员组件：Crew / 工作优先级 / CrewTask(Idle|Haul|Build|Deconstruct|Operate)
+  items.rs       地面物品：Item / MarkedForHaul / ReservedBy / CarriedBy
+  storage.rs     货架 StorageCell（容量 + 物品类型过滤）
+  building.rs    建筑定义/蓝图/放置校验/施工完成/拆除返还（多格 Footprint）
+  production.rs  Fabricator：配方(2 Ore→1 Part)/订单(Produce N|Repeat)/状态机/缓冲
+  jobs.rs        核心：玩家动作、四类任务执行、统一工作扫描与优先级领取
+  movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制）
   time_ctrl.rs   暂停/1×/2×/4×（Bevy 虚拟时钟）
-  input.rs       点击选择/拖框标记/右键平移/悬停检测/快捷键
-  render.rs      逻辑实体 ↔ 独立视觉实体（房间标注/状态环/悬停环）
-  ui.rs          HUD：顶栏/船员状态/选中面板/事件日志/Debug 折叠
-  ui_overlay.rs  悬停 tooltip + 框选矩形覆盖层
-  autotest.rs    SLICE0_SCENARIO=A..F 自动验收驱动器（开发工具）
+  input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
+  render.rs      建筑/蓝图/机器状态可视化 + 放置 ghost + 房间标注
+  ui.rs          HUD：BUILD 栏/船员状态/动态选择面板(过滤/订单/优先级)/事件日志
+  ui_overlay.rs  悬停 tooltip + 框选矩形
+  autotest.rs    SLICE0_SCENARIO=A..L + P1/P2/M 自动验收与试玩驱动器（开发工具）
+  stats.rs       开发遥测（产量/搬运距离等，用于布局 A/B 对比）
+  setup.rs       从字符画生成世界（含预置 Fabricator 与 P/O 库存货架）
   bin/prep_art.rs 生成美术的后处理（去背/裁切/缩放）
-tests/haul_logic.rs  无窗口的 bevy_ecs 集成测试（领取互斥/框选/满仓/…）
-tools/            截图脚本（开发用）
+tests/
+  haul_logic.rs  Slice 0B 无头集成测试（领取互斥/框选/满仓/…）
+  ship_ops.rs    Slice 1 无头集成测试（建造/拆除/生产/过滤/优先级）
+tools/           截图脚本（开发用）
 assets/art/      运行时加载的 PNG（缺失时自动退化为色块占位）
+art_raw/         Codex image generation 原图（洋红底）
 ```
 
 ## 美术管线
@@ -42,5 +59,6 @@ assets/art/      运行时加载的 PNG（缺失时自动退化为色块占位�
 → `assets/art/`（透明背景 256×256）。游戏启动时若文件存在则加载，
 否则用程序化色块，保证仓库在任何状态下都能跑。
 
-状态：**Slice 0B（Actually Playable）完成，等待试玩反馈。**
-交付报告：`REPORT.md`（Slice 0）、`REPORT_0B.md`（本轮）；试玩指南：`PLAYTEST.md`。
+状态：**Slice 1（Ship Operations）完成，等待试玩反馈。**
+交付报告：`REPORT.md`（Slice 0）、`REPORT_0B.md`（0B）、`REPORT_1.md`（本轮）；
+试玩指南：`PLAYTEST.md`。

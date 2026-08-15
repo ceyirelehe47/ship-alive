@@ -11,7 +11,7 @@ use bevy::prelude::*;
 
 /// Seconds of accumulated blocking before re-pathing around the blocker.
 const REPATH_AFTER: f32 = 0.6;
-/// Seconds of accumulated blocking after which the crew walks through it.
+/// Seconds of blocking after which the crew walks through it.
 const PASS_THROUGH_AFTER: f32 = 1.5;
 
 pub struct MovementPlugin;
@@ -41,15 +41,29 @@ pub fn movement_system(
             mov.progress = 0.0;
             mov.blocked_for = 0.0;
             mov.passing_through = false;
+            mov.blocked_tile = None;
+            mov.blocked_on_tile = 0.0;
             continue;
         }
         let next = mov.path[0];
-        let blocked =
-            !mov.passing_through && occupied.iter().any(|&(stand, other)| other != entity && stand == next);
+        let blocked = !mov.passing_through
+            && occupied
+                .iter()
+                .any(|&(stand, other)| other != entity && stand == next);
+
+        // Track per-target-tile blockage without decay: a mutual head-on
+        // standoff must escalate to pass-through within PASS_THROUGH_AFTER no
+        // matter how the decaying `blocked_for` oscillates on frames where
+        // the blocker's tile momentarily reads as free.
+        if mov.blocked_tile != Some(next) {
+            mov.blocked_tile = Some(next);
+            mov.blocked_on_tile = 0.0;
+        }
 
         if blocked {
             mov.blocked_for += dt;
-            if mov.blocked_for >= PASS_THROUGH_AFTER {
+            mov.blocked_on_tile += dt;
+            if mov.blocked_on_tile >= PASS_THROUGH_AFTER || mov.blocked_for >= PASS_THROUGH_AFTER {
                 mov.passing_through = true;
             } else if mov.blocked_for >= REPATH_AFTER {
                 // Try a route that treats other crews' tiles as walls.
@@ -59,7 +73,9 @@ pub fn movement_system(
                     .filter(|&&(_, other)| other != entity)
                     .map(|&(stand, _)| stand)
                     .collect();
-                if let Some(alt) = crate::path::find_path(&map, *pos, goal, |p| blockers.contains(&p)) {
+                if let Some(alt) =
+                    crate::path::find_path(&map, *pos, goal, |p| blockers.contains(&p))
+                {
                     // Only accept if it is a plausible detour, not a huge loop.
                     if alt.len() < mov.path.len() + 4 {
                         mov.path = alt;

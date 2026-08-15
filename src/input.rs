@@ -1,12 +1,16 @@
 //! Mouse/keyboard input: selection, box-select marking, camera control,
-//! hotkeys and hover detection.
+//! build tools (placement ghost + deconstruct marking), hotkeys and hover
+//! detection.
 //!
 //! World picking maps the cursor to a tile and asks the queries who stands
-//! there (priority: crew > item > rack). Left click selects; dragging on the
-//! map draws a box that marks every item inside for hauling on release.
-//! Right-drag pans the camera. Pointer positions over UI panels are ignored —
-//! any `Interaction` in hover state marks the pointer as being over UI.
+//! there (priority: crew > item > rack > blueprint > building). Left click
+//! selects; dragging on the map draws a box that marks every item inside for
+//! hauling on release. While a build tool is active, left click places a
+//! blueprint instead. Right-drag pans the camera. Pointer positions over UI
+//! panels are ignored — any `Interaction` in hover state marks the pointer as
+//! being over UI.
 
+use crate::building::{Blueprint, Building, BuildingKind, MarkedForDeconstruct};
 use crate::jobs::Action;
 use crate::map::{ShipMap, TilePos};
 use bevy::input::mouse::MouseWheel;
@@ -18,6 +22,8 @@ pub enum Selected {
     Crew(Entity),
     Item(Entity),
     Rack(Entity),
+    Blueprint(Entity),
+    Building(Entity),
 }
 
 #[derive(Resource, Default, Debug)]
@@ -35,6 +41,16 @@ pub struct BoxSelect {
     pub over_ui_at_press: bool,
 }
 
+/// The active build tool (None = normal selection mode).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tool {
+    Build(BuildingKind),
+    Deconstruct,
+}
+
+#[derive(Resource, Default, Debug)]
+pub struct BuildMode(pub Option<Tool>);
+
 pub struct InputPlugin;
 
 impl Plugin for InputPlugin {
@@ -42,9 +58,11 @@ impl Plugin for InputPlugin {
         app.init_resource::<Selection>();
         app.init_resource::<Hovered>();
         app.init_resource::<BoxSelect>();
+        app.init_resource::<BuildMode>();
         app.add_systems(
             Update,
             (
+                tool_action_system,
                 select_and_box_system,
                 hover_system,
                 action_keys_system,
@@ -55,13 +73,24 @@ impl Plugin for InputPlugin {
     }
 }
 
+/// Consume `SetTool` actions (fired by the build bar buttons and Esc).
+fn tool_action_system(mut events: EventReader<Action>, mut mode: ResMut<BuildMode>) {
+    for action in events.read() {
+        if let Action::SetTool { tool } = *action {
+            mode.0 = tool;
+        }
+    }
+}
+
 fn pointer_over_ui(ui: &Query<&Interaction, With<Node>>) -> bool {
     ui.iter()
         .any(|i| matches!(i, Interaction::Hovered | Interaction::Pressed))
 }
 
-/// Shared cursor→target picking (priority: crew > item > rack).
+/// Shared cursor→target picking (priority: crew > item > rack > blueprint >
+/// building; multi-tile footprints are hit on any of their tiles).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn pick_at_cursor(
     window: &Window,
     camera: &Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -69,29 +98,41 @@ fn pick_at_cursor(
     crews: &Query<(Entity, &TilePos), With<crate::crew::Crew>>,
     items: &Query<(Entity, &TilePos), With<crate::items::Item>>,
     racks: &Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
+    blueprints: &Query<(Entity, &crate::building::Footprint), With<Blueprint>>,
+    buildings: &Query<
+        (
+            Entity,
+            &crate::building::Footprint,
+            Option<&MarkedForDeconstruct>,
+        ),
+        (With<Building>, Without<Blueprint>),
+    >,
 ) -> Option<(Selected, Vec2)> {
     let cursor = window.cursor_position()?;
     let Ok((cam, cam_gt)) = camera.single() else {
         return None;
     };
     let world = cam.viewport_to_world_2d(cam_gt, cursor).ok()?;
-    let Some(tile) = map.tile_at_world(world) else {
-        return None;
-    };
+    let tile = map.tile_at_world(world)?;
     let target = if let Some((e, _)) = crews.iter().find(|(_, p)| **p == tile) {
         Some(Selected::Crew(e))
     } else if let Some((e, _)) = items.iter().find(|(_, p)| **p == tile) {
         Some(Selected::Item(e))
     } else if let Some((e, _)) = racks.iter().find(|(_, p)| **p == tile) {
         Some(Selected::Rack(e))
+    } else if let Some((e, _)) = blueprints.iter().find(|(_, f)| f.contains(tile)) {
+        Some(Selected::Blueprint(e))
+    } else if let Some((e, _, _)) = buildings.iter().find(|(_, f, _)| f.contains(tile)) {
+        Some(Selected::Building(e))
     } else {
         None
     };
     target.map(|t| (t, world))
 }
 
-/// Left click selects a target; dragging further than a few pixels turns into
-/// a box select that marks all items inside the rectangle for hauling.
+/// Left click selects a target (or places a blueprint / marks deconstruction
+/// while a tool is active); dragging further than a few pixels in select mode
+/// turns into a box select that marks all items inside for hauling.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn select_and_box_system(
@@ -103,13 +144,24 @@ fn select_and_box_system(
     crews: Query<(Entity, &TilePos), With<crate::crew::Crew>>,
     items: Query<(Entity, &TilePos), With<crate::items::Item>>,
     racks: Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
+    blueprints: Query<(Entity, &crate::building::Footprint), With<Blueprint>>,
+    buildings: Query<
+        (
+            Entity,
+            &crate::building::Footprint,
+            Option<&MarkedForDeconstruct>,
+        ),
+        (With<Building>, Without<Blueprint>),
+    >,
     mut selection: ResMut<Selection>,
+    build_mode: Res<BuildMode>,
     mut box_select: ResMut<BoxSelect>,
     mut actions: EventWriter<Action>,
 ) {
     let Ok(window) = windows.single() else {
         return;
     };
+
     if buttons.just_pressed(MouseButton::Left) {
         box_select.anchor = window.cursor_position();
         box_select.over_ui_at_press = pointer_over_ui(&ui);
@@ -122,7 +174,53 @@ fn select_and_box_system(
         }
         if buttons.just_released(MouseButton::Left) {
             let dist = box_select.current.distance(anchor);
-            if !box_select.over_ui_at_press && dist > 10.0 {
+            if !box_select.over_ui_at_press && dist <= 10.0 {
+                // Plain click: tool action, or select.
+                if let Some(tool) = build_mode.0 {
+                    match tool {
+                        Tool::Build(kind) => {
+                            if let Some(tile) = cursor_tile(window, &camera, &map) {
+                                actions.write(Action::PlaceBlueprint { kind, pos: tile });
+                            }
+                        }
+                        Tool::Deconstruct => {
+                            if let Some((Selected::Building(e) | Selected::Rack(e), _)) =
+                                pick_at_cursor(
+                                    window,
+                                    &camera,
+                                    &map,
+                                    &crews,
+                                    &items,
+                                    &racks,
+                                    &blueprints,
+                                    &buildings,
+                                )
+                            {
+                                let marked =
+                                    buildings.get(e).ok().is_some_and(|(_, _, m)| m.is_some());
+                                if marked {
+                                    actions.write(Action::UnmarkDeconstruct { building: e });
+                                } else {
+                                    actions.write(Action::MarkDeconstruct { building: e });
+                                }
+                            }
+                        }
+                    }
+                } else if let Some((target, _)) = pick_at_cursor(
+                    window,
+                    &camera,
+                    &map,
+                    &crews,
+                    &items,
+                    &racks,
+                    &blueprints,
+                    &buildings,
+                ) {
+                    selection.0 = Some(target);
+                } else {
+                    selection.0 = None;
+                }
+            } else if !box_select.over_ui_at_press && dist > 10.0 && build_mode.0.is_none() {
                 // Box select: mark items between the two world-space corners.
                 let Ok((cam, cam_gt)) = camera.single() else {
                     box_select.anchor = None;
@@ -134,23 +232,28 @@ fn select_and_box_system(
                 ) {
                     actions.write(Action::MarkArea { from, to });
                 }
-            } else if !box_select.over_ui_at_press && dist <= 10.0 {
-                // Plain click: select (or deselect on empty ground).
-                if let Some((target, _)) =
-                    pick_at_cursor(window, &camera, &map, &crews, &items, &racks)
-                {
-                    selection.0 = Some(target);
-                } else {
-                    selection.0 = None;
-                }
             }
             box_select.anchor = None;
         }
     }
 }
 
+fn cursor_tile(
+    window: &Window,
+    camera: &Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    map: &ShipMap,
+) -> Option<TilePos> {
+    let cursor = window.cursor_position()?;
+    let Ok((cam, cam_gt)) = camera.single() else {
+        return None;
+    };
+    let world = cam.viewport_to_world_2d(cam_gt, cursor).ok()?;
+    map.tile_at_world(world)
+}
+
 /// Track what the cursor hovers over (drives the hover ring and tooltip).
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn hover_system(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
@@ -160,6 +263,15 @@ fn hover_system(
     crews: Query<(Entity, &TilePos), With<crate::crew::Crew>>,
     items: Query<(Entity, &TilePos), With<crate::items::Item>>,
     racks: Query<(Entity, &TilePos), With<crate::storage::StorageCell>>,
+    blueprints: Query<(Entity, &crate::building::Footprint), With<Blueprint>>,
+    buildings: Query<
+        (
+            Entity,
+            &crate::building::Footprint,
+            Option<&MarkedForDeconstruct>,
+        ),
+        (With<Building>, Without<Blueprint>),
+    >,
     mut hovered: ResMut<Hovered>,
 ) {
     let Ok(window) = windows.single() else {
@@ -172,13 +284,24 @@ fn hover_system(
         hovered.0 = None;
         return;
     }
-    hovered.0 = pick_at_cursor(window, &camera, &map, &crews, &items, &racks).map(|(t, _)| t);
+    hovered.0 = pick_at_cursor(
+        window,
+        &camera,
+        &map,
+        &crews,
+        &items,
+        &racks,
+        &blueprints,
+        &buildings,
+    )
+    .map(|(t, _)| t);
 }
 
 fn action_keys_system(
     keys: Res<ButtonInput<KeyCode>>,
     debug: Option<Res<crate::ui::DebugBarVisible>>,
     mut selection: ResMut<Selection>,
+    build_mode: Res<BuildMode>,
     mut actions: EventWriter<Action>,
 ) {
     if keys.just_pressed(KeyCode::KeyH) {
@@ -192,17 +315,33 @@ fn action_keys_system(
             actions.write(Action::ToggleMark { item });
         }
     }
-    // X deletes entities — debug only, available while the debug bar is shown.
+    if keys.just_pressed(KeyCode::KeyB) {
+        // Cycle build tools: none → wall → door → rack → fabricator → deconstruct → none.
+        let next = match build_mode.0 {
+            None => Some(Tool::Build(BuildingKind::Wall)),
+            Some(Tool::Build(BuildingKind::Wall)) => Some(Tool::Build(BuildingKind::Door)),
+            Some(Tool::Build(BuildingKind::Door)) => Some(Tool::Build(BuildingKind::Rack)),
+            Some(Tool::Build(BuildingKind::Rack)) => Some(Tool::Build(BuildingKind::Fabricator)),
+            Some(Tool::Build(BuildingKind::Fabricator)) => Some(Tool::Deconstruct),
+            Some(Tool::Deconstruct) => None,
+        };
+        actions.write(Action::SetTool { tool: next });
+    }
     if keys.just_pressed(KeyCode::KeyX) && debug.is_some_and(|d| d.0) {
         if let Some(Selected::Item(item)) = selection.0 {
             actions.write(Action::DeleteItem { item });
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        selection.0 = None;
+        if build_mode.0.is_some() {
+            actions.write(Action::SetTool { tool: None });
+        } else {
+            selection.0 = None;
+        }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn camera_control_system(
     keys: Res<ButtonInput<KeyCode>>,
     buttons: Res<ButtonInput<MouseButton>>,

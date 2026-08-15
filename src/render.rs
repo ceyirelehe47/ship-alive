@@ -1,16 +1,19 @@
-//! Rendering: every gameplay entity (crew, item, rack) is represented by a
-//! separate "visual" entity linked through `Visual { target }`. Logic code
-//! never touches sprites, and dead targets are cleaned up automatically, so
-//! despawning an item can never leak or orphan its visuals.
+//! Rendering: every gameplay entity (crew, item, rack, building, blueprint)
+//! is represented by a separate "visual" entity linked through
+//! `Visual { target }`. Logic code never touches sprites, and dead targets
+//! are cleaned up automatically, so despawning an entity can never leak or
+//! orphan its visuals.
 //!
 //! Art is loaded from `assets/art/*.png` when present; missing files fall
 //! back to procedurally generated colored quads so the game stays playable
 //! before the art pass (see `Art::load`).
 
-use crate::crew::{Crew, CrewTask, HaulPhase, Movement};
-use crate::input::Selection;
+use crate::building::{self, Blueprint, Building, BuildingKind, MarkedForDeconstruct};
+use crate::crew::{Crew, CrewTask, HaulDest, HaulPhase, Movement};
+use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::map::{ShipMap, TilePos};
+use crate::production::{MachineState, RECIPE};
 use crate::storage::StorageCell;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
@@ -25,6 +28,16 @@ pub enum Role {
     CrewSprite,
     CrewLabel,
     CrewCarry,
+    /// Finished building (wall/door/fabricator sprite, sized to footprint).
+    BuildingSprite,
+    /// Construction blueprint ghost sprite.
+    BlueprintSprite,
+    /// Blueprint materials/progress text.
+    BlueprintLabel,
+    /// Fabricator state ring.
+    FabRing,
+    /// Fabricator state text.
+    FabLabel,
 }
 
 #[derive(Component)]
@@ -44,6 +57,9 @@ pub struct Markers {
     pub hover: Entity,
     pub target: Entity,
     pub dots: Vec<Entity>,
+    /// Build-tool placement ghost.
+    pub ghost: Entity,
+    pub ghost_label: Entity,
 }
 
 /// All sprite/texture handles used by the game.
@@ -51,7 +67,10 @@ pub struct Markers {
 pub struct Art {
     pub floor: Handle<Image>,
     pub wall: Handle<Image>,
+    pub wall_built: Handle<Image>,
+    pub door: Handle<Image>,
     pub rack: Handle<Image>,
+    pub fabricator: Handle<Image>,
     pub crate_: Handle<Image>,
     pub ore: Handle<Image>,
     pub part: Handle<Image>,
@@ -66,6 +85,15 @@ impl Art {
             ItemKind::Crate => &self.crate_,
             ItemKind::Ore => &self.ore,
             ItemKind::Part => &self.part,
+        }
+    }
+
+    pub fn building(&self, kind: BuildingKind) -> &Handle<Image> {
+        match kind {
+            BuildingKind::Wall => &self.wall_built,
+            BuildingKind::Door => &self.door,
+            BuildingKind::Rack => &self.rack,
+            BuildingKind::Fabricator => &self.fabricator,
         }
     }
 
@@ -84,7 +112,8 @@ impl Art {
                     TextureDimension::D2,
                     &color,
                     TextureFormat::Rgba8UnormSrgb,
-                    bevy::asset::RenderAssetUsages::MAIN_WORLD | bevy::asset::RenderAssetUsages::RENDER_WORLD,
+                    bevy::asset::RenderAssetUsages::MAIN_WORLD
+                        | bevy::asset::RenderAssetUsages::RENDER_WORLD,
                 );
                 images.add(img)
             }
@@ -92,7 +121,10 @@ impl Art {
         Self {
             floor: fill("art/floor.png", [64, 70, 86, 255]),
             wall: fill("art/wall.png", [34, 38, 50, 255]),
+            wall_built: fill("art/wall_built.png", [72, 82, 104, 255]),
+            door: fill("art/door.png", [96, 148, 178, 255]),
             rack: fill("art/rack.png", [58, 118, 118, 255]),
+            fabricator: fill("art/fabricator.png", [112, 122, 146, 255]),
             crate_: fill("art/crate.png", [198, 166, 112, 255]),
             ore: fill("art/ore.png", [150, 92, 62, 255]),
             part: fill("art/part.png", [134, 134, 172, 255]),
@@ -115,11 +147,22 @@ fn sprite(image: Handle<Image>, size: f32, z: f32, pos: Vec2, color: Color) -> (
     )
 }
 
+/// World-space center of a footprint rect.
+fn foot_world_pos(foot: &building::Footprint) -> Vec2 {
+    Vec2::new(
+        (foot.x as f32 + foot.w as f32 / 2.0) * crate::TILE,
+        -(foot.y as f32 + foot.h as f32 / 2.0) * crate::TILE,
+    )
+}
+
 pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Startup, (spawn_tile_visuals, spawn_room_labels, spawn_markers));
+        app.add_systems(
+            Startup,
+            (spawn_tile_visuals, spawn_room_labels, spawn_markers),
+        );
         app.add_systems(
             Update,
             (
@@ -127,7 +170,9 @@ impl Plugin for RenderPlugin {
                 sync_crew_visuals_system,
                 sync_item_visuals_system,
                 sync_rack_labels_system,
+                sync_building_visuals_system,
                 sync_selection_system,
+                ghost_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -140,14 +185,20 @@ impl Plugin for RenderPlugin {
 pub fn spawn_tile_visuals(mut commands: Commands, map: Res<ShipMap>, art: Res<Art>) {
     for (pos, tile) in map.iter_tiles() {
         let img = match tile {
-            crate::map::Tile::Floor => art.floor.clone(),
             crate::map::Tile::Wall => art.wall.clone(),
+            _ => art.floor.clone(),
         };
         let z = match tile {
-            crate::map::Tile::Floor => 0.0,
             crate::map::Tile::Wall => 0.05,
+            _ => 0.0,
         };
-        commands.spawn(sprite(img, crate::TILE, z, map.world_pos(pos), Color::WHITE));
+        commands.spawn(sprite(
+            img,
+            crate::TILE,
+            z,
+            map.world_pos(pos),
+            Color::WHITE,
+        ));
     }
 }
 
@@ -159,7 +210,7 @@ fn spawn_room_labels(mut commands: Commands) {
         ("CREW QUARTERS", 12, 1, 21, 5),
         ("ORE BAY", 23, 1, 34, 5),
         ("PARTS ROOM", 1, 10, 10, 17),
-        ("HOLD B", 12, 10, 21, 17),
+        ("FABRICATION", 12, 10, 21, 17),
         ("STORAGE", 23, 10, 34, 17),
     ];
     for (name, x0, y0, x1, y1) in rooms {
@@ -184,7 +235,9 @@ fn spawn_room_labels(mut commands: Commands) {
                 ..default()
             },
             TextColor(Color::srgba(0.62, 0.68, 0.78, 0.5)),
-            Transform::from_translation((center + Vec2::new(0.0, size.y * 0.5 - 14.0)).extend(0.02)),
+            Transform::from_translation(
+                (center + Vec2::new(0.0, size.y * 0.5 - 14.0)).extend(0.02),
+            ),
         ));
     }
 }
@@ -243,11 +296,43 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
                 .id()
         })
         .collect();
-    commands.insert_resource(Markers { selection, hover, target, dots });
+    let ghost = commands
+        .spawn((
+            Sprite {
+                image: art.ring.clone(),
+                custom_size: Some(Vec2::splat(crate::TILE * 0.95)),
+                color: Color::srgba(0.4, 1.0, 0.5, 0.8),
+                ..default()
+            },
+            Transform::from_translation(Vec3::Z * 0.8),
+            Visibility::Hidden,
+        ))
+        .id();
+    let ghost_label = commands
+        .spawn((
+            Text2d::new(""),
+            TextFont {
+                font_size: 12.0,
+                ..default()
+            },
+            TextColor(Color::WHITE),
+            Transform::from_translation(Vec3::new(0.0, 0.0, 0.82)),
+            Visibility::Hidden,
+        ))
+        .id();
+    commands.insert_resource(Markers {
+        selection,
+        hover,
+        target,
+        dots,
+        ghost,
+        ghost_label,
+    });
 }
 
 /// Spawn visuals for logic entities that do not have them yet.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn ensure_visuals_system(
     mut commands: Commands,
     map: Res<ShipMap>,
@@ -255,15 +340,32 @@ fn ensure_visuals_system(
     crews: Query<(Entity, &TilePos, &Crew), Without<HasVisual>>,
     items: Query<(Entity, &TilePos, &Item), Without<HasVisual>>,
     racks: Query<(Entity, &TilePos), (With<StorageCell>, Without<HasVisual>)>,
+    blueprints: Query<(Entity, &building::Footprint, &Blueprint), Without<HasVisual>>,
+    buildings: Query<
+        (Entity, &building::Footprint, &Building),
+        (Without<HasVisual>, Without<StorageCell>),
+    >,
 ) {
     for (e, pos, item) in items.iter() {
         let p = map.world_pos(*pos);
         commands.spawn((
-            Visual { target: e, role: Role::ItemSprite },
-            sprite(art.item(item.kind).clone(), crate::TILE * 0.62, 0.35, p, Color::WHITE),
+            Visual {
+                target: e,
+                role: Role::ItemSprite,
+            },
+            sprite(
+                art.item(item.kind).clone(),
+                crate::TILE * 0.62,
+                0.35,
+                p,
+                Color::WHITE,
+            ),
         ));
         commands.spawn((
-            Visual { target: e, role: Role::ItemRing },
+            Visual {
+                target: e,
+                role: Role::ItemRing,
+            },
             sprite(art.ring.clone(), crate::TILE * 0.95, 0.45, p, Color::WHITE),
             Visibility::Hidden,
         ));
@@ -272,11 +374,17 @@ fn ensure_visuals_system(
     for (e, pos, crew) in crews.iter() {
         let p = map.world_pos(*pos);
         commands.spawn((
-            Visual { target: e, role: Role::CrewSprite },
+            Visual {
+                target: e,
+                role: Role::CrewSprite,
+            },
             sprite(art.crew.clone(), crate::TILE * 0.8, 0.6, p, crew.tint),
         ));
         commands.spawn((
-            Visual { target: e, role: Role::CrewLabel },
+            Visual {
+                target: e,
+                role: Role::CrewLabel,
+            },
             Text2d::new(crew.name.clone()),
             TextFont {
                 font_size: 11.0,
@@ -286,8 +394,17 @@ fn ensure_visuals_system(
             Transform::from_translation((p + Vec2::new(0.0, -22.0)).extend(0.8)),
         ));
         commands.spawn((
-            Visual { target: e, role: Role::CrewCarry },
-            sprite(art.crate_.clone(), crate::TILE * 0.34, 0.7, p + Vec2::new(0.0, 24.0), Color::WHITE),
+            Visual {
+                target: e,
+                role: Role::CrewCarry,
+            },
+            sprite(
+                art.crate_.clone(),
+                crate::TILE * 0.34,
+                0.7,
+                p + Vec2::new(0.0, 24.0),
+                Color::WHITE,
+            ),
             Visibility::Hidden,
         ));
         commands.entity(e).insert(HasVisual);
@@ -295,11 +412,17 @@ fn ensure_visuals_system(
     for (e, pos) in racks.iter() {
         let p = map.world_pos(*pos);
         commands.spawn((
-            Visual { target: e, role: Role::Rack },
+            Visual {
+                target: e,
+                role: Role::Rack,
+            },
             sprite(art.rack.clone(), crate::TILE * 0.95, 0.2, p, Color::WHITE),
         ));
         commands.spawn((
-            Visual { target: e, role: Role::RackLabel },
+            Visual {
+                target: e,
+                role: Role::RackLabel,
+            },
             Text2d::new("0/4"),
             TextFont {
                 font_size: 13.0,
@@ -308,6 +431,79 @@ fn ensure_visuals_system(
             TextColor(Color::srgb(1.0, 0.93, 0.45)),
             Transform::from_translation((p + Vec2::new(0.0, 12.0)).extend(0.3)),
         ));
+        commands.entity(e).insert(HasVisual);
+    }
+    for (e, foot, bp) in blueprints.iter() {
+        let p = foot_world_pos(foot);
+        let d = building::def(bp.kind);
+        let size = crate::TILE * d.w as f32 * 0.95;
+        commands.spawn((
+            Visual {
+                target: e,
+                role: Role::BlueprintSprite,
+            },
+            sprite(
+                art.building(bp.kind).clone(),
+                size,
+                0.25,
+                p,
+                Color::srgba(0.55, 0.85, 1.0, 0.45),
+            ),
+        ));
+        commands.spawn((
+            Visual {
+                target: e,
+                role: Role::BlueprintLabel,
+            },
+            Text2d::new(""),
+            TextFont {
+                font_size: 12.0,
+                ..default()
+            },
+            TextColor(Color::srgb(0.65, 0.9, 1.0)),
+            Transform::from_translation((p + Vec2::new(0.0, 14.0)).extend(0.5)),
+        ));
+        commands.entity(e).insert(HasVisual);
+    }
+    for (e, foot, b) in buildings.iter() {
+        let p = foot_world_pos(foot);
+        let d = building::def(b.kind);
+        let size = crate::TILE * d.w as f32 * 0.98;
+        commands.spawn((
+            Visual {
+                target: e,
+                role: Role::BuildingSprite,
+            },
+            sprite(art.building(b.kind).clone(), size, 0.15, p, Color::WHITE),
+        ));
+        if b.kind == BuildingKind::Fabricator {
+            commands.spawn((
+                Visual {
+                    target: e,
+                    role: Role::FabRing,
+                },
+                sprite(
+                    art.ring.clone(),
+                    crate::TILE * 2.0 * 0.98,
+                    0.4,
+                    p,
+                    Color::WHITE,
+                ),
+            ));
+            commands.spawn((
+                Visual {
+                    target: e,
+                    role: Role::FabLabel,
+                },
+                Text2d::new(""),
+                TextFont {
+                    font_size: 12.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                Transform::from_translation((p + Vec2::new(0.0, 40.0)).extend(0.5)),
+            ));
+        }
         commands.entity(e).insert(HasVisual);
     }
 }
@@ -417,9 +613,9 @@ fn sync_item_visuals_system(
         }
         let ring_color = if cooled.is_some_and(|c| c.0 > now) {
             Color::srgb(1.0, 0.3, 0.25)
-        } else if let Some(claimer_tint) = reserved.and_then(|r| {
-            crews.iter().find(|(ce, _)| *ce == r.0).map(|(_, c)| c.tint)
-        }) {
+        } else if let Some(claimer_tint) =
+            reserved.and_then(|r| crews.iter().find(|(ce, _)| *ce == r.0).map(|(_, c)| c.tint))
+        {
             claimer_tint
         } else {
             Color::WHITE
@@ -430,7 +626,11 @@ fn sync_item_visuals_system(
             }
             match v.role {
                 Role::ItemSprite => {
-                    *vis = if carried_now { Visibility::Hidden } else { Visibility::Visible };
+                    *vis = if carried_now {
+                        Visibility::Hidden
+                    } else {
+                        Visibility::Visible
+                    };
                     tf.translation = p.extend(0.35);
                 }
                 Role::ItemRing => {
@@ -456,14 +656,88 @@ fn sync_rack_labels_system(
     for (e, cell) in racks.iter() {
         for (v, mut text) in labels.iter_mut() {
             if v.target == e && v.role == Role::RackLabel {
-                text.0 = cell.label();
+                text.0 = format!("{} {}", cell.label(), cell.filter_label());
             }
         }
     }
 }
 
-/// Selection ring, path preview dots, job target marker and hover ring.
+/// Building & blueprint visuals: deconstruct tint + progress, blueprint
+/// materials/progress text, fabricator state ring and label.
 #[allow(clippy::type_complexity)]
+fn sync_building_visuals_system(
+    blueprints: Query<(Entity, &Blueprint), Changed<Blueprint>>,
+    buildings: Query<(Entity, &Building, Option<&MarkedForDeconstruct>), Changed<Building>>,
+    fabs: Query<(Entity, &crate::production::Fabricator), Changed<crate::production::Fabricator>>,
+    mut sprites: Query<(&Visual, &mut Sprite), Without<Text2d>>,
+    mut labels: Query<(&Visual, &mut Text2d, &mut TextColor)>,
+) {
+    for (e, bp) in blueprints.iter() {
+        let label = if bp.progress > 0.0 {
+            format!("{}%", (bp.progress * 100.0) as u32)
+        } else {
+            bp.materials_label()
+        };
+        for (v, mut text, _) in labels.iter_mut() {
+            if v.target == e && v.role == Role::BlueprintLabel {
+                text.0 = label.clone();
+            }
+        }
+    }
+    for (e, _, marked) in buildings.iter() {
+        for (v, mut sprite) in sprites.iter_mut() {
+            if v.target == e && v.role == Role::BuildingSprite {
+                sprite.color = if marked.is_some() {
+                    Color::srgb(1.0, 0.8, 0.25)
+                } else {
+                    Color::WHITE
+                };
+            }
+        }
+    }
+    for (e, f) in fabs.iter() {
+        let state = f.state();
+        let (ring, text) = match state {
+            MachineState::NoOrder => (Color::srgba(0.6, 0.65, 0.7, 0.35), "no order".to_string()),
+            MachineState::WaitingInput => (
+                Color::srgba(1.0, 0.75, 0.25, 0.6),
+                format!("need {} ore", RECIPE.in_qty),
+            ),
+            MachineState::WaitingWorker => (
+                Color::srgba(0.35, 0.75, 1.0, 0.6),
+                "waiting for worker".to_string(),
+            ),
+            MachineState::Working => (
+                Color::srgba(0.35, 1.0, 0.5, 0.7),
+                format!("working {}%", (f.progress * 100.0) as u32),
+            ),
+            MachineState::OutputBlocked => (
+                Color::srgba(1.0, 0.35, 0.3, 0.7),
+                "output blocked".to_string(),
+            ),
+        };
+        for (v, mut sprite) in sprites.iter_mut() {
+            if v.target == e && v.role == Role::FabRing {
+                sprite.color = ring;
+            }
+        }
+        for (v, mut t, mut c) in labels.iter_mut() {
+            if v.target == e && v.role == Role::FabLabel {
+                t.0 = text.clone();
+                c.0 = match state {
+                    MachineState::Working => Color::srgb(0.55, 1.0, 0.65),
+                    MachineState::OutputBlocked => Color::srgb(1.0, 0.55, 0.45),
+                    _ => Color::WHITE,
+                };
+            }
+        }
+    }
+}
+
+/// Selection ring, path preview dots, job target marker, hover ring and the
+/// build-tool ghost.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn sync_selection_system(
     map: Res<ShipMap>,
     selection: Res<Selection>,
@@ -472,6 +746,8 @@ fn sync_selection_system(
     crews: Query<(Entity, &TilePos, &Movement, &CrewTask), With<Crew>>,
     items: Query<&TilePos, With<Item>>,
     racks: Query<(Entity, &TilePos), With<StorageCell>>,
+    blueprints: Query<(Entity, &building::Footprint), With<Blueprint>>,
+    buildings: Query<(Entity, &building::Footprint), (With<Building>, Without<Blueprint>)>,
     mut marker_q: Query<(&mut Transform, &mut Visibility)>,
 ) {
     // Hide everything first.
@@ -485,14 +761,28 @@ fn sync_selection_system(
         }
     }
 
+    let foot_pos = |e: Entity| {
+        blueprints
+            .iter()
+            .find(|(be, _)| *be == e)
+            .map(|(_, f)| foot_world_pos(f))
+            .or_else(|| {
+                buildings
+                    .iter()
+                    .find(|(be, _)| *be == e)
+                    .map(|(_, f)| foot_world_pos(f))
+            })
+    };
+
     // Hover ring (white, softer than the selection ring).
     let hover_pos = match hovered.0 {
-        Some(crate::input::Selected::Crew(e)) => crews
+        Some(Selected::Crew(e)) => crews
             .get(e)
             .ok()
             .map(|(_, pos, mov, _)| crew_world_pos(&map, pos, mov)),
-        Some(crate::input::Selected::Item(e)) => items.get(e).ok().map(|p| map.world_pos(*p)),
-        Some(crate::input::Selected::Rack(e)) => racks.get(e).ok().map(|(_, p)| map.world_pos(*p)),
+        Some(Selected::Item(e)) => items.get(e).ok().map(|p| map.world_pos(*p)),
+        Some(Selected::Rack(e)) => racks.get(e).ok().map(|(_, p)| map.world_pos(*p)),
+        Some(Selected::Blueprint(e)) | Some(Selected::Building(e)) => foot_pos(e),
         None => None,
     };
     if let Some(p) = hover_pos {
@@ -511,27 +801,42 @@ fn sync_selection_system(
     let mut dot_pos: Vec<Vec2> = Vec::new();
     let mut target_pos: Option<Vec2> = None;
     match sel {
-        crate::input::Selected::Crew(e) => {
+        Selected::Crew(e) => {
             if let Ok((_, pos, mov, task)) = crews.get(e) {
                 sel_pos = Some(crew_world_pos(&map, pos, mov));
                 dot_pos = mov.path.iter().map(|t| map.world_pos(*t)).collect();
-                if let CrewTask::Haul(job) = task {
-                    let carrying = matches!(job.phase, HaulPhase::ToStorage | HaulPhase::Storing);
-                    target_pos = if carrying {
-                        job.target_rack
-                            .and_then(|r| racks.get(r).ok())
-                            .map(|(_, p)| map.world_pos(*p))
-                    } else {
-                        items.get(job.item).ok().map(|p| map.world_pos(*p))
-                    };
+                match task {
+                    CrewTask::Haul(job) => {
+                        let carrying =
+                            matches!(job.phase, HaulPhase::ToDest | HaulPhase::Delivering);
+                        target_pos = if carrying {
+                            match job.dest {
+                                HaulDest::Storage => job
+                                    .target_rack
+                                    .and_then(|r| racks.get(r).ok())
+                                    .map(|(_, p)| map.world_pos(*p)),
+                                HaulDest::Blueprint(bp) => foot_pos(bp),
+                                HaulDest::Machine(m) => foot_pos(m),
+                            }
+                        } else {
+                            items.get(job.item).ok().map(|p| map.world_pos(*p))
+                        };
+                    }
+                    CrewTask::Build(job) | CrewTask::Deconstruct(job) | CrewTask::Operate(job) => {
+                        target_pos = foot_pos(job.target);
+                    }
+                    CrewTask::Idle(_) => {}
                 }
             }
         }
-        crate::input::Selected::Item(e) => {
+        Selected::Item(e) => {
             sel_pos = items.get(e).ok().map(|p| map.world_pos(*p));
         }
-        crate::input::Selected::Rack(e) => {
+        Selected::Rack(e) => {
             sel_pos = racks.get(e).ok().map(|(_, p)| map.world_pos(*p));
+        }
+        Selected::Blueprint(e) | Selected::Building(e) => {
+            sel_pos = foot_pos(e);
         }
     }
 
@@ -554,6 +859,116 @@ fn sync_selection_system(
         if let Ok((mut tf, mut vis)) = marker_q.get_mut(markers.dots[i]) {
             tf.translation = p.extend(0.15);
             *vis = Visibility::Visible;
+        }
+    }
+}
+
+/// Placement ghost: follows the cursor while a build tool is active, green
+/// when the footprint is placeable, red with the reason otherwise.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn ghost_system(
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    build_mode: Res<BuildMode>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    ui: Query<&Interaction, With<Node>>,
+    items: Query<(Entity, &TilePos), With<Item>>,
+    blueprints: Query<(Entity, &building::Footprint), With<Blueprint>>,
+    buildings: Query<(Entity, &building::Footprint), (With<Building>, Without<Blueprint>)>,
+    markers: Res<Markers>,
+    mut marker_q: Query<(&mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
+    mut label_q: Query<(&mut Transform, &mut Text2d, &mut Visibility)>,
+) {
+    let over_ui = ui
+        .iter()
+        .any(|i| matches!(i, Interaction::Hovered | Interaction::Pressed));
+    let mut hide = || {
+        if let Ok((_, _, mut vis)) = marker_q.get_mut(markers.ghost) {
+            *vis = Visibility::Hidden;
+        }
+        if let Ok((_, _, mut vis)) = label_q.get_mut(markers.ghost_label) {
+            *vis = Visibility::Hidden;
+        }
+    };
+    let Some(tool) = build_mode.0 else {
+        hide();
+        return;
+    };
+    let Some(cursor) = windows.single().ok().and_then(|w| w.cursor_position()) else {
+        hide();
+        return;
+    };
+    if over_ui {
+        hide();
+        return;
+    }
+    let Ok((cam, cam_gt)) = camera.single() else {
+        hide();
+        return;
+    };
+    let Ok(world) = cam.viewport_to_world_2d(cam_gt, cursor) else {
+        hide();
+        return;
+    };
+    let Some(tile) = map.tile_at_world(world) else {
+        hide();
+        return;
+    };
+
+    match tool {
+        Tool::Build(kind) => {
+            let d = building::def(kind);
+            let foot = building::Footprint::new(tile.x, tile.y, d.w, d.h);
+            let ground: Vec<TilePos> = items.iter().map(|(_, p)| *p).collect();
+            let mut feet: Vec<(building::Footprint, bool)> =
+                blueprints.iter().map(|(_, f)| (*f, true)).collect();
+            feet.extend(buildings.iter().map(|(_, f)| (*f, false)));
+            let check = building::can_place(&map, kind, tile, &ground, &feet);
+            let (color, text) = match &check {
+                Ok(()) => {
+                    let cost: u32 = d.cost.iter().sum();
+                    (
+                        Color::srgba(0.4, 1.0, 0.5, 0.55),
+                        format!("{} — {} part", d.label, cost),
+                    )
+                }
+                Err(e) => (Color::srgba(1.0, 0.35, 0.3, 0.55), e.label().to_string()),
+            };
+            let p = foot_world_pos(&foot);
+            if let Ok((mut tf, mut sprite, mut vis)) = marker_q.get_mut(markers.ghost) {
+                sprite.image = art.building(kind).clone();
+                sprite.custom_size = Some(Vec2::splat(crate::TILE * d.w as f32 * 0.95));
+                sprite.color = color;
+                tf.translation = p.extend(0.8);
+                *vis = Visibility::Visible;
+            }
+            if let Ok((mut tf, mut text2d, mut vis)) = label_q.get_mut(markers.ghost_label) {
+                text2d.0 = text;
+                tf.translation = (p + Vec2::new(0.0, 14.0 + d.h as f32 * 10.0)).extend(0.82);
+                *vis = Visibility::Visible;
+            }
+        }
+        Tool::Deconstruct => {
+            let found = buildings.iter().find(|(_, f)| f.contains(tile));
+            let Some((_, f)) = found else {
+                hide();
+                return;
+            };
+            let p = foot_world_pos(f);
+            if let Ok((mut tf, mut sprite, mut vis)) = marker_q.get_mut(markers.ghost) {
+                sprite.image = art.ring.clone();
+                sprite.custom_size = Some(Vec2::splat(crate::TILE * f.w.max(f.h) as f32 * 1.05));
+                sprite.color = Color::srgba(1.0, 0.8, 0.25, 0.7);
+                tf.translation = p.extend(0.8);
+                *vis = Visibility::Visible;
+            }
+            if let Ok((mut tf, mut text2d, mut vis)) = label_q.get_mut(markers.ghost_label) {
+                text2d.0 = "deconstruct".to_string();
+                tf.translation = (p + Vec2::new(0.0, 14.0)).extend(0.82);
+                *vis = Visibility::Visible;
+            }
         }
     }
 }

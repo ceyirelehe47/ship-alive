@@ -1,6 +1,11 @@
 //! Bootstraps the world from the hand-authored ship layout: map resource,
-//! camera, crew, racks and ground items.
+//! camera, crew, racks, fabricator and ground items.
+//!
+//! Map-spawned racks and the starter fabricator carry the same `Building`
+//! component the construction system produces, so everything the player can
+//! see blocking a tile can also be torn down and moved.
 
+use crate::building::{Building, BuildingKind, Footprint};
 use crate::crew::{Crew, CrewTask, Movement};
 use crate::items;
 use crate::log::EventLog;
@@ -25,7 +30,11 @@ impl Plugin for SetupPlugin {
     }
 }
 
-pub fn setup_world(mut commands: Commands, mut images: ResMut<Assets<Image>>, server: Res<AssetServer>) {
+pub fn setup_world(
+    mut commands: Commands,
+    mut images: ResMut<Assets<Image>>,
+    server: Res<AssetServer>,
+) {
     let (map, spawns) = ShipMap::from_layout(&MAP_LAYOUT);
 
     // Camera centered on the ship.
@@ -40,6 +49,7 @@ pub fn setup_world(mut commands: Commands, mut images: ResMut<Assets<Image>>, se
 
     commands.insert_resource(map);
     commands.insert_resource(EventLog::default());
+    commands.insert_resource(crate::stats::Stats::default());
     commands.insert_resource(crate::render::Art::load(&server, &mut images));
 
     let mut crew_index = 0;
@@ -58,8 +68,33 @@ pub fn setup_world(mut commands: Commands, mut images: ResMut<Assets<Image>>, se
                     Movement::default(),
                 ));
             }
-            SpawnReq::Rack { pos } => {
-                commands.spawn((TilePos::new(pos.x, pos.y), StorageCell::default()));
+            SpawnReq::Rack { pos, fill } => {
+                let cell = match fill {
+                    Some((kind, n)) => StorageCell::with_stock(kind, n),
+                    None => StorageCell::default(),
+                };
+                commands.spawn((
+                    TilePos::new(pos.x, pos.y),
+                    cell,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Rack,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                ));
+            }
+            SpawnReq::Fabricator { pos } => {
+                commands.spawn((
+                    TilePos::new(pos.x, pos.y),
+                    crate::production::Fabricator::default(),
+                    Footprint::new(pos.x, pos.y, 2, 2),
+                    Building {
+                        kind: BuildingKind::Fabricator,
+                        foot: Footprint::new(pos.x, pos.y, 2, 2),
+                        demo_progress: 0.0,
+                    },
+                ));
             }
             SpawnReq::Item { pos, kind } => {
                 items::spawn_item(&mut commands, pos, kind);

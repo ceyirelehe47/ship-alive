@@ -10,6 +10,7 @@
 use bevy::prelude::*;
 
 pub mod autotest;
+pub mod building;
 pub mod crew;
 pub mod input;
 pub mod items;
@@ -18,8 +19,10 @@ pub mod log;
 pub mod map;
 pub mod movement;
 pub mod path;
+pub mod production;
 pub mod render;
 pub mod setup;
+pub mod stats;
 pub mod storage;
 pub mod time_ctrl;
 pub mod ui;

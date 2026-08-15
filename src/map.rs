@@ -10,36 +10,49 @@
 use bevy::prelude::*;
 
 /// Legend:
-///  `#` wall            `.` floor
+///  `#` hull wall       `.` floor
 ///  `S` storage rack    `C` crew spawn
+///  `P` parts rack (4 machinery parts)   `O` ore rack (4 asteroid ore)
+///  `F` fabricator origin (2x2 machine — all four tiles carry the char)
 ///  `1` crate item      `2` ore item      `3` machinery part item
 ///  `X` item inside a sealed pocket (permanently unreachable — scenario C)
+///
+/// Slice 1 layout notes: the ore bay (top right) and the storage racks
+/// (bottom right) are deliberately far from the fabricator (FABRICATION,
+/// bottom middle) so a bad supply layout is visible and worth optimizing.
 pub const MAP_LAYOUT: [&str; 19] = [
     "####################################",
-    "#....1.....#..........#............#",
-    "#..1....1..#....C.....#...2........#",
-    "#..........#....C.....#......2.....#",
-    "#..1....1..#....C.....#..........2.#",
-    "#........1.#....C.....#...2........#",
+    "#.3..1.....#..........#...2...2....#",
+    "#..1....1..#....C.....#....2...2...#",
+    "#.3....3...#....C.....#..........2.#",
+    "#..1....1..#....C.....#...2...2....#",
+    "#........1.#....C.....#........2...#",
     "######.#########.###########.#######",
     "#..................................#",
-    "#..................................#",
+    "#.............3............3.......#",
     "#####.###########.#########.####.###",
-    "#..........#..........#............#",
-    "#..........#..........#....SSS.....#",
-    "#..........#...###....#....SSS.....#",
-    "#..........#...#X#....#............#",
-    "#..........#...###....#............#",
-    "#..3.......#.......1..#............#",
-    "#......3...#.1........#............#",
-    "#..........#..........#............#",
+    "#..........#..........#....SPS.....#",
+    "#..........#..........#....SPS.....#",
+    "#..........#...FF.....#............#",
+    "#..3.......#...FF.....#....SO......#",
+    "#....3.3...#..........#....SO......#",
+    "#.###......#..........#............#",
+    "#.#X#......#.3........#............#",
+    "#.###......#..........#............#",
     "####################################",
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tile {
+    /// Hull wall (part of the fixed ship shell — never player-built).
     Wall,
     Floor,
+    /// Player-built interior wall (blocks movement, deconstructable).
+    BuiltWall,
+    /// Player-built door (walkable, future airlock hook).
+    Door,
+    /// Tile occupied by a multi-tile machine footprint (blocks movement).
+    Machine,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -73,12 +86,28 @@ impl ShipMap {
         );
         let mut tiles = Vec::with_capacity((width * height) as usize);
         let mut spawns = Vec::new();
+        // Origins of 2x2 fabricators already registered (the map char repeats
+        // on all four footprint tiles; only the first spawns an entity).
+        let mut fab_origins: Vec<(i32, i32)> = Vec::new();
         for (y, row) in layout.iter().enumerate() {
             for (x, ch) in row.chars().enumerate() {
                 let pos = TilePos::new(x as i32, y as i32);
                 match ch {
                     '#' => tiles.push(Tile::Wall),
-                    '.' | 'C' | 'S' | 'X' => tiles.push(Tile::Floor),
+                    'F' => {
+                        tiles.push(Tile::Machine);
+                        let covered = fab_origins.iter().any(|&(ox, oy)| {
+                            x as i32 >= ox
+                                && x as i32 <= ox + 1
+                                && y as i32 >= oy
+                                && y as i32 <= oy + 1
+                        });
+                        if !covered {
+                            fab_origins.push((x as i32, y as i32));
+                            spawns.push(SpawnReq::Fabricator { pos });
+                        }
+                    }
+                    '.' | 'C' | 'S' | 'P' | 'O' | 'X' => tiles.push(Tile::Floor),
                     d @ ('1' | '2' | '3') => {
                         tiles.push(Tile::Floor);
                         spawns.push(SpawnReq::Item {
@@ -90,7 +119,15 @@ impl ShipMap {
                 }
                 match ch {
                     'C' => spawns.push(SpawnReq::Crew { pos }),
-                    'S' => spawns.push(SpawnReq::Rack { pos }),
+                    'S' => spawns.push(SpawnReq::Rack { pos, fill: None }),
+                    'P' => spawns.push(SpawnReq::Rack {
+                        pos,
+                        fill: Some((crate::items::ItemKind::Part, 4)),
+                    }),
+                    'O' => spawns.push(SpawnReq::Rack {
+                        pos,
+                        fill: Some((crate::items::ItemKind::Ore, 4)),
+                    }),
                     'X' => spawns.push(SpawnReq::Item {
                         pos,
                         kind: crate::items::ItemKind::Crate,
@@ -122,7 +159,14 @@ impl ShipMap {
     }
 
     pub fn is_walkable(&self, p: TilePos) -> bool {
-        self.tile(p) == Some(Tile::Floor)
+        matches!(self.tile(p), Some(Tile::Floor) | Some(Tile::Door))
+    }
+
+    /// Overwrite one tile (used when buildings complete or are torn down).
+    /// Slice 1 only ever writes floor-side tiles; hull walls are never touched.
+    pub fn set_tile(&mut self, p: TilePos, tile: Tile) {
+        assert!(self.in_bounds(p), "set_tile out of bounds at {p:?}");
+        self.tiles[(p.y * self.width + p.x) as usize] = tile;
     }
 
     /// World-space center of a tile (row 0 renders at the top).
@@ -156,9 +200,22 @@ impl ShipMap {
 /// Things the hand-authored layout asks the game to spawn.
 #[derive(Clone, Copy, Debug)]
 pub enum SpawnReq {
-    Crew { pos: TilePos },
-    Rack { pos: TilePos },
-    Item { pos: TilePos, kind: crate::items::ItemKind },
+    Crew {
+        pos: TilePos,
+    },
+    Rack {
+        pos: TilePos,
+        /// Pre-stocked kind + amount.
+        fill: Option<(crate::items::ItemKind, u32)>,
+    },
+    /// 2x2 fabricator with its top-left tile at `pos`.
+    Fabricator {
+        pos: TilePos,
+    },
+    Item {
+        pos: TilePos,
+        kind: crate::items::ItemKind,
+    },
 }
 
 impl From<char> for crate::items::ItemKind {
@@ -173,7 +230,11 @@ impl From<char> for crate::items::ItemKind {
 
 /// Find a free floor tile near `around` for dropping an item.
 /// Prefers `around` itself, then scans outward in a small square.
-pub fn find_drop_tile(map: &ShipMap, around: TilePos, racks: &[(TilePos, Entity)]) -> Option<TilePos> {
+pub fn find_drop_tile(
+    map: &ShipMap,
+    around: TilePos,
+    racks: &[(TilePos, Entity)],
+) -> Option<TilePos> {
     for dy in 0..=2 {
         for dx in 0..=2 {
             for p in [
@@ -191,19 +252,32 @@ pub fn find_drop_tile(map: &ShipMap, around: TilePos, racks: &[(TilePos, Entity)
     None
 }
 
+/// Like [`find_drop_tile`] but takes a plain list of tiles to avoid (used when
+/// spawning several refund items at once).
+pub fn find_drop_tile_ext(map: &ShipMap, around: TilePos, occupied: &[TilePos]) -> Option<TilePos> {
+    for dy in 0..=3 {
+        for dx in 0..=3 {
+            for p in [
+                TilePos::new(around.x + dx, around.y + dy),
+                TilePos::new(around.x - dx, around.y + dy),
+                TilePos::new(around.x + dx, around.y - dy),
+                TilePos::new(around.x - dx, around.y - dy),
+            ] {
+                if map.is_walkable(p) && !occupied.contains(&p) {
+                    return Some(p);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn test_map() -> ShipMap {
-        ShipMap::from_layout(&[
-            "#####",
-            "#...#",
-            "#.#.#",
-            "#...#",
-            "#####",
-        ])
-        .0
+        ShipMap::from_layout(&["#####", "#...#", "#.#.#", "#...#", "#####"]).0
     }
 
     #[test]
@@ -211,9 +285,34 @@ mod tests {
         let (map, spawns) = ShipMap::from_layout(&MAP_LAYOUT);
         assert_eq!(map.width, 36);
         assert_eq!(map.height, 19);
-        assert_eq!(spawns.iter().filter(|s| matches!(s, SpawnReq::Crew { .. })).count(), 4);
-        assert_eq!(spawns.iter().filter(|s| matches!(s, SpawnReq::Rack { .. })).count(), 6);
-        assert_eq!(spawns.iter().filter(|s| matches!(s, SpawnReq::Item { .. })).count(), 15);
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Crew { .. }))
+                .count(),
+            4
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Rack { .. }))
+                .count(),
+            10
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Fabricator { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Item { .. }))
+                .count(),
+            24
+        );
     }
 
     #[test]

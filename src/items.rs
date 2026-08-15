@@ -53,9 +53,6 @@ pub struct NoPathUntil(pub f64);
 
 pub fn spawn_item(commands: &mut Commands, pos: crate::map::TilePos, kind: ItemKind) -> Entity {
     commands
-        .spawn((
-            crate::map::TilePos::new(pos.x, pos.y),
-            Item { kind },
-        ))
+        .spawn((crate::map::TilePos::new(pos.x, pos.y), Item { kind }))
         .id()
 }

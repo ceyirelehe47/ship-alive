@@ -13,7 +13,9 @@ const TOLERANCE: i32 = 60;
 const OUT_SIZE: u32 = 256;
 
 fn is_key(p: Rgba<u8>) -> bool {
-    (p[0] as i32 - KEY[0] as i32).abs() + (p[1] as i32 - KEY[1] as i32).abs() + (p[2] as i32 - KEY[2] as i32).abs()
+    (p[0] as i32 - KEY[0] as i32).abs()
+        + (p[1] as i32 - KEY[1] as i32).abs()
+        + (p[2] as i32 - KEY[2] as i32).abs()
         <= TOLERANCE * 3
 }
 
@@ -103,14 +105,31 @@ fn process(name: &str) {
     let mut rgba = img.to_rgba8();
     remove_background(&mut rgba);
     let squared = crop_and_square(&mut rgba);
-    let resized = DynamicImage::ImageRgba8(squared).resize_exact(OUT_SIZE, OUT_SIZE, image::imageops::FilterType::Lanczos3);
+    let resized = DynamicImage::ImageRgba8(squared).resize_exact(
+        OUT_SIZE,
+        OUT_SIZE,
+        image::imageops::FilterType::Lanczos3,
+    );
     std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
     resized.save(&dst).unwrap();
     println!("{} -> {} ok", src.display(), dst.display());
 }
 
 fn main() {
-    for name in ["floor", "wall", "rack", "crate", "ore", "part", "crew", "ring", "dot"] {
+    for name in [
+        "floor",
+        "wall",
+        "wall_built",
+        "door",
+        "rack",
+        "fabricator",
+        "crate",
+        "ore",
+        "part",
+        "crew",
+        "ring",
+        "dot",
+    ] {
         process(name);
     }
 }

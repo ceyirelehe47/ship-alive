@@ -4,6 +4,7 @@
 //! hovers (crew / item / rack); the box-select rect is drawn while the left
 //! button is dragged on the map. Both are plain UI nodes updated per frame.
 
+use crate::building::{Blueprint, Building};
 use crate::crew::{Crew, CrewTask, Movement};
 use crate::input::{BoxSelect, Hovered, Selected};
 use crate::items::{CarriedBy, Item, MarkedForHaul, NoPathUntil, ReservedBy};
@@ -88,6 +89,7 @@ pub fn build_overlay(mut commands: Commands) {
 
 /// Follow the cursor with a small info card for the hovered target.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn tooltip_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     hovered: Res<Hovered>,
@@ -107,6 +109,8 @@ pub fn tooltip_system(
         With<Item>,
     >,
     racks: Query<(&TilePos, &StorageCell), With<StorageCell>>,
+    blueprints: Query<(&TilePos, &Blueprint)>,
+    buildings: Query<(&TilePos, &Building), Without<Blueprint>>,
     mut node_q: Query<&mut Node, With<ZIndex>>,
     mut text_q: Query<(&mut Text, &mut TextColor)>,
     mut vis_q: Query<&mut Visibility>,
@@ -133,11 +137,43 @@ pub fn tooltip_system(
                 Some(if cell.free() == 0 {
                     format!("{} — FULL", cell.label())
                 } else {
-                    format!("{} — free slots: {}", cell.label(), cell.free())
+                    format!(
+                        "{} — free: {} | accepts: {}",
+                        cell.label(),
+                        cell.free(),
+                        cell.filter_label()
+                    )
                 }),
             ),
             Err(_) => (None, None),
         },
+        Some(Selected::Blueprint(e)) => match blueprints.get(e) {
+            Ok((p, bp)) => (
+                Some(format!("{} blueprint ({},{})", bp.kind.label(), p.x, p.y)),
+                Some(if bp.fully_supplied() {
+                    "materials complete — awaiting builder".to_string()
+                } else {
+                    format!("needs: {}", bp.materials_label())
+                }),
+            ),
+            Err(_) => (None, None),
+        },
+        Some(Selected::Building(e)) => {
+            if let Ok((p, b)) = buildings.get(e) {
+                (
+                    Some(format!("{} ({},{})", b.kind.label(), p.x, p.y)),
+                    Some(match b.kind {
+                        crate::building::BuildingKind::Rack => "storage rack".to_string(),
+                        crate::building::BuildingKind::Fabricator => {
+                            "2x2 machine — select for orders".to_string()
+                        }
+                        _ => "player-built structure".to_string(),
+                    }),
+                )
+            } else {
+                (None, None)
+            }
+        }
         None => (None, None),
     };
 
@@ -147,7 +183,11 @@ pub fn tooltip_system(
         None
     };
     if let Ok(mut vis) = vis_q.get_mut(overlay.tooltip) {
-        *vis = if show.is_some() { Visibility::Visible } else { Visibility::Hidden };
+        *vis = if show.is_some() {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
     }
     let Some((t, d)) = title.zip(detail) else {
         return;

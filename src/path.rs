@@ -18,7 +18,10 @@ impl Ord for OpenNode {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         // BinaryHeap is a max-heap: order by estimated total, then lower cost,
         // so the most promising node pops first.
-        other.est_total.cmp(&self.est_total).then(other.cost.cmp(&self.cost))
+        other
+            .est_total
+            .cmp(&self.est_total)
+            .then(other.cost.cmp(&self.cost))
     }
 }
 
@@ -47,7 +50,11 @@ pub fn find_path(
     let mut best_cost: HashMap<TilePos, u32> = HashMap::new();
     let mut came_from: HashMap<TilePos, TilePos> = HashMap::new();
 
-    open.push(OpenNode { cost: 0, est_total: heuristic(from), pos: from });
+    open.push(OpenNode {
+        cost: 0,
+        est_total: heuristic(from),
+        pos: from,
+    });
     best_cost.insert(from, 0);
 
     while let Some(OpenNode { cost, pos, .. }) = open.pop() {
@@ -102,14 +109,7 @@ mod tests {
     use super::*;
 
     fn map() -> ShipMap {
-        ShipMap::from_layout(&[
-            "#####",
-            "#...#",
-            "#.#.#",
-            "#...#",
-            "#####",
-        ])
-        .0
+        ShipMap::from_layout(&["#####", "#...#", "#.#.#", "#...#", "#####"]).0
     }
 
     #[test]
@@ -138,12 +138,18 @@ mod tests {
     #[test]
     fn goal_blocked_by_dynamic_obstacle() {
         let m = map();
-        assert!(find_path(&m, TilePos::new(1, 1), TilePos::new(3, 1), |p| p == TilePos::new(3, 1)).is_none());
+        assert!(find_path(&m, TilePos::new(1, 1), TilePos::new(3, 1), |p| p
+            == TilePos::new(3, 1))
+        .is_none());
     }
 
     #[test]
     fn zero_length_path_when_already_there() {
         let m = map();
-        assert!(find_path(&m, TilePos::new(2, 1), TilePos::new(2, 1), |_| false).unwrap().is_empty());
+        assert!(
+            find_path(&m, TilePos::new(2, 1), TilePos::new(2, 1), |_| false)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

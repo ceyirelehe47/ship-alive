@@ -216,11 +216,11 @@ impl ThermalGrid {
     /// Total heat content vs absolute zero, including per-tile device mass.
     /// Conservation tests compare *deltas* of this against injections and
     /// radiator dumps.
-    pub fn total_heat(&self, masses: &HashMap<usize, f32>) -> f64 {
+    pub fn total_heat(&self, devices: &DeviceTiles) -> f64 {
         let mut total = 0.0f64;
         for i in 0..self.amb.len() {
-            let m = masses.get(&i).copied().unwrap_or(0.0);
-            total += (self.air_cap(m) as f64) * (self.amb[i] + KELVIN_OFFSET) as f64;
+            total +=
+                (self.air_cap(devices.mass_at(i)) as f64) * (self.amb[i] + KELVIN_OFFSET) as f64;
             total += (self.solid_cap[i] as f64) * (self.solid_temp[i] + KELVIN_OFFSET) as f64;
         }
         total
@@ -373,10 +373,37 @@ impl ThermalState {
 
 /// Per-tile device data rebuilt each step by `thermal_air_system` and shared
 /// with the coolant system (HX exchanges against the same effective air cap).
-#[derive(Resource, Default, Debug)]
+/// Dense (grid-length) so the conduction inner loop reads it with a plain
+/// index instead of hashing.
+#[derive(Resource, Default, Debug, Clone)]
 pub struct DeviceTiles {
     /// Extra heat mass per tile index (device footprint mass, spread).
-    pub mass: HashMap<usize, f32>,
+    /// Empty until the first step sizes it; `mass_at` tolerates that.
+    pub mass: Vec<f32>,
+}
+
+impl DeviceTiles {
+    /// Zeroed, grid-sized device mass (setup + test harnesses).
+    pub fn sized(tiles: usize) -> Self {
+        Self {
+            mass: vec![0.0; tiles],
+        }
+    }
+
+    /// Extra device mass at a tile (0.0 when unsized or no device).
+    #[inline]
+    pub fn mass_at(&self, i: usize) -> f32 {
+        self.mass.get(i).copied().unwrap_or(0.0)
+    }
+
+    /// Reset all masses to zero, keeping the allocation.
+    fn reset(&mut self, tiles: usize) {
+        if self.mass.len() != tiles {
+            self.mass = vec![0.0; tiles];
+        } else {
+            self.mass.iter_mut().for_each(|m| *m = 0.0);
+        }
+    }
 }
 
 /// Cumulative thermal accounting + per-step telemetry.
@@ -416,7 +443,7 @@ pub fn thermal_air_system(
     if dt <= 0.0 {
         return;
     }
-    devices.mass.clear();
+    devices.reset(grid.amb.len());
 
     // Online generators per power network: a network's served load is shared
     // between its reactors (single-reactor networks divide by one).
@@ -493,7 +520,7 @@ pub fn thermal_air_system(
         };
         for &t in &tiles {
             let i = grid.idx(t);
-            *devices.mass.entry(i).or_insert(0.0) += per_tile_mass;
+            devices.mass[i] += per_tile_mass;
             if heat > 0.0 {
                 let q = heat * dt / tiles.len() as f32;
                 grid.amb[i] += q / grid.air_cap(per_tile_mass);
@@ -506,10 +533,11 @@ pub fn thermal_air_system(
     // ---- 2. Conduction over awake tiles -------------------------------------------
     let current = grid.take_awake();
     stats.active_tiles = current.len();
+    let dev_mass = &devices.mass;
     for &i in &current {
         let p = grid.pos(i);
         let solid_i = grid.solid_cap[i] > 0.0;
-        let mass_i = devices.mass.get(&i).copied().unwrap_or(0.0);
+        let mass_i = dev_mass[i];
         for nb in [
             TilePos::new(p.x + 1, p.y),
             TilePos::new(p.x - 1, p.y),
@@ -530,7 +558,7 @@ pub fn thermal_air_system(
             let solid_j = grid.solid_cap[j] > 0.0;
             let moved = match (solid_i, solid_j) {
                 (false, false) => {
-                    let mj = devices.mass.get(&j).copied().unwrap_or(0.0);
+                    let mj = dev_mass[j];
                     let mut ta = grid.amb[i];
                     let mut tb = grid.amb[j];
                     let moved = conduct(
@@ -564,7 +592,7 @@ pub fn thermal_air_system(
                     // One solid, one open: air↔structure surface exchange.
                     let (si, sj) = if a { (i, j) } else { (j, i) };
                     let mut ts = grid.solid_temp[si];
-                    let mass_open = devices.mass.get(&sj).copied().unwrap_or(0.0);
+                    let mass_open = dev_mass[sj];
                     let mut to = grid.amb[sj];
                     let moved = conduct(
                         &mut ts,
@@ -835,12 +863,12 @@ mod tests {
     fn total_heat_tracks_injection_exactly() {
         let map = map_of(&["####", "#..#", "#..#", "####"]);
         let mut grid = ThermalGrid::new(&map);
-        let masses = HashMap::new();
-        let before = grid.total_heat(&masses);
+        let devices = DeviceTiles::default();
+        let before = grid.total_heat(&devices);
         let i = grid.idx(TilePos::new(1, 1));
         let q = 480.0f64;
         grid.amb[i] += (q as f32) / AMB_CAP;
-        let after = grid.total_heat(&masses);
+        let after = grid.total_heat(&devices);
         assert!((after - before - q).abs() < 1e-6);
     }
 
@@ -853,12 +881,12 @@ mod tests {
         grid.amb[b] = 0.0;
         grid.wake(a);
         grid.wake(b);
-        let masses = HashMap::new();
-        let h0 = grid.total_heat(&masses);
+        let devices = DeviceTiles::default();
+        let h0 = grid.total_heat(&devices);
         for _ in 0..4000 {
             conduction_pass(&mut grid, 1.0);
         }
-        let h1 = grid.total_heat(&masses);
+        let h1 = grid.total_heat(&devices);
         // f32 exchange accumulation drifts slightly over hundreds of steps.
         assert!(
             (h1 - h0).abs() < 0.5,

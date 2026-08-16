@@ -234,6 +234,16 @@ pub struct CoolantState {
     pub networks: Vec<CoolantNet>,
     pub device_net: HashMap<Entity, usize>,
     pub order: Vec<Vec<usize>>,
+    /// Topology epoch: `PipeGrid::version` folded with the coolant device
+    /// set. While unchanged, the flood fill / attachment work is skipped —
+    /// water and temperatures still advance every step.
+    pub topo_sig: u64,
+    /// Pipe tile index → network index (rebuilt only on topology changes).
+    pub net_of: HashMap<usize, usize>,
+    /// Telemetry: full topology rebuilds since boot (1 per pipe/device edit).
+    pub topology_rebuilds: u32,
+    /// Scratch buffer for circulation releases (reused every step).
+    released: Vec<f32>,
 }
 
 /// Coolant accounting + telemetry.
@@ -259,8 +269,8 @@ pub fn water_heat(water: &WaterGrid) -> f64 {
 }
 
 /// Attach a device to the network of its (pipe-backed) tile.
-fn attach(
-    state: &mut CoolantState,
+fn attach_into(
+    device_net: &mut HashMap<Entity, usize>,
     net_of: &HashMap<usize, usize>,
     e: Entity,
     tile: TilePos,
@@ -270,7 +280,7 @@ fn attach(
         return None;
     }
     let net = *net_of.get(&pipes.idx(tile))?;
-    state.device_net.insert(e, net);
+    device_net.insert(e, net);
     Some(net)
 }
 
@@ -290,71 +300,109 @@ pub fn coolant_system(
     pumps: Query<(Entity, &Footprint, &crate::power::PowerStatus), With<Pump>>,
     exchangers: Query<(Entity, &Footprint), With<HeatExchanger>>,
     radiators: Query<(Entity, &Footprint, &Radiator)>,
-    reservoirs: Query<&Footprint, With<Reservoir>>,
+    reservoirs: Query<(Entity, &Footprint), With<Reservoir>>,
 ) {
     let dt = clock.dt() as f32;
     if dt <= 0.0 {
         return;
     }
 
-    // ---- 1. Networks: flood fill into DFS walks (deterministic) -------------------
-    let mut order: Vec<Vec<usize>> = Vec::new();
-    let mut net_of: HashMap<usize, usize> = HashMap::new();
-    {
-        let mut visited = vec![false; water.amount.len()];
-        let mut starts: Vec<usize> = pipes.iter_pipes().map(|p| pipes.idx(p)).collect();
-        starts.sort_unstable();
-        for start in starts {
-            if visited[start] {
-                continue;
+    // ---- 1. Topology: flood fill + device attachment, cached per epoch -------------
+    // Topology only changes when pipes are edited or coolant devices are
+    // added/removed — never because water moved or power flipped. Folding the
+    // pipe version with the device entity bits gives a cheap per-step guard.
+    let mut device_sig: u64 = 0xcbf2_9ce4_8422_2325;
+    for (e, _, _) in pumps.iter() {
+        device_sig = device_sig.wrapping_mul(31) ^ (e.to_bits() << 3) ^ 0xA1;
+    }
+    for (e, _) in exchangers.iter() {
+        device_sig = device_sig.wrapping_mul(31) ^ (e.to_bits() << 3) ^ 0xB2;
+    }
+    for (e, _, _) in radiators.iter() {
+        device_sig = device_sig.wrapping_mul(31) ^ (e.to_bits() << 3) ^ 0xC3;
+    }
+    for (e, _) in reservoirs.iter() {
+        device_sig = device_sig.wrapping_mul(31) ^ (e.to_bits() << 3) ^ 0xD4;
+    }
+    let topo_sig = pipes.version.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ device_sig;
+
+    if topo_sig != state.topo_sig {
+        state.topo_sig = topo_sig;
+        state.topology_rebuilds += 1;
+        let mut order: Vec<Vec<usize>> = Vec::new();
+        let mut net_of: HashMap<usize, usize> = HashMap::new();
+        {
+            let mut visited = vec![false; water.amount.len()];
+            let mut starts: Vec<usize> = pipes.iter_pipes().map(|p| pipes.idx(p)).collect();
+            starts.sort_unstable();
+            for start in starts {
+                if visited[start] {
+                    continue;
+                }
+                let net = order.len();
+                let mut walk: Vec<usize> = Vec::new();
+                let mut stack = vec![start];
+                visited[start] = true;
+                while let Some(i) = stack.pop() {
+                    walk.push(i);
+                    net_of.insert(i, net);
+                    let p = TilePos::new(i as i32 % water.width, i as i32 / water.width);
+                    let mut nbs: Vec<usize> = [
+                        TilePos::new(p.x + 1, p.y),
+                        TilePos::new(p.x - 1, p.y),
+                        TilePos::new(p.x, p.y + 1),
+                        TilePos::new(p.x, p.y - 1),
+                    ]
+                    .iter()
+                    .filter(|&&n| pipes.has(n))
+                    .map(|&n| pipes.idx(n))
+                    .filter(|&j| !visited[j])
+                    .collect::<Vec<_>>();
+                    // Ascending on the walk: push descending so the stack pops
+                    // the smallest index first.
+                    nbs.sort_unstable();
+                    for &j in nbs.iter().rev() {
+                        visited[j] = true;
+                        stack.push(j);
+                    }
+                }
+                order.push(walk);
             }
-            let net = order.len();
-            let mut walk: Vec<usize> = Vec::new();
-            let mut stack = vec![start];
-            visited[start] = true;
-            while let Some(i) = stack.pop() {
-                walk.push(i);
-                net_of.insert(i, net);
-                let p = TilePos::new(i as i32 % water.width, i as i32 / water.width);
-                let mut nbs: Vec<usize> = [
-                    TilePos::new(p.x + 1, p.y),
-                    TilePos::new(p.x - 1, p.y),
-                    TilePos::new(p.x, p.y + 1),
-                    TilePos::new(p.x, p.y - 1),
-                ]
-                .iter()
-                .filter(|&&n| pipes.has(n))
-                .map(|&n| pipes.idx(n))
-                .filter(|&j| !visited[j])
-                .collect::<Vec<_>>();
-                // Ascending on the walk: push descending so the stack pops
-                // the smallest index first.
-                nbs.sort_unstable();
-                for &j in nbs.iter().rev() {
-                    visited[j] = true;
-                    stack.push(j);
+        }
+        let mut device_net: HashMap<Entity, usize> = HashMap::new();
+        for (e, foot, _) in pumps.iter() {
+            if let Some(tile) = foot.tiles().next() {
+                attach_into(&mut device_net, &net_of, e, tile, &pipes);
+            }
+        }
+        for (e, foot) in exchangers.iter() {
+            if let Some(tile) = foot.tiles().next() {
+                attach_into(&mut device_net, &net_of, e, tile, &pipes);
+            }
+        }
+        for (e, foot, _) in radiators.iter() {
+            if let Some(tile) = foot.tiles().next() {
+                attach_into(&mut device_net, &net_of, e, tile, &pipes);
+            }
+        }
+        // Reservoir bonus tiles (read by pipe teardown to preserve water).
+        let mut res_tiles: Vec<usize> = Vec::new();
+        for (_, foot) in reservoirs.iter() {
+            for t in foot.tiles() {
+                if pipes.has(t) {
+                    res_tiles.push(pipes.idx(t));
                 }
             }
-            order.push(walk);
         }
+        state.order = order;
+        state.net_of = net_of;
+        state.device_net = device_net;
+        cstats.reservoir_tiles = res_tiles;
     }
 
-    // ---- 2. Per-tile reservoir bonus capacity -------------------------------------
-    let mut bonus_cap: HashMap<usize, f32> = HashMap::new();
-    cstats.reservoir_tiles.clear();
-    for foot in reservoirs.iter() {
-        for t in foot.tiles() {
-            if pipes.has(t) {
-                let i = pipes.idx(t);
-                *bonus_cap.entry(i).or_insert(0.0) += RESERVOIR_ADD_CAP;
-                cstats.reservoir_tiles.push(i);
-            }
-        }
-    }
-
-    // ---- 3. Device attachment + base summaries ------------------------------------
-    state.device_net.clear();
-    let mut nets: Vec<CoolantNet> = order
+    // ---- 2. Base summaries (water content changes every step) ---------------------
+    let mut nets: Vec<CoolantNet> = state
+        .order
         .iter()
         .map(|walk| {
             let (mut w_sum, mut t_sum) = (0.0f32, 0.0f32);
@@ -370,45 +418,43 @@ pub fn coolant_system(
             }
         })
         .collect();
-    let mut powered_pumps = vec![0u32; order.len()];
-    let mut pump_start = vec![None::<usize>; order.len()];
+    let mut powered_pumps = vec![0u32; state.order.len()];
+    let mut pump_start = vec![None::<usize>; state.order.len()];
     for (e, foot, status) in pumps.iter() {
-        let Some(tile) = foot.tiles().next() else {
+        let Some(&net) = state.device_net.get(&e) else {
             continue;
         };
-        if let Some(net) = attach(&mut state, &net_of, e, tile, &pipes) {
-            nets[net].pumps += 1;
-            if status.ok() {
-                nets[net].powered_pumps += 1;
-                powered_pumps[net] += 1;
-                let i = pipes.idx(tile);
-                let better = pump_start[net].map(|cur| i < cur).unwrap_or(true);
-                if better {
-                    pump_start[net] = Some(i);
-                }
+        nets[net].pumps += 1;
+        if status.ok() {
+            nets[net].powered_pumps += 1;
+            powered_pumps[net] += 1;
+            let i = pipes.idx(foot.tiles().next().unwrap());
+            let better = pump_start[net].map(|cur| i < cur).unwrap_or(true);
+            if better {
+                pump_start[net] = Some(i);
             }
         }
     }
-    for (e, foot) in exchangers.iter() {
-        if let Some(tile) = foot.tiles().next() {
-            if let Some(net) = attach(&mut state, &net_of, e, tile, &pipes) {
-                nets[net].exchangers += 1;
-            }
+    for (e, _) in exchangers.iter() {
+        if let Some(&net) = state.device_net.get(&e) {
+            nets[net].exchangers += 1;
         }
     }
-    for (e, foot, rad) in radiators.iter() {
-        if let Some(tile) = foot.tiles().next() {
-            if let Some(net) = attach(&mut state, &net_of, e, tile, &pipes) {
-                nets[net].radiators += u32::from(rad.hull_ok);
-            }
+    for (e, _, rad) in radiators.iter() {
+        if let Some(&net) = state.device_net.get(&e) {
+            nets[net].radiators += u32::from(rad.hull_ok);
         }
     }
 
-    // ---- 4. Circulation: simultaneous rotation along each walk --------------------
+    // ---- 3. Circulation: simultaneous rotation along each walk --------------------
     // Every tile releases up to `flow` water and receives its predecessor's
     // release — full rings circulate (displacement flow), amounts can never
-    // exceed capacity, and water is conserved exactly.
-    for (net, walk) in order.iter().enumerate() {
+    // exceed capacity, and water is conserved exactly. Rotation is pure index
+    // arithmetic into the cached walk (no per-step allocation).
+    // Scratch taken out of `state` so the immutable `order` borrow above can
+    // coexist with filling it.
+    let mut released = std::mem::take(&mut state.released);
+    for (net, walk) in state.order.iter().enumerate() {
         let n = walk.len();
         if n < 2 || powered_pumps[net] == 0 {
             continue;
@@ -421,14 +467,17 @@ pub fn coolant_system(
         let rot = pump_start[net]
             .and_then(|s| walk.iter().position(|&i| i == s))
             .unwrap_or(0);
-        let seq: Vec<usize> = walk.iter().cycle().skip(rot).take(n).copied().collect();
-        let released: Vec<f32> = seq.iter().map(|&i| water.amount[i].min(flow)).collect();
+        released.clear();
+        released.resize(n, 0.0);
+        for k in 0..n {
+            released[k] = water.amount[walk[(rot + k) % n]].min(flow);
+        }
         for k in (0..n).rev() {
             let m = released[k];
             if m <= 0.0 {
                 continue;
             }
-            let (i, j) = (seq[k], seq[(k + 1) % n]);
+            let (i, j) = (walk[(rot + k) % n], walk[(rot + k + 1) % n]);
             let (wi, wj) = (water.amount[i], water.amount[j]);
             water.amount[i] = wi - m;
             let tj = if wj + m > 0.0 {
@@ -440,6 +489,7 @@ pub fn coolant_system(
             water.temp[j] = tj;
         }
     }
+    state.released = released;
 
     // ---- 5. Heat exchangers: air ↔ water at their tile ----------------------------
     for (e, foot) in exchangers.iter() {
@@ -457,7 +507,7 @@ pub fn coolant_system(
         let ta = thermal.amb[i];
         let tw = water.temp[i];
         let cw = w * WATER_CAP;
-        let ca = thermal.air_cap(devices.mass.get(&i).copied().unwrap_or(0.0));
+        let ca = thermal.air_cap(devices.mass_at(i));
         // Passive valve: pickup only above the setpoint; hot water may warm
         // cold air; never against the temperature gradient.
         let rate = if tw >= ta {
@@ -524,7 +574,6 @@ pub fn coolant_system(
     }
 
     state.networks = nets;
-    state.order = order;
 }
 
 // =====================================================================================

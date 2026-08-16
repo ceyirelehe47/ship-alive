@@ -89,6 +89,9 @@ pub struct ShipMap {
     pub width: i32,
     pub height: i32,
     tiles: Vec<Tile>,
+    /// Bumped on every `set_tile` so overlays can detect tile-set changes
+    /// (walls built/torn) without re-scanning the grid.
+    pub version: u64,
 }
 
 impl ShipMap {
@@ -198,6 +201,7 @@ impl ShipMap {
                 width,
                 height,
                 tiles,
+                version: 0,
             },
             spawns,
         )
@@ -224,6 +228,7 @@ impl ShipMap {
     pub fn set_tile(&mut self, p: TilePos, tile: Tile) {
         assert!(self.in_bounds(p), "set_tile out of bounds at {p:?}");
         self.tiles[(p.y * self.width + p.x) as usize] = tile;
+        self.version += 1;
     }
 
     /// World-space center of a tile (row 0 renders at the top).

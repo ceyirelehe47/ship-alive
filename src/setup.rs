@@ -215,7 +215,9 @@ pub fn setup_world(
     commands.insert_resource(thermal_grid);
     commands.insert_resource(crate::coolant::CoolantState::default());
     commands.insert_resource(crate::coolant::CoolantStats::default());
-    commands.insert_resource(crate::thermal::DeviceTiles::default());
+    commands.insert_resource(crate::thermal::DeviceTiles::sized(
+        (map.width * map.height) as usize,
+    ));
     commands.insert_resource(crate::thermal::ThermalStats::default());
     commands.insert_resource(map);
 }

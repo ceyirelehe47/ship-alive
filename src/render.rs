@@ -20,7 +20,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 
 /// Which sprite role a visual entity plays.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Role {
     Rack,
     RackLabel,
@@ -67,20 +67,78 @@ pub struct PowerOverlayVis {
 #[derive(Component)]
 pub struct ThermalOverlayRoot;
 
+/// Pooled heat-map tile sprite (one per open tile; colors updated in place).
+#[derive(Component)]
+pub struct HeatTile;
+
 #[derive(Resource)]
 pub struct ThermalOverlayVis {
     pub root: Entity,
+    /// Membership signature: map tile set + thermal device set. A change
+    /// rebuilds the pool (walls built/torn, devices placed/removed).
     pub last_sig: u64,
+    /// Pool: one sprite per open tile, in `map.iter_tiles()` order.
+    pub tiles: Vec<Entity>,
+    /// Last color bucket drawn per pool slot.
+    pub bucket: Vec<u16>,
+    /// Device state rings, rebuilt on ring-signature change.
+    pub rings: Vec<Entity>,
+    pub ring_sig: u64,
+    /// Wall-clock seconds since the last color refresh.
+    pub refresh_acc: f32,
+    /// Telemetry: pool rebuilds / sprite color writes since boot.
+    pub rebuilds: u32,
+    pub color_writes: u64,
 }
 
 /// Tags the coolant overlay root entity.
 #[derive(Component)]
 pub struct CoolantOverlayRoot;
 
+/// Pooled coolant pipe dot (one per pipe tile; colors updated in place).
+#[derive(Component)]
+pub struct PipeDot;
+
 #[derive(Resource)]
 pub struct CoolantOverlayVis {
     pub root: Entity,
+    /// Membership signature: pipe layout + coolant device set.
     pub last_sig: u64,
+    pub tiles: Vec<Entity>,
+    /// Last color bucket per pool slot (temp<<8 | amount).
+    pub bucket: Vec<u32>,
+    pub rings: Vec<Entity>,
+    pub ring_sig: u64,
+    pub refresh_acc: f32,
+    pub rebuilds: u32,
+    pub color_writes: u64,
+}
+
+/// Overlay color refresh cadence (wall-clock seconds). Visual colors follow
+/// the sim at this rate instead of every frame; membership edits (walls,
+/// pipes, devices) still rebuild immediately.
+const OVERLAY_REFRESH_SECS: f32 = 0.1;
+
+/// target entity + role → visual entity. Maintained from `Added<Visual>` and
+/// cleanup, so the per-frame sync systems update visuals with O(1) lookups
+/// instead of scanning every visual for every target.
+#[derive(Resource, Default)]
+pub struct VisualIndex {
+    map: std::collections::HashMap<(Entity, Role), Entity>,
+}
+
+impl VisualIndex {
+    fn insert(&mut self, target: Entity, role: Role, visual: Entity) {
+        self.map.insert((target, role), visual);
+    }
+
+    fn remove(&mut self, target: Entity, role: Role) {
+        self.map.remove(&(target, role));
+    }
+
+    pub fn get(&self, target: Entity, role: Role) -> Option<Entity> {
+        self.map.get(&(target, role)).copied()
+    }
 }
 
 /// Persistent selection/path marker entities (pooled, hidden when unused).
@@ -210,6 +268,7 @@ pub struct RenderPlugin;
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<crate::OverlayMode>();
+        app.init_resource::<VisualIndex>();
         app.add_systems(
             Startup,
             (spawn_tile_visuals, spawn_room_labels, spawn_markers),
@@ -218,6 +277,7 @@ impl Plugin for RenderPlugin {
             Update,
             (
                 ensure_visuals_system,
+                index_visuals_system,
                 sync_crew_visuals_system,
                 sync_item_visuals_system,
                 sync_rack_labels_system,
@@ -398,11 +458,35 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
     commands.insert_resource(ThermalOverlayVis {
         root: thermal_root,
         last_sig: 0,
+        tiles: Vec::new(),
+        bucket: Vec::new(),
+        rings: Vec::new(),
+        ring_sig: 0,
+        refresh_acc: 0.0,
+        rebuilds: 0,
+        color_writes: 0,
     });
     commands.insert_resource(CoolantOverlayVis {
         root: coolant_root,
         last_sig: 0,
+        tiles: Vec::new(),
+        bucket: Vec::new(),
+        rings: Vec::new(),
+        ring_sig: 0,
+        refresh_acc: 0.0,
+        rebuilds: 0,
+        color_writes: 0,
     });
+}
+
+/// Fold newly spawned visuals into the `VisualIndex`.
+fn index_visuals_system(
+    mut index: ResMut<VisualIndex>,
+    added: Query<(Entity, &Visual), Added<Visual>>,
+) {
+    for (e, v) in added.iter() {
+        index.insert(v.target, v.role, e);
+    }
 }
 
 /// Spawn visuals for logic entities that do not have them yet.
@@ -604,42 +688,44 @@ fn crew_world_pos(map: &ShipMap, pos: &TilePos, mov: &Movement) -> Vec2 {
 fn sync_crew_visuals_system(
     map: Res<ShipMap>,
     art: Res<Art>,
+    index: Res<VisualIndex>,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &Movement)>,
     items: Query<(&CarriedBy, &Item)>,
-    mut sprites: Query<(&Visual, &mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
-    mut labels: Query<(&Visual, &mut Transform), With<Text2d>>,
+    mut sprites: Query<(&mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
+    mut labels: Query<&mut Transform, With<Text2d>>,
 ) {
+    // One pass over items instead of a find() per crew.
+    let mut carried_kind: std::collections::HashMap<Entity, ItemKind> =
+        std::collections::HashMap::new();
+    for (c, i) in items.iter() {
+        carried_kind.insert(c.0, i.kind);
+    }
     for (e, crew, task, pos, mov) in crews.iter() {
         let p = crew_world_pos(&map, pos, mov);
         let idle = matches!(task, CrewTask::Idle(_));
-        for (v, mut tf) in labels.iter_mut() {
-            if v.target != e {
-                continue;
-            }
-            if v.role == Role::CrewLabel {
+        if let Some(ve) = index.get(e, Role::CrewLabel) {
+            if let Ok(mut tf) = labels.get_mut(ve) {
                 tf.translation = (p + Vec2::new(0.0, -22.0)).extend(0.8);
             }
         }
-        for (v, mut tf, mut sprite, mut vis) in sprites.iter_mut() {
-            if v.target != e {
-                continue;
+        if let Some(ve) = index.get(e, Role::CrewSprite) {
+            if let Ok((mut tf, mut sprite, _)) = sprites.get_mut(ve) {
+                tf.translation = p.extend(0.6);
+                let want = if idle { dimmed(crew.tint) } else { crew.tint };
+                if sprite.color != want {
+                    sprite.color = want;
+                }
             }
-            match v.role {
-                Role::CrewSprite => {
-                    tf.translation = p.extend(0.6);
-                    sprite.color = if idle { dimmed(crew.tint) } else { crew.tint };
+        }
+        if let Some(ve) = index.get(e, Role::CrewCarry) {
+            if let Ok((mut tf, mut sprite, mut vis)) = sprites.get_mut(ve) {
+                if let Some(kind) = carried_kind.get(&e) {
+                    tf.translation = (p + Vec2::new(0.0, 24.0)).extend(0.7);
+                    sprite.image = art.item(*kind).clone();
+                    *vis = Visibility::Visible;
+                } else {
+                    *vis = Visibility::Hidden;
                 }
-                Role::CrewCarry => {
-                    let carried = items.iter().find(|(c, _)| c.0 == e).map(|(_, i)| i.kind);
-                    if let Some(kind) = carried {
-                        tf.translation = (p + Vec2::new(0.0, 24.0)).extend(0.7);
-                        sprite.image = art.item(kind).clone();
-                        *vis = Visibility::Visible;
-                    } else {
-                        *vis = Visibility::Hidden;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -671,9 +757,13 @@ fn sync_item_visuals_system(
         With<Item>,
     >,
     crews: Query<(Entity, &Crew)>,
-    mut sprites: Query<(&Visual, &mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
+    index: Res<VisualIndex>,
+    mut sprites: Query<(&mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
 ) {
     let now = clock.now();
+    // Claimer tints once per frame instead of a find() per item.
+    let tints: std::collections::HashMap<Entity, Color> =
+        crews.iter().map(|(e, c)| (e, c.tint)).collect();
     // Stack offset so several items on one tile remain visible.
     let mut per_tile: std::collections::HashMap<TilePos, usize> = std::collections::HashMap::new();
     for (_, pos, _, _, carried, _) in items.iter() {
@@ -693,36 +783,44 @@ fn sync_item_visuals_system(
         }
         let ring_color = if cooled.is_some_and(|c| c.0 > now) {
             Color::srgb(1.0, 0.3, 0.25)
-        } else if let Some(claimer_tint) =
-            reserved.and_then(|r| crews.iter().find(|(ce, _)| *ce == r.0).map(|(_, c)| c.tint))
-        {
+        } else if let Some(claimer_tint) = reserved.and_then(|r| tints.get(&r.0).copied()) {
             claimer_tint
         } else {
             Color::WHITE
         };
-        for (v, mut tf, mut sprite, mut vis) in sprites.iter_mut() {
-            if v.target != e {
-                continue;
+        if let Some(ve) = index.get(e, Role::ItemSprite) {
+            if let Ok((mut tf, _, mut vis)) = sprites.get_mut(ve) {
+                let want_vis = if carried_now {
+                    Visibility::Hidden
+                } else {
+                    Visibility::Visible
+                };
+                if *vis != want_vis {
+                    *vis = want_vis;
+                }
+                let want = p.extend(0.35);
+                if tf.translation != want {
+                    tf.translation = want;
+                }
             }
-            match v.role {
-                Role::ItemSprite => {
-                    *vis = if carried_now {
-                        Visibility::Hidden
-                    } else {
-                        Visibility::Visible
-                    };
-                    tf.translation = p.extend(0.35);
+        }
+        if let Some(ve) = index.get(e, Role::ItemRing) {
+            if let Ok((mut tf, mut sprite, mut vis)) = sprites.get_mut(ve) {
+                let want_vis = if marked.is_some() && !carried_now {
+                    Visibility::Visible
+                } else {
+                    Visibility::Hidden
+                };
+                if *vis != want_vis {
+                    *vis = want_vis;
                 }
-                Role::ItemRing => {
-                    *vis = if marked.is_some() && !carried_now {
-                        Visibility::Visible
-                    } else {
-                        Visibility::Hidden
-                    };
+                if sprite.color != ring_color {
                     sprite.color = ring_color;
-                    tf.translation = p.extend(0.45);
                 }
-                _ => {}
+                let want = p.extend(0.45);
+                if tf.translation != want {
+                    tf.translation = want;
+                }
             }
         }
     }
@@ -730,13 +828,17 @@ fn sync_item_visuals_system(
 
 /// Rack count labels.
 fn sync_rack_labels_system(
+    index: Res<VisualIndex>,
     racks: Query<(Entity, &StorageCell), Changed<StorageCell>>,
-    mut labels: Query<(&Visual, &mut Text2d)>,
+    mut labels: Query<&mut Text2d>,
 ) {
     for (e, cell) in racks.iter() {
-        for (v, mut text) in labels.iter_mut() {
-            if v.target == e && v.role == Role::RackLabel {
-                text.0 = format!("{} {}", cell.label(), cell.filter_label());
+        if let Some(ve) = index.get(e, Role::RackLabel) {
+            if let Ok(mut text) = labels.get_mut(ve) {
+                let want = format!("{} {}", cell.label(), cell.filter_label());
+                if text.0 != want {
+                    text.0 = want;
+                }
             }
         }
     }
@@ -754,8 +856,9 @@ fn sync_building_visuals_system(
         &crate::power::PowerStatus,
     )>,
     generators: Query<(Entity, &crate::power::PowerRole, &crate::power::PowerStatus)>,
-    mut sprites: Query<(&Visual, &mut Sprite), Without<Text2d>>,
-    mut labels: Query<(&Visual, &mut Text2d, &mut TextColor)>,
+    index: Res<VisualIndex>,
+    mut sprites: Query<&mut Sprite, Without<Text2d>>,
+    mut labels: Query<(&mut Text2d, &mut TextColor)>,
 ) {
     for (e, bp) in blueprints.iter() {
         let label = if bp.progress > 0.0 {
@@ -763,20 +866,25 @@ fn sync_building_visuals_system(
         } else {
             bp.materials_label()
         };
-        for (v, mut text, _) in labels.iter_mut() {
-            if v.target == e && v.role == Role::BlueprintLabel {
-                text.0 = label.clone();
+        if let Some(ve) = index.get(e, Role::BlueprintLabel) {
+            if let Ok((mut text, _)) = labels.get_mut(ve) {
+                if text.0 != label {
+                    text.0 = label;
+                }
             }
         }
     }
     for (e, _, marked) in buildings.iter() {
-        for (v, mut sprite) in sprites.iter_mut() {
-            if v.target == e && v.role == Role::BuildingSprite {
-                sprite.color = if marked.is_some() {
+        if let Some(ve) = index.get(e, Role::BuildingSprite) {
+            if let Ok(mut sprite) = sprites.get_mut(ve) {
+                let want = if marked.is_some() {
                     Color::srgb(1.0, 0.8, 0.25)
                 } else {
                     Color::WHITE
                 };
+                if sprite.color != want {
+                    sprite.color = want;
+                }
             }
         }
     }
@@ -819,15 +927,21 @@ fn sync_building_visuals_system(
                 ),
             }
         };
-        for (v, mut sprite) in sprites.iter_mut() {
-            if v.target == e && v.role == Role::FabRing {
-                sprite.color = ring;
+        if let Some(ve) = index.get(e, Role::FabRing) {
+            if let Ok(mut sprite) = sprites.get_mut(ve) {
+                if sprite.color != ring {
+                    sprite.color = ring;
+                }
             }
         }
-        for (v, mut t, mut c) in labels.iter_mut() {
-            if v.target == e && v.role == Role::FabLabel {
-                t.0 = text.clone();
-                c.0 = text_color;
+        if let Some(ve) = index.get(e, Role::FabLabel) {
+            if let Ok((mut t, mut c)) = labels.get_mut(ve) {
+                if t.0 != text {
+                    t.0 = text;
+                }
+                if c.0 != text_color {
+                    c.0 = text_color;
+                }
             }
         }
     }
@@ -852,14 +966,18 @@ fn sync_building_visuals_system(
                 "reactor standby".to_string(),
             )
         };
-        for (v, mut sprite) in sprites.iter_mut() {
-            if v.target == e && v.role == Role::FabRing {
-                sprite.color = ring;
+        if let Some(ve) = index.get(e, Role::FabRing) {
+            if let Ok(mut sprite) = sprites.get_mut(ve) {
+                if sprite.color != ring {
+                    sprite.color = ring;
+                }
             }
         }
-        for (v, mut t, _) in labels.iter_mut() {
-            if v.target == e && v.role == Role::FabLabel {
-                t.0 = text.clone();
+        if let Some(ve) = index.get(e, Role::FabLabel) {
+            if let Ok((mut t, _)) = labels.get_mut(ve) {
+                if t.0 != text {
+                    t.0 = text;
+                }
             }
         }
     }
@@ -961,207 +1079,333 @@ fn power_overlay_system(
     }
 }
 
-/// Thermal heat map: every open tile tinted by ambient temperature, device
-/// footprints ringed by thermal state. Rebuilt when a tile crosses a whole
-/// degree or a state flips (temps are quantized into the signature).
+/// Thermal heat map: one pooled sprite per open tile whose color follows the
+/// ambient temperature. The pool is rebuilt only when the tile set or device
+/// set changes (walls built/torn, devices placed); afterwards colors are
+/// updated in place at `OVERLAY_REFRESH_SECS` cadence, writing only the
+/// sprites whose 1 °C temperature bucket changed.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn thermal_overlay_system(
     mut commands: Commands,
+    time: Res<Time>,
     map: Res<ShipMap>,
     art: Res<Art>,
     grid: Res<crate::thermal::ThermalGrid>,
     overlay: Res<crate::OverlayMode>,
     mut vis: ResMut<ThermalOverlayVis>,
-    devices: Query<(&Footprint, &Building, &crate::thermal::ThermalState)>,
+    devices: Query<(Entity, &Footprint, &crate::thermal::ThermalState)>,
     mut root_q: Query<&mut Visibility, With<ThermalOverlayRoot>>,
     children_q: Query<&Children>,
+    mut tile_q: Query<&mut Sprite, With<HeatTile>>,
 ) {
     let active = *overlay == crate::OverlayMode::Thermal;
-    let mut sig: u64 = if active { 1 } else { 0 };
-    if active {
-        for &t in &grid.amb {
-            // Quantize to whole degrees so slow drift does not rebuild 60x/s.
-            sig = sig.wrapping_mul(31).wrapping_add(t.round() as i64 as u64);
-        }
-        for (_, _, s) in devices.iter() {
-            sig = sig.wrapping_mul(7).wrapping_add(*s as u64 + 1);
-        }
-    }
-    if sig == vis.last_sig {
-        return;
-    }
-    vis.last_sig = sig;
-    if let Ok(children) = children_q.get(vis.root) {
-        for &c in children {
-            commands.entity(c).despawn();
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        let want = if active {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *v != want {
+            *v = want;
         }
     }
     if !active {
-        if let Ok(mut v) = root_q.get_mut(vis.root) {
-            *v = Visibility::Hidden;
-        }
         return;
     }
-    if let Ok(mut v) = root_q.get_mut(vis.root) {
-        *v = Visibility::Visible;
+
+    // Membership signature: tile set + thermal device set.
+    let mut sig = map.version;
+    for (e, _, _) in devices.iter() {
+        sig = sig.wrapping_mul(31).wrapping_add(e.to_bits());
     }
-    for (pos, tile) in map.iter_tiles() {
-        let solid = matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall);
-        if solid {
-            continue;
+    if sig != vis.last_sig {
+        vis.last_sig = sig;
+        vis.rebuilds += 1;
+        if let Ok(children) = children_q.get(vis.root) {
+            for &c in children {
+                commands.entity(c).despawn();
+            }
         }
-        let t = grid.amb_at(pos);
-        let mut color = crate::thermal::heat_color(t);
-        let Color::Srgba(ref mut c) = color else {
-            continue;
-        };
-        c.alpha = 0.40;
-        commands
-            .spawn((
-                Sprite {
-                    image: art.floor.clone(),
-                    custom_size: Some(Vec2::splat(crate::TILE)),
-                    color,
-                    ..default()
-                },
-                Transform::from_translation(map.world_pos(pos).extend(0.70)),
-            ))
-            .insert(ChildOf(vis.root));
+        vis.tiles.clear();
+        vis.bucket.clear();
+        vis.ring_sig = u64::MAX; // rings were despawned with the pool
+        for (pos, tile) in map.iter_tiles() {
+            if matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall) {
+                continue;
+            }
+            let t = grid.amb_at(pos);
+            let id = commands
+                .spawn((
+                    HeatTile,
+                    Sprite {
+                        image: art.floor.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE)),
+                        color: heat_tile_color(t),
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(pos).extend(0.70)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.tiles.push(id);
+            vis.bucket.push(temp_bucket(t));
+        }
+        // Spawned entities appear at the next command flush; paint then.
+        vis.refresh_acc = OVERLAY_REFRESH_SECS;
     }
-    for (foot, _, state) in devices.iter() {
-        let p = foot_world_pos(foot);
-        commands
-            .spawn((
-                Sprite {
-                    image: art.ring.clone(),
-                    custom_size: Some(Vec2::splat(crate::TILE * foot.w.max(foot.h) as f32 * 1.08)),
-                    color: state.color(),
-                    ..default()
-                },
-                Transform::from_translation(p.extend(0.93)),
-            ))
-            .insert(ChildOf(vis.root));
+
+    // Device state rings (few entities — cheap to rebuild on change).
+    let mut ring_sig: u64 = 1;
+    for (e, _, state) in devices.iter() {
+        ring_sig = ring_sig
+            .wrapping_mul(31)
+            .wrapping_add(e.to_bits() * 8 + *state as u64);
+    }
+    if ring_sig != vis.ring_sig {
+        vis.ring_sig = ring_sig;
+        for old in vis.rings.drain(..) {
+            commands.entity(old).despawn();
+        }
+        for (_, foot, state) in devices.iter() {
+            let p = foot_world_pos(foot);
+            let id = commands
+                .spawn((
+                    Sprite {
+                        image: art.ring.clone(),
+                        custom_size: Some(Vec2::splat(
+                            crate::TILE * foot.w.max(foot.h) as f32 * 1.08,
+                        )),
+                        color: state.color(),
+                        ..default()
+                    },
+                    Transform::from_translation(p.extend(0.93)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.rings.push(id);
+        }
+    }
+
+    vis.refresh_acc += time.delta_secs();
+    if vis.refresh_acc < OVERLAY_REFRESH_SECS {
+        return;
+    }
+    vis.refresh_acc = 0.0;
+    let open_tiles = map
+        .iter_tiles()
+        .filter(|(_, tile)| !matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall));
+    for (ti, (pos, _)) in open_tiles.enumerate() {
+        let t = grid.amb_at(pos);
+        let b = temp_bucket(t);
+        if b != vis.bucket[ti] {
+            vis.bucket[ti] = b;
+            if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+                sprite.color = heat_tile_color(t);
+                vis.color_writes += 1;
+            }
+        }
     }
 }
 
-/// Coolant overlay: pipe tiles tinted by water temperature (alpha tracks how
-/// full the tile is), rings on pump / exchanger / radiator devices.
+/// Heat-map tile color (shared heat ramp at 40% alpha).
+fn heat_tile_color(t: f32) -> Color {
+    let mut c = crate::thermal::heat_color(t);
+    if let Color::Srgba(ref mut s) = c {
+        s.alpha = 0.40;
+    }
+    c
+}
+
+/// 1 °C color buckets: slow drift repaints only tiles that crossed a degree.
+fn temp_bucket(t: f32) -> u16 {
+    ((t + 100.0).round().clamp(0.0, 500.0)) as u16
+}
+
+/// Coolant overlay: one pooled dot per pipe tile tinted by water temperature
+/// (alpha tracks how full the tile is), rings on pump / exchanger / radiator
+/// devices. Pool rebuilt only on pipe/device edits; colors refreshed in place
+/// at `OVERLAY_REFRESH_SECS` cadence, writing only changed dots.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn coolant_overlay_system(
     mut commands: Commands,
+    time: Res<Time>,
     map: Res<ShipMap>,
     art: Res<Art>,
     pipes: Res<crate::coolant::PipeGrid>,
     water: Res<crate::coolant::WaterGrid>,
     overlay: Res<crate::OverlayMode>,
     mut vis: ResMut<CoolantOverlayVis>,
-    devices: Query<(&Footprint, &Building, Option<&crate::power::PowerStatus>)>,
-    pumps: Query<(&Footprint, &crate::power::PowerStatus), With<crate::coolant::Pump>>,
+    devices: Query<(
+        Entity,
+        &Footprint,
+        &Building,
+        Option<&crate::power::PowerStatus>,
+    )>,
+    pumps: Query<(Entity, &Footprint, &crate::power::PowerStatus), With<crate::coolant::Pump>>,
     mut root_q: Query<&mut Visibility, With<CoolantOverlayRoot>>,
     children_q: Query<&Children>,
+    mut dot_q: Query<&mut Sprite, With<PipeDot>>,
 ) {
     let active = *overlay == crate::OverlayMode::Coolant;
-    let mut sig: u64 = if active { pipes.version } else { 0 };
-    if active {
-        for i in 0..water.amount.len() {
-            sig = sig
-                .wrapping_mul(31)
-                .wrapping_add((water.temp[i].round() as i64 as u64) << 8)
-                .wrapping_add((water.amount[i] * 4.0) as u64);
-        }
-        for (_, st) in pumps.iter() {
-            sig = sig.wrapping_mul(7).wrapping_add(*st as u64 + 1);
-        }
-    }
-    if sig == vis.last_sig {
-        return;
-    }
-    vis.last_sig = sig;
-    if let Ok(children) = children_q.get(vis.root) {
-        for &c in children {
-            commands.entity(c).despawn();
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        let want = if active {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *v != want {
+            *v = want;
         }
     }
     if !active {
-        if let Ok(mut v) = root_q.get_mut(vis.root) {
-            *v = Visibility::Hidden;
-        }
         return;
     }
-    if let Ok(mut v) = root_q.get_mut(vis.root) {
-        *v = Visibility::Visible;
-    }
-    let temp_color = |t: f32| {
-        // 15..70 °C → blue..red through the shared heat ramp.
-        crate::thermal::heat_color(t.clamp(0.0, 75.0))
-    };
-    for tile in pipes.iter_pipes() {
-        let i = pipes.idx(tile);
-        let (amount, temp) = (water.amount[i], water.temp[i]);
-        let mut color = temp_color(temp);
-        let Color::Srgba(ref mut c) = color else {
-            continue;
-        };
-        c.alpha = if amount <= 0.0 {
-            0.12
-        } else {
-            (0.25 + 0.55 * (amount / crate::coolant::PIPE_TILE_CAP).min(1.0)).min(0.85)
-        };
-        commands
-            .spawn((
-                Sprite {
-                    image: art.dot.clone(),
-                    custom_size: Some(Vec2::splat(crate::TILE * 0.6)),
-                    color,
-                    ..default()
-                },
-                Transform::from_translation(map.world_pos(tile).extend(0.72)),
-            ))
-            .insert(ChildOf(vis.root));
-    }
-    for (foot, building, status) in devices.iter() {
-        let is_coolant = matches!(
-            building.kind,
+
+    // Membership signature: pipe layout + coolant device set.
+    let coolant_kinds = |b: &Building| {
+        matches!(
+            b.kind,
             BuildingKind::Pump
                 | BuildingKind::Reservoir
                 | BuildingKind::HeatExchanger
                 | BuildingKind::Radiator
-        );
-        if !is_coolant {
-            continue;
+        )
+    };
+    let mut sig = pipes.version;
+    for (e, _, b, _) in devices.iter() {
+        if coolant_kinds(b) {
+            sig = sig.wrapping_mul(31).wrapping_add(e.to_bits());
         }
-        let p = foot_world_pos(foot);
-        let color = status
-            .map(|s| s.color())
-            .unwrap_or(Color::srgba(0.6, 0.8, 0.9, 0.9));
-        commands
-            .spawn((
-                Sprite {
-                    image: art.ring.clone(),
-                    custom_size: Some(Vec2::splat(crate::TILE * 1.08)),
-                    color,
-                    ..default()
-                },
-                Transform::from_translation(p.extend(0.93)),
-            ))
-            .insert(ChildOf(vis.root));
     }
-    for (foot, status) in pumps.iter() {
-        let p = foot_world_pos(foot);
-        commands
-            .spawn((
-                Sprite {
-                    image: art.ring.clone(),
-                    custom_size: Some(Vec2::splat(crate::TILE * 1.18)),
-                    color: status.color(),
-                    ..default()
-                },
-                Transform::from_translation(p.extend(0.94)),
-            ))
-            .insert(ChildOf(vis.root));
+    if sig != vis.last_sig {
+        vis.last_sig = sig;
+        vis.rebuilds += 1;
+        if let Ok(children) = children_q.get(vis.root) {
+            for &c in children {
+                commands.entity(c).despawn();
+            }
+        }
+        vis.tiles.clear();
+        vis.bucket.clear();
+        vis.ring_sig = u64::MAX; // rings were despawned with the pool
+        for tile in pipes.iter_pipes() {
+            let (amount, temp) = (water.amount_at(tile), water.temp_at(tile));
+            let id = commands
+                .spawn((
+                    PipeDot,
+                    Sprite {
+                        image: art.dot.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE * 0.6)),
+                        color: pipe_dot_color(amount, temp),
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(tile).extend(0.72)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.tiles.push(id);
+            vis.bucket.push(pipe_bucket(amount, temp));
+        }
+        vis.refresh_acc = OVERLAY_REFRESH_SECS;
     }
+
+    // Device rings + powered-pump double rings.
+    let mut ring_sig: u64 = 1;
+    for (e, _, b, st) in devices.iter() {
+        if coolant_kinds(b) {
+            ring_sig = ring_sig
+                .wrapping_mul(31)
+                .wrapping_add(e.to_bits() * 32 + st.map(|s| *s as u64).unwrap_or(9));
+        }
+    }
+    for (e, _, st) in pumps.iter() {
+        ring_sig = ring_sig
+            .wrapping_mul(31)
+            .wrapping_add(e.to_bits() * 32 + *st as u64 + 17);
+    }
+    if ring_sig != vis.ring_sig {
+        vis.ring_sig = ring_sig;
+        for old in vis.rings.drain(..) {
+            commands.entity(old).despawn();
+        }
+        for (_, foot, b, status) in devices.iter() {
+            if !coolant_kinds(b) {
+                continue;
+            }
+            let p = foot_world_pos(foot);
+            let color = status
+                .map(|s| s.color())
+                .unwrap_or(Color::srgba(0.6, 0.8, 0.9, 0.9));
+            let id = commands
+                .spawn((
+                    Sprite {
+                        image: art.ring.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE * 1.08)),
+                        color,
+                        ..default()
+                    },
+                    Transform::from_translation(p.extend(0.93)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.rings.push(id);
+        }
+        for (_, foot, status) in pumps.iter() {
+            let p = foot_world_pos(foot);
+            let id = commands
+                .spawn((
+                    Sprite {
+                        image: art.ring.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE * 1.18)),
+                        color: status.color(),
+                        ..default()
+                    },
+                    Transform::from_translation(p.extend(0.94)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.rings.push(id);
+        }
+    }
+
+    vis.refresh_acc += time.delta_secs();
+    if vis.refresh_acc < OVERLAY_REFRESH_SECS {
+        return;
+    }
+    vis.refresh_acc = 0.0;
+    for (ti, tile) in pipes.iter_pipes().enumerate() {
+        let (amount, temp) = (water.amount_at(tile), water.temp_at(tile));
+        let b = pipe_bucket(amount, temp);
+        if b != vis.bucket[ti] {
+            vis.bucket[ti] = b;
+            if let Ok(mut sprite) = dot_q.get_mut(vis.tiles[ti]) {
+                sprite.color = pipe_dot_color(amount, temp);
+                vis.color_writes += 1;
+            }
+        }
+    }
+}
+
+/// Pipe dot color: heat ramp clamped to 15..70 °C, alpha by fill.
+fn pipe_dot_color(amount: f32, temp: f32) -> Color {
+    let mut c = crate::thermal::heat_color(temp.clamp(0.0, 75.0));
+    if let Color::Srgba(ref mut s) = c {
+        s.alpha = if amount <= 0.0 {
+            0.12
+        } else {
+            (0.25 + 0.55 * (amount / crate::coolant::PIPE_TILE_CAP).min(1.0)).min(0.85)
+        };
+    }
+    c
+}
+
+/// Color bucket for a pipe dot: temperature (1 °C) and amount (¼ unit).
+fn pipe_bucket(amount: f32, temp: f32) -> u32 {
+    let t = temp.round().clamp(0.0, 255.0) as u32;
+    let a = ((amount * 4.0).round().clamp(0.0, 255.0)) as u32;
+    (t << 8) | a
 }
 
 /// Selection ring, path preview dots, job target marker, hover ring and the
@@ -1415,12 +1659,14 @@ fn ghost_system(
 
 /// Despawn visuals whose target entity no longer exists.
 fn cleanup_visuals_system(
+    mut index: ResMut<VisualIndex>,
     targets: Query<Entity, With<TilePos>>,
     visuals: Query<(Entity, &Visual)>,
     mut commands: Commands,
 ) {
     for (e, v) in visuals.iter() {
         if targets.get(v.target).is_err() {
+            index.remove(v.target, v.role);
             commands.entity(e).despawn();
         }
     }

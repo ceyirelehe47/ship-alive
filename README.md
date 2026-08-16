@@ -35,7 +35,7 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 112 个单元/集成测试
+cargo test                     # 113 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
@@ -92,5 +92,5 @@ art_raw/         Codex image generation 原图（洋红底）
 
 状态：**Slice 3（Thermal & Cooling）完成，等待试玩反馈。**
 交付报告：`REPORT.md` / `REPORT_0B.md` / `REPORT_1.md` / `REPORT_2.md` /
-`REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md`（本轮）；
+`REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md`；性能优化轮：`REPORT_PERF.md`（本轮）；
 试玩指南：`PLAYTEST.md`；代理经验：`AGENTS.md`。

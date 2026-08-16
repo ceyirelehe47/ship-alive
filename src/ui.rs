@@ -148,6 +148,19 @@ pub struct Hud {
     pub entity_section: Entity,
 }
 
+/// Wall-clock UI refresh cadence for sim-derived text (sidebar, HUD lines,
+/// overlay summaries). Fast enough to read as live, slow enough that text
+/// layout does not run every frame.
+const UI_REFRESH_SECS: f32 = 0.2;
+
+/// Assign UI text only when it actually changed — avoids re-triggering
+/// Bevy's text layout for mostly-static lines.
+fn set_text_if_changed(text: &mut Text, want: String) {
+    if text.0 != want {
+        text.0 = want;
+    }
+}
+
 fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
     parent
         .spawn((
@@ -716,6 +729,8 @@ fn button_system(
 #[allow(clippy::too_many_arguments)]
 fn sidebar_system(
     hud: Res<Hud>,
+    time: Res<Time>,
+    mut ui_acc: Local<f32>,
     selection: Res<Selection>,
     clock: Res<crate::simtime::SimClock>,
     speed: Res<GameSpeed>,
@@ -747,6 +762,13 @@ fn sidebar_system(
         };
     }
     if !entity_mode {
+        // Environment content is sim-derived and refreshes on a cadence
+        // (includes a full-grid hottest-room scan).
+        *ui_acc += time.delta_secs();
+        if *ui_acc < UI_REFRESH_SECS {
+            return;
+        }
+        *ui_acc = 0.0;
         // ---- environment content ----
         let ship_time = crate::simtime::format_sim_stamp(clock.now());
 
@@ -895,8 +917,12 @@ fn sidebar_system(
             if let Ok((mut text, mut color, mut vis)) = texts.get_mut(*line) {
                 if i < lines.len() {
                     *vis = Visibility::Visible;
-                    text.0 = lines[i].0.clone();
-                    color.0 = lines[i].1;
+                    if text.0 != lines[i].0 {
+                        text.0 = lines[i].0.clone();
+                    }
+                    if color.0 != lines[i].1 {
+                        color.0 = lines[i].1;
+                    }
                 } else {
                     *vis = Visibility::Hidden;
                 }
@@ -1014,6 +1040,9 @@ fn overlay_cycle_system(
 #[allow(clippy::too_many_arguments)]
 fn overlay_summary_system(
     hud: Res<Hud>,
+    time: Res<Time>,
+    mut ui_acc: Local<f32>,
+    mut last_mode: Local<OverlayMode>,
     overlay: Res<OverlayMode>,
     power_state: Res<PowerState>,
     thermal: ThermalView,
@@ -1022,12 +1051,24 @@ fn overlay_summary_system(
     fabs: Query<(&crate::thermal::ThermalState,), With<crate::production::Fabricator>>,
     mut texts: Query<(&mut Text, &mut TextColor), Without<Button>>,
 ) {
+    // Summary/alert text is sim-derived; refresh on a cadence, but always
+    // immediately after the overlay mode changes so [P] feels instant.
+    let mode_changed = *last_mode != *overlay;
+    *last_mode = *overlay;
+    *ui_acc += time.delta_secs();
+    if !mode_changed && *ui_acc < UI_REFRESH_SECS {
+        return;
+    }
+    *ui_acc = 0.0;
+
     // ---- summary line (visible with the matching overlay mode) ----
     if let Ok((mut text, mut color)) = texts.get_mut(hud.power_line) {
+        let mut summary = String::new();
+        let summary_color = Color::srgb(0.62, 0.9, 0.8);
         match *overlay {
             OverlayMode::Power => {
                 if power_state.networks.is_empty() {
-                    text.0 = "POWER: no networks".to_string();
+                    summary = "POWER: no networks".to_string();
                 } else {
                     let parts: Vec<String> = power_state
                         .networks
@@ -1035,7 +1076,7 @@ fn overlay_summary_system(
                         .enumerate()
                         .map(|(i, net)| format!("NET {}: {}", i + 1, net.summary()))
                         .collect();
-                    text.0 = format!("POWER | {}", parts.join(" | "));
+                    summary = format!("POWER | {}", parts.join(" | "));
                 }
             }
             OverlayMode::Thermal => {
@@ -1043,14 +1084,14 @@ fn overlay_summary_system(
                 for (foot, _) in reactors.iter() {
                     hottest = hottest.max(thermal.grid.max_footprint_temp(foot));
                 }
-                text.0 = format!(
+                summary = format!(
                     "THERMAL | hottest core {:.0}°C | injected {:.0}H | radiated {:.0}H",
                     hottest, tstats.injected_total, tstats.radiated_total,
                 );
             }
             OverlayMode::Coolant => {
                 if thermal.coolant.networks.is_empty() {
-                    text.0 = "COOLANT: no pipes laid".to_string();
+                    summary = "COOLANT: no pipes laid".to_string();
                 } else {
                     let parts: Vec<String> = thermal
                         .coolant
@@ -1069,12 +1110,15 @@ fn overlay_summary_system(
                             )
                         })
                         .collect();
-                    text.0 = format!("COOLANT | {}", parts.join(" | "));
+                    summary = format!("COOLANT | {}", parts.join(" | "));
                 }
             }
-            OverlayMode::Off => text.0 = String::new(),
+            OverlayMode::Off => {}
         }
-        color.0 = Color::srgb(0.62, 0.9, 0.8);
+        set_text_if_changed(&mut text, summary);
+        if color.0 != summary_color {
+            color.0 = summary_color;
+        }
     }
 
     // ---- thermal alert (always visible when something is wrong) ----
@@ -1101,12 +1145,15 @@ fn overlay_summary_system(
         }
     }
     if let Ok((mut text, mut color)) = texts.get_mut(hud.alert_line) {
-        text.0 = alert;
-        color.0 = if any_critical {
+        set_text_if_changed(&mut text, alert);
+        let want_c = if any_critical {
             Color::srgb(1.0, 0.3, 0.25)
         } else {
             Color::srgb(1.0, 0.65, 0.25)
         };
+        if color.0 != want_c {
+            color.0 = want_c;
+        }
     }
 }
 
@@ -1845,8 +1892,12 @@ fn selection_panel_system(
         if let Ok((mut text, mut color, mut vis)) = texts.get_mut(*line) {
             if i < lines.len() {
                 *vis = Visibility::Visible;
-                text.0 = lines[i].0.clone();
-                color.0 = lines[i].1;
+                if text.0 != lines[i].0 {
+                    text.0 = lines[i].0.clone();
+                }
+                if color.0 != lines[i].1 {
+                    color.0 = lines[i].1;
+                }
             } else {
                 *vis = Visibility::Hidden;
             }
@@ -2024,6 +2075,8 @@ fn selection_panel_system(
 #[allow(clippy::too_many_arguments)]
 fn hud_update_system(
     hud: Res<Hud>,
+    time: Res<Time>,
+    mut ui_acc: Local<f32>,
     speed: Res<GameSpeed>,
     clock: Res<crate::simtime::SimClock>,
     stats: Res<crate::stats::Stats>,
@@ -2061,30 +2114,36 @@ fn hud_update_system(
 ) {
     let now = clock.now();
 
-    // ---- speed buttons ----
+    // ---- per-frame: button highlight states (write only on change) ----
     for (idx, interaction, mut bg) in speed_btn_q.iter_mut() {
-        bg.0 = if speed.index == idx.0 {
+        let want = if speed.index == idx.0 {
             BUTTON_ACTIVE
         } else if *interaction == Interaction::Hovered {
             BUTTON_HOVER
         } else {
             BUTTON_BG
         };
+        if bg.0 != want {
+            bg.0 = want;
+        }
     }
 
     // ---- build tool buttons + hint ----
     for (ti, interaction, mut bg) in tool_btn_q.iter_mut() {
         let active = build_mode.0 == Some(ti.0);
-        bg.0 = if active {
+        let want = if active {
             BUTTON_ACTIVE
         } else if *interaction == Interaction::Hovered {
             BUTTON_HOVER
         } else {
             BUTTON_BG
         };
+        if bg.0 != want {
+            bg.0 = want;
+        }
     }
     if let Ok((mut text, _, _)) = texts.get_mut(hud.tool_hint) {
-        text.0 = match build_mode.0 {
+        let want = match build_mode.0 {
             Some(Tool::Build(kind)) => format!(
                 "Placing {} — click the map ({:?} parts) | Esc to cancel",
                 kind.label(),
@@ -2095,24 +2154,39 @@ fn hud_update_system(
             }
             None => String::new(),
         };
+        set_text_if_changed(&mut text, want);
     }
+
+    // Everything below reads sim state that changes at most a few times a
+    // second — refresh it on a wall-clock cadence instead of every frame.
+    *ui_acc += time.delta_secs();
+    if *ui_acc < UI_REFRESH_SECS {
+        return;
+    }
+    *ui_acc = 0.0;
 
     // ---- sim scheduler telemetry (debug row) ----
     if let Ok((mut text, _, _)) = texts.get_mut(hud.sim_telemetry) {
-        text.0 = format!(
-            "| SIM steps/frame {} peak {} backlog {:.2}s base {}/s",
-            clock.steps_last_frame,
-            clock.peak_steps,
-            clock.backlog_secs(),
-            crate::simtime::BASE_SIM_RATE,
+        set_text_if_changed(
+            &mut text,
+            format!(
+                "| SIM steps/frame {} peak {} backlog {:.2}s base {}/s",
+                clock.steps_last_frame,
+                clock.peak_steps,
+                clock.backlog_secs(),
+                crate::simtime::BASE_SIM_RATE,
+            ),
         );
     }
 
     // ---- SHIP TIME ----
     if let Ok((mut text, _, _)) = texts.get_mut(hud.ship_time) {
-        text.0 = format!(
-            "SHIP TIME {}",
-            crate::simtime::format_sim_stamp(clock.now())
+        set_text_if_changed(
+            &mut text,
+            format!(
+                "SHIP TIME {}",
+                crate::simtime::format_sim_stamp(clock.now())
+            ),
         );
     }
 
@@ -2126,21 +2200,22 @@ fn hud_update_system(
         .count();
     let clock = crate::simtime::format_sim_stamp(now);
     if let Ok((mut text, mut color, _)) = texts.get_mut(hud.stats) {
-        text.0 = format!(
-            "Marked: {marked} | Storage: {stored}/cap{} | Parts made: {} | Built: {} | Crew idle: {}/4 | {clock} | {}",
-            "",
+        let want = format!(
+            "Marked: {marked} | Storage: {stored}/{cap} | Parts made: {} | Built: {} | Crew idle: {}/4 | {clock} | {}",
             stats.produced,
             stats.built,
             idle,
             speed.label(),
         );
-        // Show capacity summary with actual number.
-        text.0 = text.0.replacen("cap", &format!("{cap}"), 1);
-        color.0 = if cap == stored {
+        set_text_if_changed(&mut text, want);
+        let want_c = if cap == stored {
             Color::srgb(1.0, 0.45, 0.4)
         } else {
             Color::WHITE
         };
+        if color.0 != want_c {
+            color.0 = want_c;
+        }
     }
 
     // ---- crew chips ----
@@ -2163,8 +2238,10 @@ fn hud_update_system(
                 "  (hauled {} built {} ops {})",
                 crew.delivered, crew.built, crew.operated
             ));
-            text.0 = line;
-            color.0 = crew.tint;
+            set_text_if_changed(&mut text, line);
+            if color.0 != crew.tint {
+                color.0 = crew.tint;
+            }
         }
     }
 
@@ -2175,14 +2252,18 @@ fn hud_update_system(
         if let Ok((mut text, mut color, _)) = texts.get_mut(*line_e) {
             if entry_idx < log.entries.len() {
                 let e = &log.entries[entry_idx];
-                text.0 = format!("[{}] {}", crate::simtime::format_sim_stamp(e.time), e.text);
-                color.0 = match e.kind {
+                let want = format!("[{}] {}", crate::simtime::format_sim_stamp(e.time), e.text);
+                set_text_if_changed(&mut text, want);
+                let want_c = match e.kind {
                     LogKind::Info => Color::srgb(0.68, 0.72, 0.78),
                     LogKind::Job => Color::srgb(0.65, 0.9, 0.7),
                     LogKind::Fail => Color::srgb(1.0, 0.55, 0.45),
                 };
+                if color.0 != want_c {
+                    color.0 = want_c;
+                }
             } else {
-                text.0 = String::new();
+                set_text_if_changed(&mut text, String::new());
             }
         }
     }

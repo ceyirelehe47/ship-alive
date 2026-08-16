@@ -162,11 +162,13 @@ fn setup_world() -> World {
     world.insert_resource(water);
     {
         let map = world.resource::<ShipMap>();
-        world.insert_resource(ThermalGrid::new(map));
+        let grid = ThermalGrid::new(map);
+        let devices = ship_alive::thermal::DeviceTiles::sized((map.width * map.height) as usize);
+        world.insert_resource(grid);
+        world.insert_resource(devices);
     }
     world.insert_resource(ship_alive::coolant::CoolantState::default());
     world.insert_resource(ship_alive::coolant::CoolantStats::default());
-    world.insert_resource(ship_alive::thermal::DeviceTiles::default());
     world.insert_resource(ship_alive::thermal::ThermalStats::default());
     world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(ship_alive::simtime::SimClock::default());
@@ -220,10 +222,10 @@ fn reactor_state(world: &mut World) -> ThermalState {
 }
 
 fn total_stored_heat(world: &World) -> f64 {
-    let masses = &world.resource::<ship_alive::thermal::DeviceTiles>().mass;
+    let devices = world.resource::<ship_alive::thermal::DeviceTiles>();
     let grid = world.resource::<ThermalGrid>();
     let water = world.resource::<WaterGrid>();
-    grid.total_heat(masses) + ship_alive::coolant::water_heat(water)
+    grid.total_heat(devices) + ship_alive::coolant::water_heat(water)
 }
 
 #[test]
@@ -601,6 +603,80 @@ fn unpowered_pump_stagnates_loop() {
     assert!(nets[0].flow > 0.0, "circulation resumes");
 }
 
+/// The coolant topology (flood fill + device attachment) must be cached: it
+/// rebuilds once per pipe/device edit, never because water circulated or a
+/// power status flipped.
+#[test]
+fn coolant_topology_is_cached_between_edits() {
+    let mut world = setup_world();
+    let mut schedule = thermal_schedule();
+
+    let rebuilds = |w: &World| {
+        w.resource::<ship_alive::coolant::CoolantState>()
+            .topology_rebuilds
+    };
+
+    step(&mut world, &mut schedule, 1.0);
+    let boot = rebuilds(&world);
+    assert_eq!(boot, 1, "first step builds the topology once");
+
+    // Long quiet run with active circulation: no topology churn allowed.
+    for _ in 0..500 {
+        step(&mut world, &mut schedule, 1.0);
+    }
+    assert_eq!(rebuilds(&world), boot, "cached across circulating steps");
+
+    // A pipe edit rebuilds exactly once and re-splits the network.
+    let water0 = world.resource::<WaterGrid>().total_water();
+    {
+        let mut pipes = world.remove_resource::<PipeGrid>().unwrap();
+        let mut water = world.remove_resource::<WaterGrid>().unwrap();
+        let mut cstats = world
+            .remove_resource::<ship_alive::coolant::CoolantStats>()
+            .unwrap();
+        cstats.reservoir_tiles = vec![pipes.idx(TilePos::new(21, 17))];
+        ship_alive::coolant::remove_pipe_preserving_water(
+            &mut pipes,
+            &mut water,
+            &mut cstats,
+            TilePos::new(16, 17),
+        );
+        world.insert_resource(pipes);
+        world.insert_resource(water);
+        world.insert_resource(cstats);
+    }
+    for _ in 0..50 {
+        step(&mut world, &mut schedule, 1.0);
+    }
+    assert_eq!(rebuilds(&world), boot + 1, "one rebuild for the cut");
+    assert_eq!(
+        world
+            .resource::<ship_alive::coolant::CoolantState>()
+            .networks
+            .len(),
+        2
+    );
+    assert!((world.resource::<WaterGrid>().total_water() - water0).abs() < 1e-3);
+
+    // Rejoining rebuilds once more and heals the ring.
+    {
+        let mut pipes = world.remove_resource::<PipeGrid>().unwrap();
+        pipes.set(TilePos::new(16, 17), true);
+        world.insert_resource(pipes);
+    }
+    for _ in 0..50 {
+        step(&mut world, &mut schedule, 1.0);
+    }
+    assert_eq!(rebuilds(&world), boot + 2, "one rebuild for the rejoin");
+    assert_eq!(
+        world
+            .resource::<ship_alive::coolant::CoolantState>()
+            .networks
+            .len(),
+        1
+    );
+}
+
 #[test]
 fn network_split_and_merge_with_water_conservation() {
     let mut world = setup_world();
@@ -715,7 +791,7 @@ fn perf_128x128_synth_loop() {
     world.insert_resource(WaterGrid::new(w, h));
     world.insert_resource(ship_alive::coolant::CoolantState::default());
     world.insert_resource(ship_alive::coolant::CoolantStats::default());
-    world.insert_resource(ship_alive::thermal::DeviceTiles::default());
+    world.insert_resource(ship_alive::thermal::DeviceTiles::sized((w * h) as usize));
     world.insert_resource(ship_alive::thermal::ThermalStats::default());
     world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(ship_alive::simtime::SimClock::default());

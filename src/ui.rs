@@ -1,7 +1,10 @@
-//! HUD: top bar (speed controls, global stats, action buttons, build tools),
-//! per-crew status chips, a dynamic selection detail panel (with buttons for
+//! HUD, laid out RimWorld-style as floating corner panels over the map:
+//! top-left identity/stats and the event feed, top-right the ship clock with
+//! time controls and alerts, bottom-left the build bar (categories open a
+//! flyout above it), bottom-center per-crew status chips, and a bottom-right
+//! inspect pane (ship status, or selection details with buttons for
 //! build/deconstruct, rack filters, fabricator orders and crew work
-//! priorities) and an event log.
+//! priorities).
 //!
 //! Every text is rebuilt each frame — at slice scale this is negligible and
 //! keeps the update code trivial. All labels are ASCII because the bundled
@@ -103,7 +106,7 @@ pub struct BuildCat(pub BuildCatKind);
 #[derive(Component)]
 pub struct FlyoutRow(pub BuildCatKind);
 
-/// The flyout container below the build bar.
+/// The flyout container above the build bar.
 #[derive(Component)]
 pub struct FlyoutRoot;
 
@@ -115,10 +118,32 @@ pub struct ToolIndex(pub Tool);
 #[derive(Resource, Default)]
 pub struct DebugBarVisible(pub bool);
 
+/// `Visibility::Hidden` is render-only in Bevy UI — the node still occupies
+/// layout space. Panels that must physically collapse (flyout, inspect
+/// sections, debug row, unused button slots) carry this marker and have
+/// their `Display` mirrored from `Visibility` by `collapse_hidden_system`.
+#[derive(Component)]
+pub struct CollapseWhenHidden;
+
+/// Map `Visibility` onto the `Node`'s `display` field for marked nodes so
+/// hidden panels stop reserving space in the flexbox layout.
+fn collapse_hidden_system(mut q: Query<(&Visibility, &mut Node), With<CollapseWhenHidden>>) {
+    for (vis, mut node) in &mut q {
+        let want = if *vis == Visibility::Hidden {
+            Display::None
+        } else {
+            Display::Flex
+        };
+        if node.display != want {
+            node.display = want;
+        }
+    }
+}
+
 /// Number of fixed text lines / button slots in the selection panel.
 const SEL_LINES: usize = 12;
 const SEL_BTNS: usize = 16;
-/// Fixed text lines in the sidebar environment view.
+/// Fixed text lines in the inspect pane's environment view.
 const ENV_LINES: usize = 16;
 
 #[derive(Resource)]
@@ -228,6 +253,9 @@ impl Plugin for UiPlugin {
             )
                 .in_set(crate::Set::Sync),
         );
+        // Must run after the Sync systems that write Visibility so panels
+        // collapse in the same frame they hide (layout runs in PostUpdate).
+        app.add_systems(Update, collapse_hidden_system.after(crate::Set::Sync));
     }
 }
 
@@ -259,55 +287,131 @@ fn build_hud(mut commands: Commands) {
         .spawn(Node {
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
-            flex_direction: FlexDirection::Row,
-            ..default()
-        })
-        .with_children(|shell| {
-        // ---- main column (top bar + bottom) ----
-        shell
-        .spawn(Node {
-            flex_grow: 1.0,
             flex_direction: FlexDirection::Column,
-            justify_content: JustifyContent::SpaceBetween,
             ..default()
         })
         .with_children(|root| {
-            // ---- top bar ----
-            root.spawn((
-                Interaction::default(),
-                Node {
-                    width: Val::Percent(100.0),
-                    padding: UiRect::all(Val::Px(6.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(2.0),
-                    ..default()
-                },
-                BackgroundColor(PANEL_BG),
-            ))
-            .with_children(|bar| {
-                bar.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(6.0),
-                    align_items: AlignItems::Center,
-                    flex_wrap: FlexWrap::Wrap,
-                    ..default()
-                })
-                .with_children(|row| {
-                    label(row, "SHIP ALIVE", 15.0, Color::srgb(0.95, 0.85, 0.55));
+            // ---- top: left cluster (identity, stats, event feed) and right
+            // cluster (ship clock, time controls, alerts) ----
+            root.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                justify_content: JustifyContent::SpaceBetween,
+                align_items: AlignItems::FlexStart,
+                ..default()
+            })
+            .with_children(|top| {
+                // Top-left panel.
+                top.spawn((
+                    Interaction::default(),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        padding: UiRect::all(Val::Px(6.0)),
+                        ..default()
+                    },
+                    BackgroundColor(PANEL_BG),
+                ))
+                .with_children(|panel| {
+                    panel.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(6.0),
+                        align_items: AlignItems::Center,
+                        flex_wrap: FlexWrap::Wrap,
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        label(row, "SHIP ALIVE", 15.0, Color::srgb(0.95, 0.85, 0.55));
+                        stats = label(row, "", 14.0, Color::WHITE);
+                        button(row, "Haul All [H]", Action::MarkAll, 96.0);
+                        button(row, "Cancel All [C]", Action::CancelAll, 104.0);
+                    });
 
-                    for (i, text) in ["Pause", "1x", "2x", "4x"].iter().enumerate() {
-                        speed_buttons.push(button(row, text, Action::SetSpeed { index: i }, 52.0));
-                    }
+                    // Per-network power summary line (visible with the overlay).
+                    power_line = label(panel, "", 12.0, Color::srgb(0.62, 0.9, 0.8));
 
-                    stats = label(row, "", 14.0, Color::WHITE);
-                    ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
-                    alert_line = label(row, "", 13.0, Color::srgb(1.0, 0.4, 0.3));
+                    // Event feed.
+                    panel.spawn((
+                        Interaction::default(),
+                        Node {
+                            padding: UiRect::all(Val::Px(4.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(1.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|p| {
+                        label(p, "EVENT LOG", 11.0, Color::srgb(0.5, 0.55, 0.62));
+                        for _ in 0..EventLog::VISIBLE {
+                            log_lines.push(label(p, "", 12.0, Color::srgb(0.75, 0.78, 0.82)));
+                        }
+                    });
 
-                    button(row, "Haul All [H]", Action::MarkAll, 96.0);
-                    button(row, "Cancel All [C]", Action::CancelAll, 104.0);
-
-                    let power_btn = row
+                    // Developer toolbar, hidden by default.
+                    debug_row = panel
                         .spawn((
+                            Node {
+                                flex_direction: FlexDirection::Row,
+                                column_gap: Val::Px(6.0),
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            CollapseWhenHidden,
+                            Visibility::Hidden,
+                        ))
+                        .with_children(|row| {
+                            button(
+                                row,
+                                "+Crate",
+                                Action::SpawnItem { kind: ItemKind::Crate },
+                                64.0,
+                            );
+                            button(row, "+Ore", Action::SpawnItem { kind: ItemKind::Ore }, 56.0);
+                            button(row, "+Part", Action::SpawnItem { kind: ItemKind::Part }, 60.0);
+                            label(
+                                row,
+                                "debug tools | [X] deletes the selected item",
+                                11.0,
+                                Color::srgb(0.55, 0.6, 0.66),
+                            );
+                            sim_telemetry = label(row, "", 11.0, Color::srgb(0.6, 0.8, 0.7));
+                        })
+                        .id();
+
+                    label(
+                        panel,
+                        "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark | B: build tools | Space/1/2/3: speed",
+                        11.0,
+                        Color::srgb(0.6, 0.66, 0.72),
+                    );
+                });
+
+                // Top-right panel: ship clock, time controls and alerts.
+                top.spawn((
+                    Interaction::default(),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::FlexEnd,
+                        row_gap: Val::Px(2.0),
+                        padding: UiRect::all(Val::Px(6.0)),
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                    BackgroundColor(PANEL_BG),
+                ))
+                .with_children(|panel| {
+                    panel.spawn(Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(4.0),
+                        align_items: AlignItems::Center,
+                        ..default()
+                    })
+                    .with_children(|row| {
+                        ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
+                        for (i, text) in ["Pause", "1x", "2x", "4x"].iter().enumerate() {
+                            speed_buttons
+                                .push(button(row, text, Action::SetSpeed { index: i }, 52.0));
+                        }
+                        row.spawn((
                             Button,
                             Interaction::default(),
                             OnPress(Action::CycleOverlay),
@@ -323,12 +427,8 @@ fn build_hud(mut commands: Commands) {
                         ))
                         .with_children(|b| {
                             power_button_label = label(b, "View [P]", 13.0, Color::WHITE);
-                        })
-                        .id();
-                    let _ = power_btn;
-
-                    let debug_btn = row
-                        .spawn((
+                        });
+                        row.spawn((
                             Button,
                             Interaction::default(),
                             OnPress(Action::ToggleDebug),
@@ -344,326 +444,291 @@ fn build_hud(mut commands: Commands) {
                         ))
                         .with_children(|b| {
                             debug_button_label = label(b, "Debug", 13.0, Color::WHITE);
-                        })
-                        .id();
-                    debug_row = debug_btn;
+                        });
+                    });
+
+                    alert_line = label(panel, "", 13.0, Color::srgb(1.0, 0.4, 0.3));
                 });
-
-                // Build tools row.
-                bar.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(4.0),
-                    align_items: AlignItems::Center,
-                    ..default()
-                })
-                .with_children(|row| {
-                    label(row, "BUILD:", 12.0, Color::srgb(0.6, 0.66, 0.72));
-                    // Only categories live in the bar; their buildings sit in
-                    // a flyout opened on click (see build_menu_system).
-                    for cat in BuildCatKind::ALL {
-                        let e = row
-                            .spawn((
-                                Button,
-                                Interaction::default(),
-                                BuildCat(cat),
-                                Node {
-                                    height: Val::Px(26.0),
-                                    padding: UiRect::horizontal(Val::Px(10.0)),
-                                    margin: UiRect::all(Val::Px(2.0)),
-                                    align_items: AlignItems::Center,
-                                    justify_content: JustifyContent::Center,
-                                    ..default()
-                                },
-                                BackgroundColor(BUTTON_BG),
-                            ))
-                            .with_children(|b| {
-                                label(b, cat.label(), 13.0, Color::WHITE);
-                            })
-                            .id();
-                        build_cat_buttons.push((cat, e));
-                    }
-                    let demo_tool = Tool::Deconstruct;
-                    let e = button(
-                        row,
-                        "Deconstruct",
-                        Action::SetTool { tool: Some(demo_tool) },
-                        100.0,
-                    );
-                    pending_tool_btns.push((e, demo_tool));
-                    tool_buttons.push(e);
-                    button(
-                        row,
-                        "Cancel Tool [Esc]",
-                        Action::SetTool { tool: None },
-                        110.0,
-                    );
-                    tool_hint = label(row, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
-                });
-
-                // Flyout: the concrete buildings of the opened category.
-                flyout = bar
-                    .spawn((
-                        FlyoutRoot,
-                        Interaction::default(),
-                        Node {
-                            padding: UiRect::all(Val::Px(6.0)),
-                            margin: UiRect::all(Val::Px(2.0)),
-                            border: UiRect::all(Val::Px(1.0)),
-                            ..default()
-                        },
-                        BorderColor(Color::srgba(0.45, 0.55, 0.65, 0.8)),
-                        BackgroundColor(Color::srgba(0.09, 0.12, 0.16, 0.95)),
-                        Visibility::Hidden,
-                    ))
-                    .with_children(|f| {
-                        for cat in BuildCatKind::ALL {
-                            let row_e = f
-                                .spawn((
-                                    FlyoutRow(cat),
-                                    Node {
-                                        flex_direction: FlexDirection::Row,
-                                        column_gap: Val::Px(4.0),
-                                        align_items: AlignItems::Center,
-                                        ..default()
-                                    },
-                                    Visibility::Hidden,
-                                ))
-                                .with_children(|r| {
-                                    let header = match cat {
-                                        BuildCatKind::Structure => "Structure:",
-                                        BuildCatKind::Storage => "Storage:",
-                                        BuildCatKind::Machines => "Machines:",
-                                        BuildCatKind::Power => "Power:",
-                                        BuildCatKind::Thermal => "Thermal:",
-                                    };
-                                    label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
-                                    for kind in cat.kinds() {
-                                        let tool = Tool::Build(*kind);
-                                        let e = button(
-                                            r,
-                                            kind.label(),
-                                            Action::SetTool { tool: Some(tool) },
-                                            match kind {
-                                                BuildingKind::Fabricator => 88.0,
-                                                BuildingKind::Door => 56.0,
-                                                BuildingKind::Wall => 56.0,
-                                                BuildingKind::Rack => 96.0,
-                                                BuildingKind::PowerCable => 96.0,
-                                                BuildingKind::Reactor => 72.0,
-                                                BuildingKind::CoolantPipe => 96.0,
-                                                BuildingKind::Pump => 96.0,
-                                                BuildingKind::Reservoir => 110.0,
-                                                BuildingKind::HeatExchanger => 118.0,
-                                                BuildingKind::Radiator => 76.0,
-                                            },
-                                        );
-                                        pending_tool_btns.push((e, tool));
-                                        tool_buttons.push(e);
-                                    }
-                                })
-                                .id();
-                            flyout_rows.push((cat, row_e));
-                        }
-                    })
-                    .id();
-
-                // Per-network power summary line (visible with the overlay).
-                power_line = label(
-                    bar,
-                    "",
-                    12.0,
-                    Color::srgb(0.62, 0.9, 0.8),
-                );
-
-                // Developer toolbar, hidden by default.
-                debug_row = bar
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(6.0),
-                            align_items: AlignItems::Center,
-                            ..default()
-                        },
-                        Visibility::Hidden,
-                    ))
-                    .with_children(|row| {
-                        button(row, "+Crate", Action::SpawnItem { kind: ItemKind::Crate }, 64.0);
-                        button(row, "+Ore", Action::SpawnItem { kind: ItemKind::Ore }, 56.0);
-                        button(row, "+Part", Action::SpawnItem { kind: ItemKind::Part }, 60.0);
-                        label(
-                            row,
-                            "debug tools | [X] deletes the selected item",
-                            11.0,
-                            Color::srgb(0.55, 0.6, 0.66),
-                        );
-                        sim_telemetry = label(row, "", 11.0, Color::srgb(0.6, 0.8, 0.7));
-                    })
-                    .id();
-
-                label(
-                    bar,
-                    "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark | B: build tools | Space/1/2/3: speed",
-                    11.0,
-                    Color::srgb(0.6, 0.66, 0.72),
-                );
             });
 
-            // ---- bottom ----
+            // ---- bottom: build bar (left), crew chips (center), inspect
+            // pane (right) ----
+            // The row grows to fill the leftover height so its FlexEnd
+            // alignment pins the panels to the true screen bottom; the fixed
+            // panels must not shrink and the chips take only leftover width
+            // (flex-basis 0), otherwise the row overflows and crushes them.
             root.spawn(Node {
-                flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(4.0),
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::FlexEnd,
+                column_gap: Val::Px(6.0),
+                flex_grow: 1.0,
                 ..default()
             })
             .with_children(|bottom| {
-                // crew chips
-                bottom
-                    .spawn((
-                        Interaction::default(),
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(6.0),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|row| {
-                        for _ in 0..4 {
-                            chips.push(
-                                row.spawn((
-                                    Text::new(""),
-                                    TextFont {
-                                        font_size: 13.0,
-                                        ..default()
-                                    },
-                                    TextColor(Color::WHITE),
-                                    Node {
-                                        padding: UiRect::all(Val::Px(4.0)),
-                                        ..default()
-                                    },
-                                    BackgroundColor(PANEL_BG),
-                                ))
-                                .id(),
-                            );
-                        }
-                    });
+                // Build panel: the category bar sits in the bottom-left
+                // corner; its flyout and the placement hint open above it.
+                bottom.spawn((
+                    Interaction::default(),
+                    Node {
+                        flex_direction: FlexDirection::Column,
+                        align_items: AlignItems::FlexStart,
+                        row_gap: Val::Px(2.0),
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                ))
+                .with_children(|panel| {
+                    tool_hint = label(panel, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
 
-                bottom
-                    .spawn((
-                        Interaction::default(),
-                        Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(6.0),
-                            align_items: AlignItems::FlexEnd,
-                            ..default()
-                        },
-                    ))
-                    .with_children(|row| {
-                        // event log (full width; selection moved to the sidebar)
-                        row.spawn((
+                    // Flyout: the concrete buildings of the opened category.
+                    flyout = panel
+                        .spawn((
+                            FlyoutRoot,
                             Interaction::default(),
+                            CollapseWhenHidden,
                             Node {
-                                flex_grow: 1.0,
-                                padding: UiRect::all(Val::Px(8.0)),
                                 flex_direction: FlexDirection::Column,
-                                row_gap: Val::Px(1.0),
+                                padding: UiRect::all(Val::Px(6.0)),
+                                margin: UiRect::all(Val::Px(2.0)),
+                                border: UiRect::all(Val::Px(1.0)),
                                 ..default()
                             },
-                            BackgroundColor(PANEL_BG),
+                            BorderColor(Color::srgba(0.45, 0.55, 0.65, 0.8)),
+                            BackgroundColor(Color::srgba(0.09, 0.12, 0.16, 0.95)),
+                            Visibility::Hidden,
                         ))
-                        .with_children(|p| {
-                            label(p, "EVENT LOG", 11.0, Color::srgb(0.5, 0.55, 0.62));
-                            for _ in 0..EventLog::VISIBLE {
-                                log_lines.push(label(p, "", 12.0, Color::srgb(0.75, 0.78, 0.82)));
+                        .with_children(|f| {
+                            for cat in BuildCatKind::ALL {
+                                let row_e = f
+                                    .spawn((
+                                        FlyoutRow(cat),
+                                        CollapseWhenHidden,
+                                        Node {
+                                            flex_direction: FlexDirection::Row,
+                                            column_gap: Val::Px(4.0),
+                                            align_items: AlignItems::Center,
+                                            ..default()
+                                        },
+                                        Visibility::Hidden,
+                                    ))
+                                    .with_children(|r| {
+                                        let header = match cat {
+                                            BuildCatKind::Structure => "Structure:",
+                                            BuildCatKind::Storage => "Storage:",
+                                            BuildCatKind::Machines => "Machines:",
+                                            BuildCatKind::Power => "Power:",
+                                            BuildCatKind::Thermal => "Thermal:",
+                                        };
+                                        label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
+                                        for kind in cat.kinds() {
+                                            let tool = Tool::Build(*kind);
+                                            let e = button(
+                                                r,
+                                                kind.label(),
+                                                Action::SetTool { tool: Some(tool) },
+                                                match kind {
+                                                    BuildingKind::Fabricator => 88.0,
+                                                    BuildingKind::Door => 56.0,
+                                                    BuildingKind::Wall => 56.0,
+                                                    BuildingKind::Rack => 96.0,
+                                                    BuildingKind::PowerCable => 96.0,
+                                                    BuildingKind::Reactor => 72.0,
+                                                    BuildingKind::CoolantPipe => 96.0,
+                                                    BuildingKind::Pump => 96.0,
+                                                    BuildingKind::Reservoir => 110.0,
+                                                    BuildingKind::HeatExchanger => 118.0,
+                                                    BuildingKind::Radiator => 76.0,
+                                                },
+                                            );
+                                            pending_tool_btns.push((e, tool));
+                                            tool_buttons.push(e);
+                                        }
+                                    })
+                                    .id();
+                                flyout_rows.push((cat, row_e));
                             }
-                        });
+                        })
+                        .id();
+
+                    // Category bar (RimWorld-style architect tabs). Only
+                    // categories live here; their buildings sit in the
+                    // flyout opened on click (see build_menu_system).
+                    panel.spawn((
+                        Interaction::default(),
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(4.0),
+                            align_items: AlignItems::Center,
+                            padding: UiRect::vertical(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                    ))
+                    .with_children(|row| {
+                        for cat in BuildCatKind::ALL {
+                            let e = row
+                                .spawn((
+                                    Button,
+                                    Interaction::default(),
+                                    BuildCat(cat),
+                                    Node {
+                                        height: Val::Px(26.0),
+                                        padding: UiRect::horizontal(Val::Px(10.0)),
+                                        margin: UiRect::all(Val::Px(2.0)),
+                                        align_items: AlignItems::Center,
+                                        justify_content: JustifyContent::Center,
+                                        ..default()
+                                    },
+                                    BackgroundColor(BUTTON_BG),
+                                ))
+                                .with_children(|b| {
+                                    label(b, cat.label(), 13.0, Color::WHITE);
+                                })
+                                .id();
+                            build_cat_buttons.push((cat, e));
+                        }
+                        let demo_tool = Tool::Deconstruct;
+                        let e = button(
+                            row,
+                            "Deconstruct",
+                            Action::SetTool { tool: Some(demo_tool) },
+                            100.0,
+                        );
+                        pending_tool_btns.push((e, demo_tool));
+                        tool_buttons.push(e);
+                        button(
+                            row,
+                            "Cancel Tool [Esc]",
+                            Action::SetTool { tool: None },
+                            110.0,
+                        );
                     });
-            });
-        });
+                });
 
-        // ---- right sidebar: environment by default, selection on click ----
-        shell
-            .spawn((
-                Interaction::default(),
-                Node {
-                    width: Val::Px(300.0),
-                    height: Val::Percent(100.0),
-                    padding: UiRect::all(Val::Px(8.0)),
-                    flex_direction: FlexDirection::Column,
-                    row_gap: Val::Px(2.0),
-                    ..default()
-                },
-                BackgroundColor(PANEL_BG),
-            ))
-            .with_children(|sb| {
-                label(sb, "SHIP STATUS", 12.0, Color::srgb(0.5, 0.55, 0.62));
+                // Crew chips (bottom-center): basis 0 so they only ever take
+                // the space the corner panels leave, wrapping as needed.
+                bottom.spawn((
+                    Interaction::default(),
+                    Node {
+                        flex_direction: FlexDirection::Row,
+                        column_gap: Val::Px(6.0),
+                        row_gap: Val::Px(4.0),
+                        flex_wrap: FlexWrap::Wrap,
+                        flex_grow: 1.0,
+                        flex_basis: Val::Px(0.0),
+                        justify_content: JustifyContent::Center,
+                        ..default()
+                    },
+                ))
+                .with_children(|row| {
+                    for _ in 0..4 {
+                        chips.push(
+                            row.spawn((
+                                Text::new(""),
+                                TextFont {
+                                    font_size: 13.0,
+                                    ..default()
+                                },
+                                TextColor(Color::WHITE),
+                                Node {
+                                    padding: UiRect::all(Val::Px(4.0)),
+                                    ..default()
+                                },
+                                BackgroundColor(PANEL_BG),
+                            ))
+                            .id(),
+                        );
+                    }
+                });
 
-                // Environment mode (nothing selected).
-                env_section = sb
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(2.0),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|sec| {
-                        for _ in 0..ENV_LINES {
-                            env_lines.push(label(sec, "", 12.0, Color::WHITE));
-                        }
-                    })
-                    .id();
+                // Inspect pane: environment overview by default, selection
+                // details + operation buttons while something is selected.
+                bottom.spawn((
+                    Interaction::default(),
+                    Node {
+                        width: Val::Px(300.0),
+                        padding: UiRect::all(Val::Px(8.0)),
+                        flex_direction: FlexDirection::Column,
+                        row_gap: Val::Px(2.0),
+                        flex_shrink: 0.0,
+                        ..default()
+                    },
+                    BackgroundColor(PANEL_BG),
+                ))
+                .with_children(|sb| {
+                    label(sb, "SHIP STATUS", 12.0, Color::srgb(0.5, 0.55, 0.62));
 
-                // Entity mode (something selected): properties + operations.
-                entity_section = sb
-                    .spawn((
-                        Node {
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(2.0),
-                            ..default()
-                        },
-                        Visibility::Hidden,
-                    ))
-                    .with_children(|sec| {
-                        for _ in 0..SEL_LINES {
-                            sel_lines.push(label(sec, "", 13.0, Color::WHITE));
-                        }
-                        // Re-purposable operation buttons (wrap to sidebar width).
-                        for _row_idx in 0..2 {
-                            sec.spawn(Node {
-                                flex_direction: FlexDirection::Row,
-                                flex_wrap: FlexWrap::Wrap,
-                                column_gap: Val::Px(3.0),
+                    // Environment mode (nothing selected).
+                    env_section = sb
+                        .spawn((
+                            CollapseWhenHidden,
+                            Node {
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(2.0),
                                 ..default()
-                            })
-                            .with_children(|r| {
-                                for _ in 0..(SEL_BTNS / 2) {
-                                    sel_btns.push(
-                                        r.spawn((
-                                            Button,
-                                            Interaction::default(),
-                                            Node {
-                                                height: Val::Px(24.0),
-                                                padding: UiRect::horizontal(Val::Px(8.0)),
-                                                margin: UiRect::all(Val::Px(1.0)),
-                                                align_items: AlignItems::Center,
-                                                justify_content: JustifyContent::Center,
-                                                ..default()
-                                            },
-                                            BackgroundColor(BUTTON_BG),
-                                            Visibility::Hidden,
-                                        ))
-                                        .with_children(|b| {
-                                            label(b, "", 12.0, Color::WHITE);
-                                        })
-                                        .id(),
-                                    );
-                                }
-                            });
-                        }
-                    })
-                    .id();
+                            },
+                        ))
+                        .with_children(|sec| {
+                            for _ in 0..ENV_LINES {
+                                env_lines.push(label(sec, "", 12.0, Color::WHITE));
+                            }
+                        })
+                        .id();
+
+                    // Entity mode (something selected): properties + operations.
+                    entity_section = sb
+                        .spawn((
+                            CollapseWhenHidden,
+                            Node {
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(2.0),
+                                ..default()
+                            },
+                            Visibility::Hidden,
+                        ))
+                        .with_children(|sec| {
+                            for _ in 0..SEL_LINES {
+                                sel_lines.push(label(sec, "", 13.0, Color::WHITE));
+                            }
+                            // Re-purposable operation buttons (wrap to pane width).
+                            for _row_idx in 0..2 {
+                                sec.spawn(Node {
+                                    flex_direction: FlexDirection::Row,
+                                    flex_wrap: FlexWrap::Wrap,
+                                    column_gap: Val::Px(3.0),
+                                    ..default()
+                                })
+                                .with_children(|r| {
+                                    for _ in 0..(SEL_BTNS / 2) {
+                                        sel_btns.push(
+                                            r.spawn((
+                                                Button,
+                                                Interaction::default(),
+                                                CollapseWhenHidden,
+                                                Node {
+                                                    height: Val::Px(24.0),
+                                                    padding: UiRect::horizontal(Val::Px(8.0)),
+                                                    margin: UiRect::all(Val::Px(1.0)),
+                                                    align_items: AlignItems::Center,
+                                                    justify_content: JustifyContent::Center,
+                                                    ..default()
+                                                },
+                                                BackgroundColor(BUTTON_BG),
+                                                Visibility::Hidden,
+                                            ))
+                                            .with_children(|b| {
+                                                label(b, "", 12.0, Color::WHITE);
+                                            })
+                                            .id(),
+                                        );
+                                    }
+                                });
+                            }
+                        })
+                        .id();
+                });
             });
         });
-
     commands.insert_resource(Hud {
         speed_buttons: speed_buttons.clone(),
         stats,
@@ -723,8 +788,8 @@ fn button_system(
     }
 }
 
-/// Right sidebar: environment overview by default, selection details +
-/// operation buttons while something is selected.
+/// Inspect pane (bottom-right): environment overview by default, selection
+/// details + operation buttons while something is selected.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn sidebar_system(
@@ -2118,8 +2183,6 @@ fn hud_update_system(
     )>,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
 ) {
-    let now = clock.now();
-
     // ---- per-frame: button highlight states (write only on change) ----
     for (idx, interaction, mut bg) in speed_btn_q.iter_mut() {
         let want = if speed.index == idx.0 {
@@ -2204,14 +2267,10 @@ fn hud_update_system(
         .iter()
         .filter(|(_, _, t, ..)| matches!(t, CrewTask::Idle(_)))
         .count();
-    let clock = crate::simtime::format_sim_stamp(now);
     if let Ok((mut text, mut color, _)) = texts.get_mut(hud.stats) {
         let want = format!(
-            "Marked: {marked} | Storage: {stored}/{cap} | Parts made: {} | Built: {} | Crew idle: {}/4 | {clock} | {}",
-            stats.produced,
-            stats.built,
-            idle,
-            speed.label(),
+            "Marked: {marked} | Storage: {stored}/{cap} | Parts {} | Built {} | Idle {}/4",
+            stats.produced, stats.built, idle,
         );
         set_text_if_changed(&mut text, want);
         let want_c = if cap == stored {

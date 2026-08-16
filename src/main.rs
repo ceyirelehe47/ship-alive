@@ -38,11 +38,51 @@ fn main() {
         // within a frame, so Sync always renders the latest world state.
         .configure_sets(FixedUpdate, (Set::Jobs, Set::Move).chain())
         .configure_sets(Update, (Set::Input, Set::Sync).chain())
-        .add_systems(Update, (smoke_autoquit, auto_screenshot))
+        .add_systems(Update, (smoke_autoquit, auto_screenshot, ui_layout_debug))
         .run();
 }
 
-/// Dev helper: `SLICE0_SMOKE=<frames> cargo run` exits automatically after N
+/// Dev helper: `SLICE0_UI_DEBUG=1` prints the computed taffy layout of every
+/// Interaction-bearing HUD node once at frame 250, with the first text found
+/// under it (2 levels deep) so panels can be identified in the log.
+fn ui_layout_debug(
+    mut frame: Local<u32>,
+    nodes: Query<(Entity, &ComputedNode, &GlobalTransform, &Children), With<Interaction>>,
+    texts: Query<&Text>,
+) {
+    if std::env::var("SLICE0_UI_DEBUG").is_err() {
+        return;
+    }
+    if *frame != 250 {
+        *frame += 1;
+        return;
+    }
+    let mut rows: Vec<(f32, f32, f32, f32, String)> = Vec::new();
+    for (e, node, gt, children) in nodes.iter() {
+        let s = node.size;
+        let mut tag = String::new();
+        for c in children.iter() {
+            if let Ok(t) = texts.get(c) {
+                tag = t.0.chars().take(18).collect();
+                break;
+            }
+        }
+        if tag.is_empty() {
+            tag = format!("e{:?}", e.index());
+        }
+        rows.push((gt.translation().y, gt.translation().x, s.x, s.y, tag));
+    }
+    rows.sort_by(|a, b| {
+        a.0.partial_cmp(&b.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    println!("---- UI LAYOUT (y, x, w, h, first-text) ----");
+    for (y, x, w, h, tag) in rows {
+        println!("UIDBG y={y:<7.0} x={x:<7.0} {w:<6.0}x{h:<5.0} {tag}");
+    }
+}
+
 /// frames, so the app can be smoke-tested from a script without a human
 /// closing the window.
 fn smoke_autoquit(mut frame: Local<u32>, mut exit: EventWriter<AppExit>) {

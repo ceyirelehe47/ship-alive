@@ -65,7 +65,7 @@ src/
   time_ctrl.rs   玩家倍率 Pause/1×/2×/4×（Space 记忆上次倍率）
   input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
   render.rs      建筑/蓝图/机器状态可视化 + 放置 ghost + 房间标注
-  ui.rs          HUD：右侧边栏(环境信息/选中实体属性+操作)、BUILD 分类栏/船员状态/事件日志
+  ui.rs          HUD（环世界式四角浮动面板）：左上状态+事件流、右上船钟+速度+警报、左下 BUILD 分类栏、中下船员条、右下检视面板
   ui_overlay.rs  悬停 tooltip + 框选矩形
   autotest.rs    SLICE0_SCENARIO=A..L + P1/P2/M 自动验收与试玩驱动器（开发工具）
   stats.rs       开发遥测（产量/搬运距离等，用于布局 A/B 对比）

@@ -1488,9 +1488,15 @@ fn selection_panel_system(
         &PowerStatus,
         Option<&MarkedForDeconstruct>,
     )>,
+    // Fabricators also carry Building; excluding them here lets the fabs
+    // branch below show the order panel instead of the generic building one.
     buildings: Query<
         (Entity, &TilePos, &Building, Option<&MarkedForDeconstruct>),
-        (With<Building>, Without<StorageCell>),
+        (
+            With<Building>,
+            Without<StorageCell>,
+            Without<crate::production::Fabricator>,
+        ),
     >,
     generators: Query<(
         Entity,
@@ -1546,10 +1552,23 @@ fn selection_panel_system(
             Err(_) => SelSig::None,
         },
         Some(Selected::Building(e)) => {
-            if let Ok((_, pos, role, _, demo, _)) = generators.get(e) {
+            // The generators query matches every powered machine; only a
+            // real Generator role takes the reactor branch, consumers
+            // (pumps, fabricators, …) fall through to the panels below.
+            let reactor = generators
+                .get(e)
+                .ok()
+                .and_then(|(_, pos, role, _, demo, _)| {
+                    if let PowerRole::Generator { on, .. } = *role {
+                        Some((pos, on, demo))
+                    } else {
+                        None
+                    }
+                });
+            if let Some((pos, on, demo)) = reactor {
                 SelSig::Generator {
                     e,
-                    on: matches!(role, PowerRole::Generator { on: true, .. }),
+                    on,
                     demo: demo.is_some(),
                     temp_q: thermal.grid.amb_at(*pos).max(0.0) as u16,
                 }
@@ -1733,10 +1752,18 @@ fn selection_panel_system(
             }
         }
         Some(Selected::Building(e)) => {
-            if let Ok((_, pos, role, status, demo, tstate)) = generators.get(e) {
-                let PowerRole::Generator { output, on } = *role else {
-                    unreachable!("generators query filters by role")
-                };
+            let reactor =
+                generators
+                    .get(e)
+                    .ok()
+                    .and_then(|(_, pos, role, status, demo, tstate)| {
+                        if let PowerRole::Generator { output, on } = *role {
+                            Some((pos, output, on, status, demo, tstate))
+                        } else {
+                            None
+                        }
+                    });
+            if let Some((pos, output, on, status, demo, tstate)) = reactor {
                 lines.push((
                     format!("Starter Reactor ({},{})", pos.x, pos.y),
                     Color::srgb(0.6, 1.0, 0.75),

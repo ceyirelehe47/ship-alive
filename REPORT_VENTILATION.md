@@ -333,8 +333,7 @@ J/K（开门气体交换/门缝语义）与 Slice 5 场景重叠，由 Slice 5 �
 
 ## Git
 
-- 代码提交：`feat: Slice 6 — Ventilation & Gas Handling (duct layer,
-  vents, blowers, gas tanks; conserved transport; topology cache; UI)`
-  （SHA 见 `git log`，本文件与文档在同一提交内更新的情况下以
-  `git log -1` 为准）
+- 代码提交：`9cf0328` — "Slice 6 — Ventilation & gas handling: duct layer,
+  vents, blowers, gas tanks"（代码 + 测试 + 文档一次提交；
+  本文件按 Slice 5 惯例钉住该 SHA）。
 - 推送：main 直推，无 force。

@@ -40,6 +40,59 @@ pub struct BtnLabel(pub String);
 #[derive(Component)]
 pub struct SpeedIndex(pub usize);
 
+/// Build toolbar categories. The bar shows only these; clicking one opens a
+/// flyout listing its concrete buildings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BuildCatKind {
+    Structure,
+    Storage,
+    Machines,
+    Power,
+}
+
+impl BuildCatKind {
+    pub const ALL: [BuildCatKind; 4] = [
+        BuildCatKind::Structure,
+        BuildCatKind::Storage,
+        BuildCatKind::Machines,
+        BuildCatKind::Power,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            BuildCatKind::Structure => "Structure",
+            BuildCatKind::Storage => "Storage",
+            BuildCatKind::Machines => "Machines",
+            BuildCatKind::Power => "Power",
+        }
+    }
+
+    pub fn kinds(self) -> &'static [BuildingKind] {
+        match self {
+            BuildCatKind::Structure => &[BuildingKind::Wall, BuildingKind::Door],
+            BuildCatKind::Storage => &[BuildingKind::Rack],
+            BuildCatKind::Machines => &[BuildingKind::Fabricator, BuildingKind::Reactor],
+            BuildCatKind::Power => &[BuildingKind::PowerCable],
+        }
+    }
+}
+
+/// Which build category's flyout is currently open.
+#[derive(Resource, Default, Debug)]
+pub struct BuildMenu(pub Option<BuildCatKind>);
+
+/// A category button in the build bar.
+#[derive(Component)]
+pub struct BuildCat(pub BuildCatKind);
+
+/// One flyout row (the buildings of one category).
+#[derive(Component)]
+pub struct FlyoutRow(pub BuildCatKind);
+
+/// The flyout container below the build bar.
+#[derive(Component)]
+pub struct FlyoutRoot;
+
 /// Marks which tool a build-bar button represents (for highlight state).
 #[derive(Component)]
 pub struct ToolIndex(pub Tool);
@@ -68,6 +121,9 @@ pub struct Hud {
     pub tool_buttons: Vec<Entity>,
     pub power_button_label: Entity,
     pub power_line: Entity,
+    pub build_cat_buttons: Vec<(BuildCatKind, Entity)>,
+    pub flyout: Entity,
+    pub flyout_rows: Vec<(BuildCatKind, Entity)>,
 }
 
 fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
@@ -110,12 +166,14 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DebugBarVisible>();
+        app.init_resource::<BuildMenu>();
         app.add_systems(Startup, (build_hud, crate::ui_overlay::build_overlay));
         app.add_systems(
             Update,
             (
                 button_system,
                 btn_label_system,
+                build_menu_system,
                 power_view_toggle_system,
                 debug_toggle_system,
                 (hud_update_system, selection_panel_system).chain(),
@@ -140,6 +198,9 @@ fn build_hud(mut commands: Commands) {
     let mut tool_buttons = Vec::new();
     let mut power_button_label = Entity::PLACEHOLDER;
     let mut power_line = Entity::PLACEHOLDER;
+    let mut build_cat_buttons: Vec<(BuildCatKind, Entity)> = Vec::new();
+    let mut flyout = Entity::PLACEHOLDER;
+    let mut flyout_rows: Vec<(BuildCatKind, Entity)> = Vec::new();
     let mut pending_tool_btns: Vec<(Entity, Tool)> = Vec::new();
 
     commands
@@ -235,23 +296,29 @@ fn build_hud(mut commands: Commands) {
                 })
                 .with_children(|row| {
                     label(row, "BUILD:", 12.0, Color::srgb(0.6, 0.66, 0.72));
-                    for kind in BuildingKind::ALL {
-                        let tool = Tool::Build(kind);
-                        let e = button(
-                            row,
-                            kind.label(),
-                            Action::SetTool { tool: Some(tool) },
-                            match kind {
-                                BuildingKind::Fabricator => 88.0,
-                                BuildingKind::Door => 56.0,
-                                BuildingKind::Wall => 56.0,
-                                BuildingKind::Rack => 96.0,
-                                BuildingKind::PowerCable => 96.0,
-                                BuildingKind::Reactor => 72.0,
-                            },
-                        );
-                        pending_tool_btns.push((e, tool));
-                        tool_buttons.push(e);
+                    // Only categories live in the bar; their buildings sit in
+                    // a flyout opened on click (see build_menu_system).
+                    for cat in BuildCatKind::ALL {
+                        let e = row
+                            .spawn((
+                                Button,
+                                Interaction::default(),
+                                BuildCat(cat),
+                                Node {
+                                    height: Val::Px(26.0),
+                                    padding: UiRect::horizontal(Val::Px(10.0)),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|b| {
+                                label(b, cat.label(), 13.0, Color::WHITE);
+                            })
+                            .id();
+                        build_cat_buttons.push((cat, e));
                     }
                     let demo_tool = Tool::Deconstruct;
                     let e = button(
@@ -270,6 +337,67 @@ fn build_hud(mut commands: Commands) {
                     );
                     tool_hint = label(row, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
                 });
+
+                // Flyout: the concrete buildings of the opened category.
+                flyout = bar
+                    .spawn((
+                        FlyoutRoot,
+                        Interaction::default(),
+                        Node {
+                            padding: UiRect::all(Val::Px(6.0)),
+                            margin: UiRect::all(Val::Px(2.0)),
+                            border: UiRect::all(Val::Px(1.0)),
+                            ..default()
+                        },
+                        BorderColor(Color::srgba(0.45, 0.55, 0.65, 0.8)),
+                        BackgroundColor(Color::srgba(0.09, 0.12, 0.16, 0.95)),
+                        Visibility::Hidden,
+                    ))
+                    .with_children(|f| {
+                        for cat in BuildCatKind::ALL {
+                            let row_e = f
+                                .spawn((
+                                    FlyoutRow(cat),
+                                    Node {
+                                        flex_direction: FlexDirection::Row,
+                                        column_gap: Val::Px(4.0),
+                                        align_items: AlignItems::Center,
+                                        ..default()
+                                    },
+                                    Visibility::Hidden,
+                                ))
+                                .with_children(|r| {
+                                    let header = match cat {
+                                        BuildCatKind::Structure => "Structure:",
+                                        BuildCatKind::Storage => "Storage:",
+                                        BuildCatKind::Machines => "Machines:",
+                                        BuildCatKind::Power => "Power:",
+                                    };
+                                    label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
+                                    for kind in cat.kinds() {
+                                        let tool = Tool::Build(*kind);
+                                        let e = button(
+                                            r,
+                                            kind.label(),
+                                            Action::SetTool { tool: Some(tool) },
+                                            match kind {
+                                                BuildingKind::Fabricator => 88.0,
+                                                BuildingKind::Door => 56.0,
+                                                BuildingKind::Wall => 56.0,
+                                                BuildingKind::Rack => 96.0,
+                                                BuildingKind::PowerCable => 96.0,
+                                                BuildingKind::Reactor => 72.0,
+                                            },
+                                        );
+                                        pending_tool_btns.push((e, tool));
+                                        tool_buttons.push(e);
+                                    }
+                                })
+                                .id();
+                            flyout_rows.push((cat, row_e));
+                        }
+                    })
+                    .id();
 
                 // Per-network power summary line (visible with the overlay).
                 power_line = label(
@@ -445,6 +573,9 @@ fn build_hud(mut commands: Commands) {
         tool_buttons,
         power_button_label,
         power_line,
+        build_cat_buttons,
+        flyout,
+        flyout_rows,
     });
     for (i, b) in speed_buttons.iter().enumerate() {
         commands.entity(*b).insert(SpeedIndex(i));
@@ -477,6 +608,72 @@ fn button_system(
         if *interaction == Interaction::Pressed {
             actions.write(on_press.0);
         }
+    }
+}
+
+/// Build toolbar flyout: category clicks toggle it open/closed, picking a
+/// building (or any tool change) closes it, and the open/active category
+/// button is highlighted.
+#[allow(clippy::type_complexity)]
+fn build_menu_system(
+    mut menu: ResMut<BuildMenu>,
+    hud: Res<Hud>,
+    build_mode: Res<crate::input::BuildMode>,
+    cat_q: Query<(&Interaction, &BuildCat), Changed<Interaction>>,
+    mut vis_q: Query<&mut Visibility, Or<(With<FlyoutRoot>, With<FlyoutRow>)>>,
+    mut bg_q: Query<(&BuildCat, &Interaction, &mut BackgroundColor)>,
+) {
+    // Toggle on click (Changed+Pressed = only the transition frame, so
+    // holding the button does not flicker the menu open and closed).
+    for (interaction, cat) in cat_q.iter() {
+        if *interaction == Interaction::Pressed {
+            menu.0 = if menu.0 == Some(cat.0) {
+                None
+            } else {
+                Some(cat.0)
+            };
+        }
+    }
+    // Any tool change (pick from the flyout, B cycle, Esc, Deconstruct…)
+    // closes the flyout so the placement ghost takes over immediately.
+    if build_mode.is_changed() {
+        menu.0 = None;
+    }
+
+    let open = menu.0;
+    if let Ok(mut v) = vis_q.get_mut(hud.flyout) {
+        *v = if open.is_some() {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    for (cat, row_e) in &hud.flyout_rows {
+        if let Ok(mut v) = vis_q.get_mut(*row_e) {
+            *v = if open == Some(*cat) {
+                Visibility::Visible
+            } else {
+                Visibility::Hidden
+            };
+        }
+    }
+    // Highlight: open category, or the category owning the active tool.
+    let active_tool_cat = match build_mode.0 {
+        Some(Tool::Build(kind)) => BuildCatKind::ALL
+            .iter()
+            .find(|c| c.kinds().contains(&kind))
+            .copied(),
+        _ => None,
+    };
+    for (cat_button, interaction, mut bg) in bg_q.iter_mut() {
+        let cat = cat_button.0;
+        bg.0 = if open == Some(cat) || active_tool_cat == Some(cat) {
+            BUTTON_ACTIVE
+        } else if *interaction == Interaction::Hovered {
+            BUTTON_HOVER
+        } else {
+            BUTTON_BG
+        };
     }
 }
 
@@ -784,7 +981,12 @@ fn selection_panel_system(
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
     mut btn_q: Query<
         (&Interaction, &mut BackgroundColor, &mut Visibility),
-        (With<Button>, Without<SpeedIndex>, Without<ToolIndex>),
+        (
+            With<Button>,
+            Without<SpeedIndex>,
+            Without<ToolIndex>,
+            Without<BuildCat>,
+        ),
     >,
     mut last_sig: Local<SelSig>,
 ) {
@@ -1327,10 +1529,13 @@ fn hud_update_system(
     build_mode: Res<BuildMode>,
     power: Res<PowerOverlay>,
     power_state: Res<PowerState>,
-    mut speed_btn_q: Query<(&SpeedIndex, &Interaction, &mut BackgroundColor), With<SpeedIndex>>,
+    mut speed_btn_q: Query<
+        (&SpeedIndex, &Interaction, &mut BackgroundColor),
+        (With<SpeedIndex>, Without<BuildCat>),
+    >,
     mut tool_btn_q: Query<
         (&ToolIndex, &Interaction, &mut BackgroundColor),
-        (With<ToolIndex>, Without<SpeedIndex>),
+        (With<ToolIndex>, Without<SpeedIndex>, Without<BuildCat>),
     >,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &crate::crew::Movement)>,
     items: Query<

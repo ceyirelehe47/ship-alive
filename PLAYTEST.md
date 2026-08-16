@@ -32,8 +32,10 @@ Fabricator）/ STORAGE（淡琥珀色高亮）。
 
 ### 建造（BUILD 栏）
 
-顶栏 **BUILD:** 按钮组：Wall（1 零件）/ Door（2 零件）/ Storage Rack（1 零件）/
-Fabricator（4 零件，2×2）/ Deconstruct。选中工具后：
+顶栏 **BUILD:** 按钮组按**分类**收纳：`Structure`（Wall/Door）、`Storage`（Storage Rack）、
+`Machines`（Fabricator/Reactor）、`Power`（Power Cable），外加 `Deconstruct` 与
+`Cancel Tool`。**点击分类展开浮窗**，再点具体建筑选中工具（浮窗自动收起）；
+正在使用的工具所在分类保持高亮。选中工具后：
 
 - 鼠标处出现放置虚影，**绿色** = 可放置，**红色** = 不可放置（悬停文本显示原因）。
 - 左键放置蓝图。蓝图**不会立即成型**：

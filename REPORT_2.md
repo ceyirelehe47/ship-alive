@@ -143,6 +143,14 @@ heat / cooling / 散热 / 维修 / 详细燃料 / 电池 / 环境（氧气气压
 - **`ring.png` / `dot.png` 改为程序化合成**（白环/白点，游戏内 tint 上色）— 原 AI raw 是纯洋红占位方块，经管线后成实心板遮挡内容；UI 图元不再走生图管线（已写入 AGENTS.md 经验）。
 - `floor/wall/wall_built/door/rack/fabricator/crate/ore/part/crew` 重跑 prep_art（视觉等价重编码）。
 
+## Post-review UI refinement
+
+交付后应用户要求把 BUILD 栏改为**分类 + 浮窗**：栏内只保留
+Structure / Storage / Machines / Power 四个分类按钮（外加 Deconstruct、Cancel Tool），
+点击分类展开浮窗选择具体建筑；选中建筑、切换工具（B/Esc）或再点分类即收起；
+活动工具所属分类保持高亮。纯 UI 层改动（`BuildMenu` 资源 + `build_menu_system`），
+不触碰模拟；全部 64 测试与门禁保持绿色。
+
 ## Git
 
 - branch：`main`

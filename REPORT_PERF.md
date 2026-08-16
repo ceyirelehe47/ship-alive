@@ -76,7 +76,21 @@ Slice 3 交付后做一轮系统级性能清理。方法：
   颜色写累计数（调试期评估用，稳定后可移除）。
 - HUD 调试行 `SIM steps/frame / peak / backlog` 不变，仍是卡顿观察入口。
 
-## 6. 后续候选（本轮未做）
+## 6. 追加修复：表现层时钟（玩家反馈 WASD 相机过快）
+
+玩家试玩报告 WASD 平移速度异常。根因不在本轮优化，而在统一模拟时间轮
+（`b53d8f4`）：`sim_pump_system` 把 `Time<Virtual>` 的 relative_speed 设为
+`BASE_SIM_RATE × 游戏速度`，而 Bevy 的泛型 `Res<Time>` 跟随虚拟时钟——所有
+用 `time.delta()` 的表现层代码因此变成 60 倍速（暂停时则冻住）。本轮优化
+暴露了它的另一面：overlay/UI 节流累计器用虚拟 delta，0.2s/10 Hz 的节流
+实际退化成每帧。
+
+修复：全部六处 `Res<Time>` 消费者改用 `Res<Time<Real>>`——相机平移与缩放
+平滑（`input.rs`）、两个 overlay 刷新节流（`render.rs`）、三个 UI 节流
+（`ui.rs`）。相机恢复 420 世界单位/真实秒（Slice 0 时的设计速度），暂停时
+也可自由移动视角；节流恢复真实墙钟频率。
+
+## 7. 后续候选（本轮未做）
 
 - Power 覆盖层池化（当前重建量小：电缆数级，收益有限）。
 - `sync_selection_system` / `ghost_system` 同样接 `VisualIndex`（当前查询已较小）。

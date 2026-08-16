@@ -729,7 +729,9 @@ fn button_system(
 #[allow(clippy::too_many_arguments)]
 fn sidebar_system(
     hud: Res<Hud>,
-    time: Res<Time>,
+    // Real time: the UI refresh cadence is wall-clock (the virtual clock
+    // runs at BASE_SIM_RATE × game speed and pauses with the game).
+    time: Res<Time<Real>>,
     mut ui_acc: Local<f32>,
     selection: Res<Selection>,
     clock: Res<crate::simtime::SimClock>,
@@ -1040,7 +1042,9 @@ fn overlay_cycle_system(
 #[allow(clippy::too_many_arguments)]
 fn overlay_summary_system(
     hud: Res<Hud>,
-    time: Res<Time>,
+    // Real time: the UI refresh cadence is wall-clock (the virtual clock
+    // runs at BASE_SIM_RATE × game speed and pauses with the game).
+    time: Res<Time<Real>>,
     mut ui_acc: Local<f32>,
     mut last_mode: Local<OverlayMode>,
     overlay: Res<OverlayMode>,
@@ -2075,7 +2079,9 @@ fn selection_panel_system(
 #[allow(clippy::too_many_arguments)]
 fn hud_update_system(
     hud: Res<Hud>,
-    time: Res<Time>,
+    // Real time: the UI refresh cadence is wall-clock (the virtual clock
+    // runs at BASE_SIM_RATE × game speed and pauses with the game).
+    time: Res<Time<Real>>,
     mut ui_acc: Local<f32>,
     speed: Res<GameSpeed>,
     clock: Res<crate::simtime::SimClock>,

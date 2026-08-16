@@ -403,7 +403,11 @@ fn camera_control_system(
     buttons: Res<ButtonInput<MouseButton>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut wheel_events: EventReader<MouseWheel>,
-    time: Res<Time>,
+    // Real (not virtual) time: the camera is a presentation concern and must
+    // pan at a constant real-world speed regardless of game speed — the
+    // virtual clock runs at BASE_SIM_RATE × scale, and it also freezes on
+    // pause.
+    time: Res<Time<Real>>,
     map: Res<ShipMap>,
     mut camera: Query<(&mut Transform, &mut Projection), With<Camera2d>>,
     mut last_cursor: Local<Option<Vec2>>,

@@ -1088,7 +1088,9 @@ fn power_overlay_system(
 #[allow(clippy::too_many_arguments)]
 fn thermal_overlay_system(
     mut commands: Commands,
-    time: Res<Time>,
+    // Real time: the refresh cadence is wall-clock by design (the virtual
+    // clock runs at BASE_SIM_RATE × game speed and pauses with the game).
+    time: Res<Time<Real>>,
     map: Res<ShipMap>,
     art: Res<Art>,
     grid: Res<crate::thermal::ThermalGrid>,
@@ -1230,7 +1232,9 @@ fn temp_bucket(t: f32) -> u16 {
 #[allow(clippy::too_many_arguments)]
 fn coolant_overlay_system(
     mut commands: Commands,
-    time: Res<Time>,
+    // Real time: the refresh cadence is wall-clock by design (the virtual
+    // clock runs at BASE_SIM_RATE × game speed and pauses with the game).
+    time: Res<Time<Real>>,
     map: Res<ShipMap>,
     art: Res<Art>,
     pipes: Res<crate::coolant::PipeGrid>,

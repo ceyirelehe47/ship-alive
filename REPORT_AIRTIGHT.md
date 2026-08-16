@@ -372,4 +372,4 @@ independent device thermal node · room renaming/zones.
 ## Git
 
 - Branch `main`, direct push (no force).
-- Final SHA: `f7eb589` (full: bd7c11f26ff8a36fd40a3b7e408cb35efc0a3872)
+- Final SHA: `9920ce0` (this report touches only docs afterward) (full: bd7c11f26ff8a36fd40a3b7e408cb35efc0a3872)

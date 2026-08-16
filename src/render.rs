@@ -539,7 +539,12 @@ fn crew_world_pos(map: &ShipMap, pos: &TilePos, mov: &Movement) -> Vec2 {
     if mov.path.is_empty() {
         from
     } else {
-        from.lerp(map.world_pos(mov.path[0]), mov.progress.clamp(0.0, 1.0))
+        // `progress` is a distance budget toward the next tile; normalize it
+        // by the current step's length (diagonal steps are √2 long) so the
+        // interpolation factor stays 0..1 in every direction.
+        let need = crate::path::step_length(*pos, mov.path[0]);
+        let t = (mov.progress / need).clamp(0.0, 1.0);
+        from.lerp(map.world_pos(mov.path[0]), t)
     }
 }
 

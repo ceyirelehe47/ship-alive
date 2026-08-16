@@ -117,6 +117,14 @@ SLICE2_SCENARIO=A..J cargo run  # 电力验收：健康网/断线/分割/重接/
 SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全程
 ```
 
+## 移动（Slice: 8 向寻路升级）
+
+船员现在**八方向**行走：开阔地带自动走斜线，路线更自然、更短。
+- 斜向步长是正交的 √2 倍，**世界速度完全一致**（斜走不会加速）；
+- **严格禁止穿角**：两面墙之间、甚至只有一侧是墙的角落都不能斜穿；
+  门口/墙角行为因此更稳定；
+- 搬运距离遥测（haul_dist）现在统计真实几何距离（斜步计为 √2）。
+
 ## Slice 2 新玩法：电力（Power）
 
 - **开局即通电**：FABRICATION 左下角的 Starter Reactor（绿环、`reactor 100 PU`）
@@ -140,4 +148,4 @@ SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全�
 - `SLICE0_TRACE=1 SLICE0_SCENARIO=... cargo run`：每 2 秒打印船员轨迹。
 - `SLICE0_SCAN_DEBUG=1 ...`：打印工作扫描/任务内部状态（诊断用）。
 - `SLICE0_SHOT=<frame>[:<path>] cargo run`：引擎内截图（无窗口抓屏的可靠替代）。
-- `cargo test`：64 个单元/集成测试。
+- `cargo test`：76 个单元/集成测试。

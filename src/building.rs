@@ -162,10 +162,13 @@ impl Footprint {
     }
 
     /// Manhattan distance from a position to the nearest footprint tile.
-    pub fn distance_to(&self, p: TilePos) -> i32 {
-        let dx = (self.x - p.x).max(p.x - (self.x + self.w - 1)).max(0);
-        let dy = (self.y - p.y).max(p.y - (self.y + self.h - 1)).max(0);
-        dx + dy
+    pub fn distance_to(&self, p: TilePos) -> f32 {
+        // Octile distance from `p` to the nearest footprint tile (8-way
+        // geometry — Manhattan would systematically overestimate diagonal
+        // targets in the job scan).
+        self.tiles()
+            .map(|t| crate::path::octile_distance(t, p))
+            .fold(f32::INFINITY, f32::min)
     }
 }
 
@@ -358,7 +361,11 @@ pub fn interaction_tiles(map: &ShipMap, foot: &Footprint) -> Vec<TilePos> {
 /// Path from `from` to the closest reachable interaction tile of a footprint.
 pub fn path_to_interaction(map: &ShipMap, from: TilePos, foot: &Footprint) -> Option<Vec<TilePos>> {
     let mut tiles = interaction_tiles(map, foot);
-    tiles.sort_by_key(|t| (t.x - from.x).abs() + (t.y - from.y).abs());
+    tiles.sort_by(|a, b| {
+        crate::path::octile_distance(*a, from)
+            .partial_cmp(&crate::path::octile_distance(*b, from))
+            .unwrap()
+    });
     for t in tiles {
         if let Some(p) = crate::path::find_path(map, from, t, |_| false) {
             return Some(p);

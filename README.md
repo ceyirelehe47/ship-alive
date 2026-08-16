@@ -24,7 +24,7 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 64 个单元/集成测试
+cargo test                     # 76 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -36,7 +36,7 @@ cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 src/
   lib.rs         模块组织 + 帧内系统顺序（Input→Jobs→Move→Sync）
   map.rs         固定舰船布局（字符画）→ 稠密网格 ShipMap（含 BuiltWall/Door/Machine 格）
-  path.rs        网格 A*（4 向，支持动态阻挡）
+  path.rs        网格 A*（8 向，octile 启发式 + 严格禁穿角，10/14 cost）
   crew.rs        船员组件：Crew / 工作优先级 / CrewTask(Idle|Haul|Build|Deconstruct|Operate)
   items.rs       地面物品：Item / MarkedForHaul / ReservedBy / CarriedBy
   storage.rs     货架 StorageCell（容量 + 物品类型过滤）
@@ -55,6 +55,7 @@ src/
   setup.rs       从字符画生成世界（含预置 Fabricator 与 P/O 库存货架）
   bin/prep_art.rs 生成美术的后处理（去背/裁切/缩放）
 tests/
+  path8.rs       8 向移动测试（对角速度一致/混合步/禁穿角/避让）
   haul_logic.rs  Slice 0B 无头集成测试（领取互斥/框选/满仓/…）
   ship_ops.rs    Slice 1 无头集成测试（建造/拆除/生产/过滤/优先级）
   power_ops.rs   Slice 2 电力测试（拓扑/分割/并网/过载/断电生产）

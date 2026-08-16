@@ -107,7 +107,7 @@ fn scenario_driver(
     mut exit: EventWriter<AppExit>,
     mut fired: Local<Vec<&'static str>>,
     mut last_trace: Local<f64>,
-    mut rework: Local<(u32, u32)>,
+    mut rework: Local<(f32, u32)>,
     trace_crews: Query<(
         &Crew,
         &CrewTask,
@@ -715,9 +715,9 @@ fn scenario_driver(
                 fired.push("m_done");
                 // Deltas since the rework completed.
                 println!(
-                    "M_IMPROVED t_next_5_parts={} haul_dist_since_rework={} hauls_since_rework={}",
+                    "M_IMPROVED t_next_5_parts={:.1} haul_dist_since_rework={:.0} hauls_since_rework={}",
                     t,
-                    stats.haul_distance.saturating_sub(rework.0),
+                    (stats.haul_distance - rework.0).max(0.0),
                     stats.hauls_done.saturating_sub(rework.1),
                 );
                 dump_and_exit(

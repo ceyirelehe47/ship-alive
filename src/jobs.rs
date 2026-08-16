@@ -658,7 +658,11 @@ fn choose_rack(
     racks: &[(Entity, TilePos)],
 ) -> Option<(Entity, Vec<TilePos>)> {
     let mut sorted = racks.to_vec();
-    sorted.sort_by_key(|(_, p)| (from.x - p.x).abs() + (from.y - p.y).abs());
+    sorted.sort_by(|(_, a), (_, b)| {
+        crate::path::octile_distance(from, *a)
+            .partial_cmp(&crate::path::octile_distance(from, *b))
+            .unwrap()
+    });
     for (e, p) in sorted {
         if let Some(path) = crate::path::find_path(map, from, p, |_| false) {
             return Some((e, path));
@@ -1505,7 +1509,7 @@ pub fn crew_task_system(
 /// One claimable unit of work, generated per idle crew from live world state.
 struct Candidate {
     prio: Priority,
-    dist: i32,
+    dist: f32,
     cand: Cand,
 }
 
@@ -1513,7 +1517,7 @@ impl Candidate {
     /// Higher is better: priority tier dominates, distance breaks ties inside
     /// a tier (capped so a far High job still beats a near Low job).
     fn score(&self) -> i32 {
-        self.prio.weight() - self.dist.min(60)
+        self.prio.weight() - (self.dist.min(60.0) as i32)
     }
 }
 
@@ -1567,8 +1571,8 @@ fn best_source_for(
     local_claims: &HashSet<Entity>,
     now: f64,
     dest: HaulDest,
-) -> Option<(i32, Cand)> {
-    let mut best: Option<(i32, Cand)> = None;
+) -> Option<(f32, Cand)> {
+    let mut best: Option<(f32, Cand)> = None;
     for (e, p, it, reserved, carried, cooled, marked) in items.iter() {
         if it.kind != kind
             || marked.is_some() // player storage intent wins over auto demands
@@ -1581,7 +1585,7 @@ fn best_source_for(
         if cooled.is_some_and(|c| c.0 > now) {
             continue;
         }
-        let d = (crew_pos.x - p.x).abs() + (crew_pos.y - p.y).abs();
+        let d = crate::path::octile_distance(crew_pos, *p);
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, Cand::Ground { item: e, dest }));
         }
@@ -1590,7 +1594,9 @@ fn best_source_for(
         if !cell.has_kind(kind) {
             continue;
         }
-        let d = (crew_pos.x - p.x).abs() + (crew_pos.y - p.y).abs() + 1;
+        // +1 keeps the tie-break preference for loose ground items over
+        // rack stock (racks act as reserves).
+        let d = crate::path::octile_distance(crew_pos, *p) + 1.0;
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((
                 d,
@@ -1723,7 +1729,7 @@ pub fn crew_scan_system(
                 if !racks.iter().any(|(_, _, s)| s.can_take(it.kind)) {
                     continue;
                 }
-                let d = (pos.x - p.x).abs() + (pos.y - p.y).abs();
+                let d = crate::path::octile_distance(*pos, *p);
                 candidates.push(Candidate {
                     prio: haul_prio,
                     dist: d,
@@ -1878,7 +1884,11 @@ pub fn crew_scan_system(
         }
 
         // ---- pick and claim ----------------------------------------------------
-        candidates.sort_by(|a, b| b.score().cmp(&a.score()).then(a.dist.cmp(&b.dist)));
+        candidates.sort_by(|a, b| {
+            b.score()
+                .cmp(&a.score())
+                .then(a.dist.partial_cmp(&b.dist).unwrap())
+        });
         let mut claimed = false;
         for cand in &candidates {
             match cand.cand {
@@ -1895,7 +1905,7 @@ pub fn crew_scan_system(
                         Some(path) => {
                             commands.entity(item).insert(ReservedBy(crew_e));
                             local_claims.insert(item);
-                            stats.haul_distance += path.len() as u32;
+                            stats.haul_distance += crate::path::path_length(Some(*pos), &path);
                             set_haul_task(&mut task, &mut mov, item, dest, path, crew_e);
                             let name = crew.name.clone();
                             let dest_label = match dest {
@@ -1960,7 +1970,7 @@ pub fn crew_scan_system(
                             if let Some(de) = dest_entity(dest) {
                                 *inbound.entry((de, kind.index())).or_insert(0) += 1;
                             }
-                            stats.haul_distance += path.len() as u32;
+                            stats.haul_distance += crate::path::path_length(Some(*pos), &path);
                             set_haul_task(&mut task, &mut mov, item, dest, path, crew_e);
                             let name = crew.name.clone();
                             log.push(
@@ -2005,7 +2015,7 @@ pub fn crew_scan_system(
                             commands.entity(item).insert(MarkedForHaul);
                             commands.entity(item).insert(ReservedBy(crew_e));
                             local_claims.insert(item);
-                            stats.haul_distance += path.len() as u32;
+                            stats.haul_distance += crate::path::path_length(Some(*pos), &path);
                             set_haul_task(
                                 &mut task,
                                 &mut mov,

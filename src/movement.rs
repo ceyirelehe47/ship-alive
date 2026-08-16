@@ -155,8 +155,11 @@ pub fn movement_system(
                 if let Some(alt) =
                     crate::path::find_path(&map, *pos, goal, |p| blockers.contains(&p))
                 {
-                    // Only accept if it is a plausible detour, not a huge loop.
-                    if alt.len() < mov.path.len() + 4 {
+                    // Only accept a plausible detour, not a huge loop: compare
+                    // real path costs (diagonals are not "1 node" anymore).
+                    let alt_cost = crate::path::path_cost(Some(*pos), &alt);
+                    let cur_cost = crate::path::path_cost(Some(*pos), &mov.path);
+                    if alt_cost < cur_cost + 4 * crate::path::COST_CARDINAL {
                         mov.path = alt;
                         mov.blocked_for = 0.0;
                     }
@@ -172,11 +175,20 @@ pub fn movement_system(
         if mov.blocked_for == 0.0 {
             mov.passing_through = false;
         }
+        // `progress` is a DISTANCE budget toward `path[0]` in tile units:
+        // a diagonal step costs √2 of budget, a cardinal step 1, so the
+        // world-space speed stays `crew.speed` per second in every
+        // direction (no 41% diagonal speed boost). Leftover budget carries
+        // across steps with per-step conversion.
         mov.progress += dt * crew.speed;
-        while mov.progress >= 1.0 && !mov.path.is_empty() {
+        while !mov.path.is_empty() {
+            let need = crate::path::step_length(*pos, mov.path[0]);
+            if mov.progress < need {
+                break;
+            }
+            mov.progress -= need;
             let entered = mov.path.remove(0);
             *pos = entered;
-            mov.progress -= 1.0;
             // Real progress: the obstacle we yielded for is behind us.
             if mov.yield_for == Some(entered) {
                 mov.yield_for = None;

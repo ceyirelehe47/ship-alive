@@ -507,7 +507,7 @@ pub fn coolant_system(
         let ta = thermal.amb[i];
         let tw = water.temp[i];
         let cw = w * WATER_CAP;
-        let ca = thermal.air_cap(devices.mass_at(i));
+        let ca = thermal.air_cap_at(i, devices.mass_at(i));
         // Passive valve: pickup only above the setpoint; hot water may warm
         // cold air; never against the temperature gradient.
         let rate = if tw >= ta {

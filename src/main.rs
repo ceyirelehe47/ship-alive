@@ -20,6 +20,7 @@ fn main() {
             ship_alive::simtime::SimTimePlugin,
             ship_alive::power::PowerPlugin,
             ship_alive::airtight::AirtightPlugin,
+            ship_alive::atmosphere::AtmospherePlugin,
             render::RenderPlugin,
             time_ctrl::TimeCtrlPlugin,
             input::InputPlugin,

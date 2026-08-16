@@ -537,6 +537,8 @@ pub fn complete_building(
     cables: &mut crate::power::CableGrid,
     pipes: &mut crate::coolant::PipeGrid,
     thermal: &mut crate::thermal::ThermalGrid,
+    // Optional: minimal test worlds build without an atmosphere grid.
+    mut atmo: Option<&mut crate::atmosphere::AtmosphereGrid>,
     blueprint: Entity,
     bp: &Blueprint,
     crew_positions: &[(Entity, TilePos)],
@@ -582,6 +584,12 @@ pub fn complete_building(
         // conversion preserves temperature; see ThermalGrid::tile_changed).
         if old != Some(d.tile) {
             thermal.tile_changed(t, d.tile);
+            // And the gas side: becoming a wall redistributes the cell's
+            // air to open neighbours; doors/machines keep it (see
+            // AtmosphereGrid::tile_changed).
+            if let Some(atmo) = atmo.as_deref_mut() {
+                atmo.tile_changed(map, t, d.tile);
+            }
         }
     }
     // Displace crews standing on tiles that just became blocked.
@@ -716,6 +724,8 @@ pub fn complete_deconstruction(
     water: &mut crate::coolant::WaterGrid,
     cstats: &mut crate::coolant::CoolantStats,
     thermal: &mut crate::thermal::ThermalGrid,
+    // Optional: minimal test worlds build without an atmosphere grid.
+    mut atmo: Option<&mut crate::atmosphere::AtmosphereGrid>,
     building: Entity,
     b: &Building,
     rack_contents: Option<[u32; 3]>,
@@ -771,6 +781,11 @@ pub fn complete_deconstruction(
         map.set_tile(t, Tile::Floor);
         if old != Some(Tile::Floor) {
             thermal.tile_changed(t, Tile::Floor);
+            // The new floor volume keeps whatever gas was stored (usually
+            // none — a torn wall starts near-vacuum and fills by real flow).
+            if let Some(atmo) = atmo.as_deref_mut() {
+                atmo.tile_changed(map, t, Tile::Floor);
+            }
         }
     }
     // Full refund of the build cost, plus everything a rack had stored.

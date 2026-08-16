@@ -234,6 +234,122 @@ pub fn tooltip_system(
     }
 }
 
+/// Atmosphere hover card: while the Atmosphere overlay is active and no
+/// entity is under the cursor, take over the shared tooltip with the per-tile
+/// gas state (pressure / temperature / composition / compartment). Runs after
+/// `tooltip_system`, so an entity card always wins.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+pub fn atmosphere_tooltip_system(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    hovered: Res<Hovered>,
+    overlay: Res<crate::OverlayMode>,
+    map: Res<crate::map::ShipMap>,
+    atmo: Res<crate::atmosphere::AtmosphereGrid>,
+    thermal: Res<crate::thermal::ThermalGrid>,
+    comps: Res<crate::airtight::Compartments>,
+    overlay_res: Res<Overlay>,
+    mut node_q: Query<&mut Node, With<ZIndex>>,
+    mut text_q: Query<(&mut Text, &mut TextColor)>,
+    mut vis_q: Query<&mut Visibility>,
+) {
+    if *overlay != crate::OverlayMode::Atmosphere || hovered.0.is_some() {
+        return;
+    }
+    let Some(cursor) = windows.single().ok().and_then(|w| w.cursor_position()) else {
+        return;
+    };
+    let Some((cam, cam_gt)) = camera.single().ok() else {
+        return;
+    };
+    let Some(world) = cam.viewport_to_world_2d(cam_gt, cursor).ok() else {
+        return;
+    };
+    let Some(p) = map.tile_at_world(world) else {
+        return;
+    };
+    let mix = atmo.mixture_at(p);
+    let total = mix.total();
+    let i = atmo.idx(p);
+    let temp = thermal.amb[i];
+    let solid = matches!(
+        map.tile(p),
+        Some(crate::map::Tile::Wall) | Some(crate::map::Tile::BuiltWall)
+    );
+    let (title, detail, warn) = if solid {
+        (
+            format!("Structure ({},{})", p.x, p.y),
+            "solid — no gas volume".to_string(),
+            false,
+        )
+    } else if total <= 0.01 {
+        (
+            format!("Atmosphere ({},{})", p.x, p.y),
+            format!(
+                "VACUUM — 0.0 kPa\nTemp {:.1}°C\nCompartment #{}",
+                temp,
+                region_label(&comps, p)
+            ),
+            true,
+        )
+    } else {
+        let p_total = crate::atmosphere::pressure(total, temp);
+        let o2pp = crate::atmosphere::partial_pressure(mix.mol[0], total, temp);
+        let warn = p_total < crate::atmosphere::LOW_PRESSURE_KPA
+            || o2pp < crate::atmosphere::O2_SAFE_KPA
+            || crate::atmosphere::partial_pressure(mix.mol[2], total, temp)
+                > crate::atmosphere::CO2_HIGH_KPA
+            || crate::atmosphere::partial_pressure(mix.mol[3], total, temp)
+                > crate::atmosphere::POLLUTANT_HIGH_KPA;
+        (
+            format!("Atmosphere ({},{})", p.x, p.y),
+            format!(
+                "Pressure {:.1} kPa | {:.1}°C\nO2 {:.1} kPa ({:.0}%)\ninert {:.0}% | CO2 {:.1}% | pollutant {:.1}%\nCompartment #{}",
+                p_total,
+                temp,
+                o2pp,
+                mix.fraction(crate::atmosphere::Species::O2) * 100.0,
+                mix.fraction(crate::atmosphere::Species::Inert) * 100.0,
+                mix.fraction(crate::atmosphere::Species::Co2) * 100.0,
+                mix.fraction(crate::atmosphere::Species::Pollutant) * 100.0,
+                region_label(&comps, p),
+            ),
+            warn,
+        )
+    };
+    if let Ok(mut vis) = vis_q.get_mut(overlay_res.tooltip) {
+        *vis = Visibility::Visible;
+    }
+    if let Ok((mut text, _)) = text_q.get_mut(overlay_res.tooltip_title) {
+        text.0 = title;
+    }
+    if let Ok((mut text, mut color)) = text_q.get_mut(overlay_res.tooltip_detail) {
+        text.0 = detail;
+        color.0 = if warn {
+            Color::srgb(1.0, 0.6, 0.45)
+        } else {
+            Color::srgb(0.72, 0.76, 0.82)
+        };
+    }
+    if let Ok(mut node) = node_q.get_mut(overlay_res.tooltip) {
+        let x = (cursor.x + 16.0).min(1400.0 - TOOLTIP_W);
+        let y = (cursor.y + 18.0).min(760.0);
+        node.left = Val::Px(x);
+        node.top = Val::Px(y);
+    }
+}
+
+/// Compartment number for the hover card ("—" on walls / doors / space).
+fn region_label(comps: &crate::airtight::Compartments, p: TilePos) -> String {
+    let r = comps.region_at(p);
+    if r == crate::airtight::NO_REGION {
+        "—".to_string()
+    } else {
+        (r + 1).to_string()
+    }
+}
+
 /// Draw the box-select rectangle while the left button is dragged.
 pub fn box_rect_system(
     box_select: Res<BoxSelect>,

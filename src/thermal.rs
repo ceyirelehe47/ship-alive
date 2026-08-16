@@ -35,7 +35,10 @@ pub const SPACE_TEMP: f32 = -270.0;
 /// unaffected by this offset; it exists so store sums are physically honest).
 pub const KELVIN_OFFSET: f32 = 273.15;
 
-/// Heat capacity of one open tile's air + light furnishings (H/K).
+/// Heat capacity of one open tile's **standard** air fill (H/K). The runtime
+/// value lives in `ThermalGrid::gas_cap` and is refreshed by the atmosphere
+/// system from the actual gas amount (`GAS_CAP_PER_MOL · n`) — a vacuum tile
+/// has ~zero gas capacity, a pressurized tile matches this constant.
 pub const AMB_CAP: f32 = 24.0;
 /// Structural heat capacity of one hull-wall tile (H/K).
 pub const HULL_WALL_CAP: f32 = 80.0;
@@ -123,6 +126,10 @@ pub struct ThermalGrid {
     pub solid_temp: Vec<f32>,
     /// Structural heat capacity per tile; 0.0 = open tile (air only).
     pub solid_cap: Vec<f32>,
+    /// Gas heat capacity per tile (H/K) — written by the atmosphere system
+    /// (`GAS_CAP_PER_MOL · gas amount`), boot value = standard fill. Open
+    /// tiles only; wall tiles read as 0.
+    pub gas_cap: Vec<f32>,
     /// Airtight-sealed door tiles (Slice 4): the tile is still an air node,
     /// but conducts with its neighbours at `K_DOOR_SEALED` instead of
     /// `K_AIR_AIR`. Written by the door system; capacity never changes here.
@@ -136,15 +143,21 @@ impl ThermalGrid {
     pub fn new(map: &ShipMap) -> Self {
         let n = (map.width * map.height) as usize;
         let mut solid_cap = vec![0.0f32; n];
+        let mut gas_cap = vec![0.0f32; n];
         let mut sealed = vec![false; n];
         for (p, tile) in map.iter_tiles() {
             let i = (p.y * map.width + p.x) as usize;
             match tile {
                 Tile::Wall => solid_cap[i] = HULL_WALL_CAP,
                 Tile::BuiltWall => solid_cap[i] = BUILT_WALL_CAP,
-                // Doors boot closed: an airtight boundary until opened.
-                Tile::Door => sealed[i] = true,
-                Tile::Floor | Tile::Machine => {}
+                // Doors boot closed (airtight until opened) and carry the
+                // standard air fill; the atmosphere system owns the runtime
+                // capacity, the door system owns the seal flag.
+                Tile::Door => {
+                    sealed[i] = true;
+                    gas_cap[i] = AMB_CAP;
+                }
+                Tile::Floor | Tile::Machine => gas_cap[i] = AMB_CAP,
             }
         }
         Self {
@@ -153,6 +166,7 @@ impl ThermalGrid {
             amb: vec![AMBIENT_START; n],
             solid_temp: vec![AMBIENT_START; n],
             solid_cap,
+            gas_cap,
             sealed,
             wake: vec![0; n],
             awake: Vec::new(),
@@ -222,19 +236,20 @@ impl ThermalGrid {
         self.awake.len()
     }
 
-    /// Effective air heat capacity of an open tile (base + device mass).
-    pub fn air_cap(&self, extra_mass: f32) -> f32 {
-        AMB_CAP + extra_mass
+    /// Effective air heat capacity of an open tile: its current gas
+    /// (atmosphere-driven) plus any device mass on the node.
+    pub fn air_cap_at(&self, i: usize, extra_mass: f32) -> f32 {
+        self.gas_cap.get(i).copied().unwrap_or(0.0) + extra_mass
     }
 
-    /// Total heat content vs absolute zero, including per-tile device mass.
-    /// Conservation tests compare *deltas* of this against injections and
-    /// radiator dumps.
+    /// Total heat content vs absolute zero, including per-tile device mass
+    /// and the current gas heat capacity. Conservation tests compare *deltas*
+    /// of this against injections, radiator dumps and vented gas energy.
     pub fn total_heat(&self, devices: &DeviceTiles) -> f64 {
         let mut total = 0.0f64;
         for i in 0..self.amb.len() {
-            total +=
-                (self.air_cap(devices.mass_at(i)) as f64) * (self.amb[i] + KELVIN_OFFSET) as f64;
+            total += (self.air_cap_at(i, devices.mass_at(i)) as f64)
+                * (self.amb[i] + KELVIN_OFFSET) as f64;
             total += (self.solid_cap[i] as f64) * (self.solid_temp[i] + KELVIN_OFFSET) as f64;
         }
         total
@@ -266,6 +281,12 @@ impl ThermalGrid {
         };
         self.solid_cap[i] = new_cap;
         self.solid_temp[i] = self.amb[i];
+        // Walls hold no gas; open tiles keep whatever gas capacity the
+        // atmosphere grid assigns them (the atmosphere `tile_changed` hook
+        // redistributes the gas itself).
+        if new_tile == Tile::Wall || new_tile == Tile::BuiltWall {
+            self.gas_cap[i] = 0.0;
+        }
         // A fresh door tile starts sealed (closed); anything else unseals.
         self.sealed[i] = new_tile == Tile::Door;
         self.wake(i);
@@ -459,6 +480,9 @@ pub struct ThermalStats {
 #[allow(clippy::type_complexity)]
 pub fn thermal_air_system(
     mut grid: ResMut<ThermalGrid>,
+    // Optional so minimal test worlds can run the thermal loop standalone;
+    // the full app always inserts the grid at setup.
+    mut atmo: Option<ResMut<crate::atmosphere::AtmosphereGrid>>,
     power: Res<crate::power::PowerState>,
     clock: Res<crate::simtime::SimClock>,
     mut devices: ResMut<DeviceTiles>,
@@ -558,9 +582,19 @@ pub fn thermal_air_system(
             devices.mass[i] += per_tile_mass;
             if heat > 0.0 {
                 let q = heat * dt / tiles.len() as f32;
-                grid.amb[i] += q / grid.air_cap(per_tile_mass);
-                stats.injected_total += q as f64;
-                grid.wake(i);
+                let cap = grid.air_cap_at(i, per_tile_mass);
+                // A heat source always carries its own device mass, so the
+                // node has capacity; guard anyway rather than divide by 0.
+                if cap > 0.0 {
+                    grid.amb[i] += q / cap;
+                    stats.injected_total += q as f64;
+                    grid.wake(i);
+                    // Temperature changes pressure: keep the gas cells that
+                    // share this node atmospherically awake.
+                    if let Some(a) = &mut atmo {
+                        a.wake(i);
+                    }
+                }
             }
         }
     }
@@ -605,9 +639,9 @@ pub fn thermal_air_system(
                     };
                     let moved = conduct(
                         &mut ta,
-                        grid.air_cap(mass_i),
+                        grid.air_cap_at(i, mass_i),
                         &mut tb,
-                        grid.air_cap(mj),
+                        grid.air_cap_at(j, mj),
                         k,
                         dt,
                     );
@@ -640,7 +674,7 @@ pub fn thermal_air_system(
                         &mut ts,
                         grid.solid_cap[si],
                         &mut to,
-                        grid.air_cap(mass_open),
+                        grid.air_cap_at(sj, mass_open),
                         K_AIR_SOLID,
                         dt,
                     );
@@ -651,6 +685,15 @@ pub fn thermal_air_system(
             };
             if moved > WAKE_EPS {
                 grid.wake(j);
+                // Gas pressure follows the open-side temperature — keep the
+                // atmosphere awake only for pressure-relevant changes (a
+                // slow ship-wide drift is below any flow threshold).
+                if moved > crate::atmosphere::THERMAL_WAKE_EPS && (!solid_i || !solid_j) {
+                    if let Some(a) = &mut atmo {
+                        a.wake(i);
+                        a.wake(j);
+                    }
+                }
             }
         }
     }

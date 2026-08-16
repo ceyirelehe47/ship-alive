@@ -26,6 +26,8 @@ impl Plugin for AutotestPlugin {
                 slice2_driver,
                 slice3_driver,
                 slice4_driver,
+                slice5_driver,
+                slice5_dev_tools,
                 slice4_dev_pins,
             )
                 .in_set(crate::Set::Input),
@@ -1967,6 +1969,728 @@ fn slice4_driver(
         }
         _ => {}
     }
+}
+
+// =====================================================================================
+// SLICE5_SCENARIO. Atmosphere acceptance driver: A (stable boot), B (closed-
+// door isolation), C (open-door equalization), D (auto-door transient), E
+// (composition mixing), F (pollutant spreading), G (breach decompression),
+// H (emergency isolation), I (re-open after isolation), O (pause freeze),
+// P (speed equivalence), Q (sleep/wake). Heavy numeric verification
+// (conservation, formula properties, perf) lives in tests/atmosphere.rs;
+// these drive the full app wiring end to end.
+// =====================================================================================
+
+fn s5_region_tiles(
+    map: &crate::map::ShipMap,
+    comps: &crate::airtight::Compartments,
+    rid: u16,
+) -> Vec<TilePos> {
+    let mut out = Vec::new();
+    for y in 0..map.height {
+        for x in 0..map.width {
+            if comps.id[(y * map.width + x) as usize] == rid {
+                out.push(TilePos::new(x, y));
+            }
+        }
+    }
+    out
+}
+
+fn s5_region_at(comps: &crate::airtight::Compartments, p: TilePos) -> u16 {
+    comps.region_at(p)
+}
+
+/// (avg, min, max) total pressure over a region's tiles.
+fn s5_region_pressure(
+    atmo: &crate::atmosphere::AtmosphereGrid,
+    thermal: &crate::thermal::ThermalGrid,
+    tiles: &[TilePos],
+) -> (f32, f32, f32) {
+    let mut sum = 0.0;
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for &p in tiles {
+        let v = atmo.pressure_at(p, thermal);
+        sum += v;
+        min = min.min(v);
+        max = max.max(v);
+    }
+    if tiles.is_empty() {
+        (0.0, 0.0, 0.0)
+    } else {
+        (sum / tiles.len() as f32, min, max)
+    }
+}
+
+/// Species-average mole fractions of a region (for composition prints).
+fn s5_region_fractions(atmo: &crate::atmosphere::AtmosphereGrid, tiles: &[TilePos]) -> [f32; 4] {
+    let mut mol = [0.0f32; 4];
+    for &p in tiles {
+        let m = atmo.mixture_at(p);
+        for (dst, src) in mol.iter_mut().zip(m.mol.iter()) {
+            *dst += *src;
+        }
+    }
+    let total: f32 = mol.iter().sum();
+    if total <= 0.0 {
+        [0.0; 4]
+    } else {
+        [
+            mol[0] / total,
+            mol[1] / total,
+            mol[2] / total,
+            mol[3] / total,
+        ]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slice5_driver(
+    clock: Res<crate::simtime::SimClock>,
+    mut exit: EventWriter<AppExit>,
+    mut map: ResMut<crate::map::ShipMap>,
+    mut thermal: ResMut<crate::thermal::ThermalGrid>,
+    mut atmo: ResMut<crate::atmosphere::AtmosphereGrid>,
+    mut astats: ResMut<crate::atmosphere::AtmoStats>,
+    comps: Res<crate::airtight::Compartments>,
+    mut doors: Query<(&TilePos, &mut crate::airtight::Door)>,
+    mut demand: ResMut<crate::airtight::DoorDemand>,
+    mut speed: ResMut<crate::time_ctrl::GameSpeed>,
+    mut fired: Local<Vec<&'static str>>,
+) {
+    let Some(scenario) = std::env::var("SLICE5_SCENARIO").ok() else {
+        return;
+    };
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
+    let cargo = s5_region_at(&comps, TilePos::new(2, 2));
+    let crew = s5_region_at(&comps, TilePos::new(18, 2));
+    let corridor = s5_region_at(&comps, TilePos::new(10, 7));
+    let mut set_door_mode = |pos: TilePos, mode: crate::airtight::DoorMode| {
+        for (p, mut d) in doors.iter_mut() {
+            if *p == pos {
+                d.mode = mode;
+            }
+        }
+    };
+    let totals = |atmo: &crate::atmosphere::AtmosphereGrid| -> [f64; 4] {
+        crate::atmosphere::SPECIES.map(|s| atmo.onboard(s))
+    };
+    let boot = astats.boot_mol;
+
+    match scenario.as_str() {
+        // A - stable starter atmosphere: pressure + species hold, gas
+        // conserved, active workload settles to the heated room only.
+        "A" => {
+            if !fired.contains(&"speed") {
+                fired.push("speed");
+                speed.index = 3;
+            }
+            if !fired.contains(&"boot") && t >= 0.5 {
+                fired.push("boot");
+                let (avg, min, max) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                println!(
+                    "S5_A_BOOT t={t:.1} pressure avg={avg:.1} min={min:.1} max={max:.1} kPa active={} species_total={:.1}",
+                    atmo.awake_count(),
+                    boot.iter().sum::<f64>(),
+                );
+            }
+            if !fired.contains(&"done") && t >= 120.0 {
+                fired.push("done");
+                let now = totals(&atmo);
+                let (avg, min, max) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                let drift: f64 = now
+                    .iter()
+                    .zip(boot.iter())
+                    .map(|(a, b)| (a - b).abs())
+                    .sum();
+                println!(
+                    "S5_A_STABLE t={t:.1} pressure avg={avg:.1} min={min:.1} max={max:.1} drift_mol={drift:.4} vented={:.2} active={}",
+                    astats.vented_mol.iter().sum::<f64>(),
+                    atmo.awake_count(),
+                );
+            }
+            // Long soak: the workload settles once the ship reaches thermal
+            // equilibrium (8 sim-hours).
+            if !fired.contains(&"soak") && t >= 480.0 {
+                fired.push("soak");
+                let (avg, min, max) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                println!(
+                    "S5_A_SOAK t={t:.1} pressure avg={avg:.1} min={min:.1} max={max:.1} vented={:.2} active={}",
+                    astats.vented_mol.iter().sum::<f64>(),
+                    atmo.awake_count(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // B - closed-door pressure isolation: CARGO dropped to ~half stays
+        // put while the door is closed.
+        "B" => {
+            if !fired.contains(&"lower") && t >= 0.5 {
+                fired.push("lower");
+                for p in s5_region_tiles(&map, &comps, cargo) {
+                    let removed = atmo.remove_fraction(p, 0.5);
+                    astats.debug_removed(&removed);
+                }
+            }
+            if !fired.contains(&"done") && t >= 30.0 {
+                fired.push("done");
+                let (ca, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                let (cr, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                println!(
+                    "S5_B_ISOLATED t={t:.1} cargo={ca:.1} kPa crew={cr:.1} kPa (door closed — expect ~50 vs ~101)"
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // C - open-door equalization: HoldOpen, front propagates from the
+        // door outward, no instant room-average.
+        "C" => {
+            if !fired.contains(&"lower") && t >= 0.5 {
+                fired.push("lower");
+                for p in s5_region_tiles(&map, &comps, cargo) {
+                    let removed = atmo.remove_fraction(p, 0.5);
+                    astats.debug_removed(&removed);
+                }
+            }
+            if !fired.contains(&"open") && t >= 1.0 {
+                fired.push("open");
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            for (tag, at) in [("c1", 5.0), ("c2", 15.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let near = atmo.pressure_at(TilePos::new(6, 5), &thermal);
+                    let far = atmo.pressure_at(TilePos::new(1, 1), &thermal);
+                    let (ca, _, _) =
+                        s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                    let (co, _, _) = s5_region_pressure(
+                        &atmo,
+                        &thermal,
+                        &s5_region_tiles(&map, &comps, corridor),
+                    );
+                    println!(
+                        "S5_C_{tag} t={t:.1} near_door={near:.1} far_cargo={far:.1} cargo_avg={ca:.1} corridor_avg={co:.1} kPa"
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                let (ca, cmin, cmax) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                let (co, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                let now = totals(&atmo);
+                let sum = now.iter().sum::<f64>() + astats.vented_mol.iter().sum::<f64>();
+                println!(
+                    "S5_C_EQUALIZED t={t:.1} cargo={ca:.1} ({cmin:.1}-{cmax:.1}) corridor={co:.1} kPa conserved={sum:.1} vs boot {:.1}",
+                    boot.iter().sum::<f64>()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // D - auto-door transient: demand opens the door, gas flows while
+        // open, flow stops after the door closes again.
+        "D" => {
+            if !fired.contains(&"lower") && t >= 0.5 {
+                fired.push("lower");
+                for p in s5_region_tiles(&map, &comps, cargo) {
+                    let removed = atmo.remove_fraction(p, 0.5);
+                    astats.debug_removed(&removed);
+                }
+            }
+            // Hold passage demand from t=1 to t=8 (old-seconds), like a crew
+            // standing in the doorway.
+            if (1.0..8.0).contains(&t) {
+                demand.0.insert(TilePos::new(6, 6));
+            }
+            for (tag, at) in [("d1", 4.0), ("d2", 9.0), ("d3", 14.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let (ca, _, _) =
+                        s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                    let open = doors
+                        .iter()
+                        .find(|(p, _)| **p == TilePos::new(6, 6))
+                        .map(|(_, d)| d.progress)
+                        .unwrap_or(0.0);
+                    println!("S5_D_{tag} t={t:.1} door_open={open:.2} cargo={ca:.1} kPa");
+                }
+            }
+            if !fired.contains(&"done") && t >= 20.0 {
+                fired.push("done");
+                let (ca, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                println!("S5_D_SETTLED t={t:.1} cargo={ca:.1} kPa (flow stopped after close)");
+                exit.write(AppExit::Success);
+            }
+        }
+        // E - composition mixing: O2-rich CARGO vs CO2-rich corridor (they
+        // share door (6,6)) equalize their fractions, species conserved.
+        "E" => {
+            if !fired.contains(&"mix") && t >= 0.5 {
+                fired.push("mix");
+                let before = totals(&atmo);
+                for p in s5_region_tiles(&map, &comps, cargo) {
+                    atmo.set_mixture(
+                        p,
+                        crate::atmosphere::GasMixture {
+                            mol: [70.0, 30.0, 0.0, 0.0],
+                        },
+                    );
+                }
+                for p in s5_region_tiles(&map, &comps, corridor) {
+                    atmo.set_mixture(
+                        p,
+                        crate::atmosphere::GasMixture {
+                            mol: [0.0, 70.0, 30.0, 0.0],
+                        },
+                    );
+                }
+                // Book the composition rewrite into the ledger so the
+                // closed-system identity still audits.
+                let after = totals(&atmo);
+                for s in 0..4 {
+                    astats.vented_mol[s] += before[s] - after[s];
+                }
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            if !fired.contains(&"done") && t >= 120.0 {
+                fired.push("done");
+                let fc = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, cargo));
+                let fk = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, corridor));
+                let now = totals(&atmo);
+                let audited = now
+                    .iter()
+                    .zip(astats.vented_mol.iter())
+                    .map(|(a, v)| a + v)
+                    .sum::<f64>();
+                println!(
+                    "S5_E_MIXED t={t:.1} cargo O2={:.0}% CO2={:.0}% | corridor O2={:.0}% CO2={:.0}% | audit {:.1} vs boot {:.1}",
+                    fc[0] * 100.0,
+                    fc[2] * 100.0,
+                    fk[0] * 100.0,
+                    fk[2] * 100.0,
+                    audited,
+                    boot.iter().sum::<f64>(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // F - pollutant spreading: a corridor pocket stays out of sealed
+        // rooms until a door opens.
+        "F" => {
+            if !fired.contains(&"inject") && t >= 0.5 {
+                fired.push("inject");
+                atmo.inject(
+                    TilePos::new(10, 7),
+                    &crate::atmosphere::GasMixture {
+                        mol: [0.0, 0.0, 0.0, 8.0],
+                    },
+                );
+            }
+            for (tag, at) in [("f1", 15.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let fp = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, corridor));
+                    let fc = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, cargo));
+                    println!(
+                        "S5_F_{tag} t={t:.1} corridor pollutant={:.2}% cargo pollutant={:.3}% (doors closed)",
+                        fp[3] * 100.0,
+                        fc[3] * 100.0
+                    );
+                }
+            }
+            if !fired.contains(&"open") && t >= 16.0 {
+                fired.push("open");
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                let fp = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, corridor));
+                let fc = s5_region_fractions(&atmo, &s5_region_tiles(&map, &comps, cargo));
+                println!(
+                    "S5_F_SPREAD t={t:.1} corridor pollutant={:.2}% cargo pollutant={:.3}% (door open)",
+                    fp[3] * 100.0,
+                    fc[3] * 100.0
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // G - decompression: breach drops pressure near the hole first, the
+        // front moves inward, onboard gas falls while the vent ledger rises.
+        "G" => {
+            if !fired.contains(&"breach") && t >= 0.5 {
+                fired.push("breach");
+                crate::atmosphere::carve_breach(
+                    &mut map,
+                    &mut thermal,
+                    &mut atmo,
+                    TilePos::new(0, 7),
+                );
+            }
+            for (tag, at) in [("g1", 3.0), ("g2", 6.0), ("g3", 10.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let p1 = atmo.pressure_at(TilePos::new(1, 7), &thermal);
+                    let p10 = atmo.pressure_at(TilePos::new(10, 7), &thermal);
+                    let p25 = atmo.pressure_at(TilePos::new(25, 7), &thermal);
+                    println!(
+                        "S5_G_{tag} t={t:.1} x1={p1:.1} x10={p10:.1} x25={p25:.1} kPa vented={:.0} mol",
+                        astats.vented_mol.iter().sum::<f64>()
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 12.0 {
+                fired.push("done");
+                let now = totals(&atmo);
+                let vented = astats.vented_mol.iter().sum::<f64>();
+                let heat = astats.vented_energy;
+                println!(
+                    "S5_G_VENTED t={t:.1} onboard={:.0} vented={:.0} audit={:.0} vs boot {:.0} | vented_heat={heat:.0}H",
+                    now.iter().sum::<f64>(),
+                    vented,
+                    now.iter().sum::<f64>() + vented,
+                    boot.iter().sum::<f64>(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // H - emergency isolation: Lock Closed before the breach keeps the
+        // room's air while the corridor vents.
+        "H" => {
+            if !fired.contains(&"lock") && t >= 0.5 {
+                fired.push("lock");
+                set_door_mode(TilePos::new(16, 6), crate::airtight::DoorMode::LockClosed);
+            }
+            if !fired.contains(&"breach") && t >= 1.0 {
+                fired.push("breach");
+                crate::atmosphere::carve_breach(
+                    &mut map,
+                    &mut thermal,
+                    &mut atmo,
+                    TilePos::new(0, 7),
+                );
+            }
+            if !fired.contains(&"done") && t >= 15.0 && !fired.contains(&"mid") {
+                fired.push("mid");
+                let (cr, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                let (co, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                println!(
+                    "S5_H_ISOLATION t={t:.1} crew_room={cr:.1} kPa corridor={co:.1} kPa (locked door saving the room)"
+                );
+            }
+            if !fired.contains(&"done") && t >= 45.0 {
+                fired.push("done");
+                let (cr, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                let (co, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                let vented = astats.vented_mol.iter().sum::<f64>();
+                println!(
+                    "S5_H_DEEP t={t:.1} crew_room={cr:.1} kPa corridor={co:.1} kPa vented={vented:.0} mol (locked door saved the room)"
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // I - re-open after isolation: equalization resumes.
+        "I" => {
+            if !fired.contains(&"breach") && t >= 0.5 {
+                fired.push("breach");
+                crate::atmosphere::carve_breach(
+                    &mut map,
+                    &mut thermal,
+                    &mut atmo,
+                    TilePos::new(0, 7),
+                );
+                set_door_mode(TilePos::new(16, 6), crate::airtight::DoorMode::LockClosed);
+            }
+            if !fired.contains(&"reopen") && t >= 15.0 {
+                fired.push("reopen");
+                set_door_mode(TilePos::new(16, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            if !fired.contains(&"done") && t >= 150.0 {
+                fired.push("done");
+                let (cr, crmin, crmax) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                let (co, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                println!(
+                    "S5_I_REOPEN t={t:.1} crew_room={cr:.1} ({crmin:.1}-{crmax:.1}) corridor={co:.1} kPa (re-equalizing)"
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // O - pause: state frozen while the renderer keeps running.
+        "O" => {
+            if !fired.contains(&"pause") && t >= 5.0 {
+                fired.push("pause");
+                speed.index = 0;
+                *fired = fired.clone();
+                fired.push("sample");
+            }
+            if fired.contains(&"pause") {
+                let frames = fired.iter().filter(|&&f| f == "tick").count();
+                if frames == 0 {
+                    let (ca, _, _) = s5_region_pressure(
+                        &atmo,
+                        &thermal,
+                        &s5_region_tiles(&map, &comps, corridor),
+                    );
+                    fired.push("frozen");
+                    println!(
+                        "S5_O_PAUSED t={t:.3} corridor={ca:.2} kPa active={}",
+                        atmo.awake_count()
+                    );
+                    // stash the frozen sample inside the log line only
+                }
+                if frames < 90 {
+                    fired.push("tick");
+                } else if !fired.contains(&"done") {
+                    fired.push("done");
+                    let (ca, _, _) = s5_region_pressure(
+                        &atmo,
+                        &thermal,
+                        &s5_region_tiles(&map, &comps, corridor),
+                    );
+                    println!(
+                        "S5_O_FROZEN t={t:.3} corridor={ca:.2} kPa sim_now={:.3} (unchanged while paused)",
+                        clock.now()
+                    );
+                    exit.write(AppExit::Success);
+                }
+            }
+        }
+        // P - speed equivalence: run to a fixed sim time at the forced speed
+        // (SLICE0_SPEED) and dump state; compare across runs.
+        "P" => {
+            let idx: usize = std::env::var("SLICE0_SPEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            if !fired.contains(&"setup") {
+                fired.push("setup");
+                speed.index = idx;
+            }
+            if !fired.contains(&"lower") && t >= 0.5 {
+                fired.push("lower");
+                for p in s5_region_tiles(&map, &comps, cargo) {
+                    let removed = atmo.remove_fraction(p, 0.5);
+                    astats.debug_removed(&removed);
+                }
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            if !fired.contains(&"done") && clock.now() >= 3600.0 {
+                fired.push("done");
+                let (ca, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, cargo));
+                let (co, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, corridor));
+                let now = totals(&atmo);
+                println!(
+                    "S5_P_EQ speed={idx} sim_t={:.0} cargo={ca:.2} corridor={co:.2} kPa o2={:.2} inert={:.2} co2={:.2} pol={:.2} active={}",
+                    clock.now(),
+                    now[0],
+                    now[1],
+                    now[2],
+                    now[3],
+                    atmo.awake_count(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // Q - sleep/wake: boot asleep, door-open wakes locally, quiet cells
+        // sleep again.
+        "Q" => {
+            if !fired.contains(&"q0") {
+                fired.push("q0");
+                println!(
+                    "S5_Q_BOOT t={t:.3} active={} (uniform sealed ship sleeps immediately)",
+                    atmo.awake_count()
+                );
+            }
+            if !fired.contains(&"open") && t >= 0.5 {
+                fired.push("open");
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::HoldOpen);
+            }
+            for (tag, at) in [("q1", 1.0), ("q2", 25.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S5_Q_{tag} t={t:.1} active={} (bounded workset: door convection + heated rooms)",
+                        atmo.awake_count()
+                    );
+                }
+            }
+            // Close the door: the sealed compartment stops being updated by
+            // the corridor and its cells fall back asleep.
+            if !fired.contains(&"close") && t >= 26.0 {
+                fired.push("close");
+                set_door_mode(TilePos::new(6, 6), crate::airtight::DoorMode::LockClosed);
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                println!(
+                    "S5_Q_SETTLED t={t:.1} active={} (sealed CARGO asleep; heated FABRICATION workset remains)",
+                    atmo.awake_count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Developer atmosphere tools (`SLICE5_TOOLS=1`): hover a tile and press
+/// - `F5` breach the hull wall under the cursor,
+/// - `F6` drop the hovered compartment to ~60% pressure,
+/// - `F7` restore the hovered compartment to standard atmosphere,
+/// - `F8` inject CO₂ into the hovered compartment,
+/// - `F9` inject pollutant into the hovered compartment.
+///
+/// Debug-only (never a player system); every mutation books into the vent
+/// ledger so conservation audits stay meaningful.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn slice5_dev_tools(
+    keys: Res<ButtonInput<KeyCode>>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    mut map: ResMut<crate::map::ShipMap>,
+    mut thermal: ResMut<crate::thermal::ThermalGrid>,
+    mut atmo: ResMut<crate::atmosphere::AtmosphereGrid>,
+    mut astats: ResMut<crate::atmosphere::AtmoStats>,
+    comps: Res<crate::airtight::Compartments>,
+    mut log: ResMut<EventLog>,
+    mut overlay: ResMut<crate::OverlayMode>,
+    mut pinned: Local<bool>,
+) {
+    // Boot-time overlay pin for scripted screenshots/playtests:
+    // SLICE5_VIEW=power|thermal|coolant|compartments|atmosphere.
+    if !*pinned {
+        *pinned = true;
+        if let Ok(v) = std::env::var("SLICE5_VIEW") {
+            *overlay = match v.as_str() {
+                "power" => crate::OverlayMode::Power,
+                "thermal" => crate::OverlayMode::Thermal,
+                "coolant" => crate::OverlayMode::Coolant,
+                "compartments" => crate::OverlayMode::Compartments,
+                "atmosphere" => crate::OverlayMode::Atmosphere,
+                _ => crate::OverlayMode::Off,
+            };
+        }
+    }
+    if std::env::var("SLICE5_TOOLS").is_err() {
+        return;
+    }
+    let Some(cursor) = windows.single().ok().and_then(|w| w.cursor_position()) else {
+        return;
+    };
+    let Some((cam, cam_gt)) = camera.single().ok() else {
+        return;
+    };
+    let Some(world) = cam.viewport_to_world_2d(cam_gt, cursor).ok() else {
+        return;
+    };
+    let Some(p) = map.tile_at_world(world) else {
+        return;
+    };
+    let now = crate::simtime::SimClock::real_secs_to_sim(0.0);
+    let say = |log: &mut EventLog, text: String| {
+        log.push(0.0, crate::log::LogKind::Info, text);
+    };
+    if keys.just_pressed(KeyCode::F5) {
+        if crate::atmosphere::carve_breach(&mut map, &mut thermal, &mut atmo, p) {
+            say(
+                &mut log,
+                format!("DEBUG: hull breach carved at ({},{})", p.x, p.y),
+            );
+        } else {
+            say(
+                &mut log,
+                format!("DEBUG: ({},{}) is not a hull wall", p.x, p.y),
+            );
+        }
+    }
+    let region = s5_region_at(&comps, p);
+    let region_ok = region != crate::airtight::NO_REGION;
+    if keys.just_pressed(KeyCode::F6) && region_ok {
+        let mut removed = crate::atmosphere::GasMixture::default();
+        for q in s5_region_tiles(&map, &comps, region) {
+            let r = atmo.remove_fraction(q, 0.4);
+            for s in 0..4 {
+                removed.mol[s] += r.mol[s];
+            }
+        }
+        astats.debug_removed(&removed);
+        say(
+            &mut log,
+            format!(
+                "DEBUG: lowered pressure in compartment #{} by 40%",
+                region + 1
+            ),
+        );
+    }
+    if keys.just_pressed(KeyCode::F7) && region_ok {
+        let mut delta = crate::atmosphere::GasMixture::default();
+        for q in s5_region_tiles(&map, &comps, region) {
+            let old = atmo.mixture_at(q);
+            atmo.set_mixture(q, crate::atmosphere::GasMixture::standard());
+            for s in 0..4 {
+                delta.mol[s] += old.mol[s] - crate::atmosphere::STANDARD_MIX[s];
+            }
+        }
+        astats.debug_removed(&delta);
+        say(
+            &mut log,
+            format!(
+                "DEBUG: compartment #{} restored to standard atmosphere",
+                region + 1
+            ),
+        );
+    }
+    let inject_region = |atmo: &mut crate::atmosphere::AtmosphereGrid,
+                         astats: &mut crate::atmosphere::AtmoStats,
+                         species: usize,
+                         amount: f32|
+     -> crate::atmosphere::GasMixture {
+        let mut mix = crate::atmosphere::GasMixture::default();
+        mix.mol[species] = amount;
+        let tiles = s5_region_tiles(&map, &comps, region);
+        let per = amount / tiles.len().max(1) as f32;
+        let mut per_mix = crate::atmosphere::GasMixture::default();
+        per_mix.mol[species] = per;
+        for q in tiles {
+            atmo.inject(q, &per_mix);
+        }
+        // Gas created by debug: book as negative vent so audits balance.
+        let mut neg = crate::atmosphere::GasMixture::default();
+        neg.mol[species] = -amount;
+        astats.debug_removed(&neg);
+        mix
+    };
+    if keys.just_pressed(KeyCode::F8) && region_ok {
+        inject_region(&mut atmo, &mut astats, 2, 30.0);
+        say(
+            &mut log,
+            format!("DEBUG: CO2 injected into compartment #{}", region + 1),
+        );
+    }
+    if keys.just_pressed(KeyCode::F9) && region_ok {
+        inject_region(&mut atmo, &mut astats, 3, 10.0);
+        say(
+            &mut log,
+            format!("DEBUG: pollutant injected into compartment #{}", region + 1),
+        );
+    }
+    let _ = now;
 }
 
 /// Dev hooks for door-art inspection on the full app (no scenario needed):

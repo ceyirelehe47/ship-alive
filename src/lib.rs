@@ -10,6 +10,7 @@
 use bevy::prelude::*;
 
 pub mod airtight;
+pub mod atmosphere;
 pub mod autotest;
 pub mod building;
 pub mod coolant;
@@ -50,8 +51,8 @@ pub enum Set {
 }
 
 /// Exclusive full-map overlay view (power / thermal / coolant /
-/// compartments). Mutually exclusive by construction — one resource, one
-/// active mode.
+/// compartments / atmosphere). Mutually exclusive by construction — one
+/// resource, one active mode.
 #[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum OverlayMode {
     #[default]
@@ -60,6 +61,7 @@ pub enum OverlayMode {
     Thermal,
     Coolant,
     Compartments,
+    Atmosphere,
 }
 
 impl OverlayMode {
@@ -70,6 +72,7 @@ impl OverlayMode {
             OverlayMode::Thermal => "Thermal",
             OverlayMode::Coolant => "Coolant",
             OverlayMode::Compartments => "Compartments",
+            OverlayMode::Atmosphere => "Atmosphere",
         }
     }
 
@@ -79,7 +82,8 @@ impl OverlayMode {
             OverlayMode::Power => OverlayMode::Thermal,
             OverlayMode::Thermal => OverlayMode::Coolant,
             OverlayMode::Coolant => OverlayMode::Compartments,
-            OverlayMode::Compartments => OverlayMode::Off,
+            OverlayMode::Compartments => OverlayMode::Atmosphere,
+            OverlayMode::Atmosphere => OverlayMode::Off,
         }
     }
 }

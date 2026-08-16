@@ -40,7 +40,7 @@ pub fn setup_world(
     server: Res<AssetServer>,
 ) {
     let (map, spawns) = ShipMap::from_layout(&MAP_LAYOUT);
-    let thermal_grid = ThermalGrid::new(&map);
+    let mut thermal_grid = ThermalGrid::new(&map);
 
     // Camera centered on the ship.
     commands.spawn((
@@ -226,13 +226,21 @@ pub fn setup_world(
     commands.insert_resource(cables);
     commands.insert_resource(pipes);
     commands.insert_resource(water);
-    commands.insert_resource(thermal_grid);
     commands.insert_resource(crate::coolant::CoolantState::default());
     commands.insert_resource(crate::coolant::CoolantStats::default());
     commands.insert_resource(crate::thermal::DeviceTiles::sized(
         (map.width * map.height) as usize,
     ));
     commands.insert_resource(crate::thermal::ThermalStats::default());
+    // Standard atmosphere boot fill: every gas cell (floor / machine / door)
+    // at ~101.3 kPa, 21 kPa O₂ partial, low CO₂, no pollutant. The gas heat
+    // capacities replace the thermal grid's boot-time constants immediately.
+    let atmo = crate::atmosphere::AtmosphereGrid::new(&map);
+    atmo.sync_all_gas_caps(&mut thermal_grid);
+    commands.insert_resource(thermal_grid);
+    commands.insert_resource(crate::atmosphere::AtmoStats::from_grid(&atmo));
+    commands.insert_resource(crate::atmosphere::AtmoSummary::default());
+    commands.insert_resource(atmo);
     commands.insert_resource(crate::airtight::Compartments::rebuild(&map));
     commands.insert_resource(map);
 }

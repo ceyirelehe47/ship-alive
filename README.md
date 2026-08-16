@@ -1,6 +1,8 @@
-# Ship Alive — Playable Slice 4 / Airtight Compartments & Doors
+# Ship Alive — Playable Slice 5 / Atmosphere & Pressure
 
-> **Slice 4 新增：门成为真实动态设备；墙和门把船内空间分成气密舱室。**
+> **Slice 5 新增：空气成为真实、逐格、守恒、可以流动和流失的资源。**
+
+> **Slice 4：门成为真实动态设备；墙和门把船内空间分成气密舱室。**
 
 > **Slice 3：热量成为真实、守恒、空间分布、可运输的量。**
 
@@ -45,14 +47,25 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
   预装 5 扇 Auto 门（开局 7 个全密封舱室）；Compartments 覆盖层（`P` 第 4
   档：舱室稳定着色、关门红/开门绿、贴太空区域 EXPOSED 警告、悬停高亮整
   舱室）；SHIP STATUS 舱室摘要 + 门选中面板（状态/朝向/两侧舱室/模式按钮）
+- **Slice 5 — 大气与压强**：逐格四气体（O₂/惰性/CO₂/污染物，数量为权威
+  数据）；压强是从 (气体量, 温度) 派生的理想气体关系（标准舱 ~101.3 kPa /
+  O₂ 分压 ~21 kPa）；压力驱动 bulk flow（等压钳位防过冲、全组分随流、
+  气体携带显热平流）+ 缓慢组分扩散；门缝语义复用 Airtight 边界（关门完全
+  阻断、全开门两侧交换、门格自带真实气体体积）；贴太空破口逐格泄压
+  （破口先失压、压力波向内传播、泄出气体带走热量并按 species 记账）；
+  气体热容量跟随真实气量（真空≈0，设备热质量保留）；睡眠/唤醒活动模型
+  （稳定船近零开销）；Atmosphere 覆盖层（`P` 第 5 档：压强色带 + 成分危险
+  警示 + 悬停逐格气体卡）；SHIP STATUS 大气块 + 常显 ATMOSPHERE LOSS 警告
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 142 个单元/集成测试
+cargo test                     # 169 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
 SLICE4_SCENARIO=A cargo run    # Slice 4 气密验收场景（A–F、H–L、N–P）
+SLICE5_SCENARIO=A cargo run    # Slice 5 大气验收场景（A–I、O/P/Q）
+SLICE5_TOOLS=1 cargo run       # 开发者大气工具：悬停 + F5 破口 / F6 降压 / F7 恢复标准 / F8 注 CO2 / F9 注污染物
 SLICE4_DOORPIN=6,6:0.5 cargo run  # 门美术检查：钉住 (x,y) 门的开启进度/模式（[:Auto|HoldOpen|LockClosed]）
 SLICE4_DEBUG_DOOR=11,10 cargo run # 门美术检查：绕过建造规则在该格生成一扇门（可放进竖墙验证 Ew 朝向）
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -79,6 +92,9 @@ src/
   airtight.rs    Slice 4：门运行时（Auto/HoldOpen/LockClosed 状态机、通行需求、
                  防夹人）、结构舱室派生缓存（flood-fill+portal）、气密连通
                  union-find、统一环境边界 boundary() 查询
+  atmosphere.rs  Slice 5：逐格四气体网格（数量权威、SoA 布局）、压强/分压派生、
+                 等压钳位 bulk flow（全组分+显热平流）、组分扩散、破口泄压
+                 （真空边界+泄出记账）、气体热容量同步、睡眠/唤醒活跃集
   movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制；
                  等门冻结避让时钟）
   simtime.rs     统一模拟时钟（i64 µs、T+HHH:MM:SS、固定步长泵/累加器/退避）

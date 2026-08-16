@@ -806,12 +806,18 @@ fn end_work(
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn crew_task_system(
-    mut map: ResMut<ShipMap>,
-    mut cables: ResMut<CableGrid>,
-    mut pipes: ResMut<crate::coolant::PipeGrid>,
-    mut water: ResMut<crate::coolant::WaterGrid>,
-    mut thermal: ResMut<crate::thermal::ThermalGrid>,
-    mut cstats: ResMut<crate::coolant::CoolantStats>,
+    // Dense world grids the job effects write to, nested into one system
+    // param (Bevy caps flat params at 16).
+    (mut map, mut cables, mut pipes, mut water, mut thermal, mut atmo, mut cstats): (
+        ResMut<ShipMap>,
+        ResMut<CableGrid>,
+        ResMut<crate::coolant::PipeGrid>,
+        ResMut<crate::coolant::WaterGrid>,
+        ResMut<crate::thermal::ThermalGrid>,
+        // Optional: minimal test worlds run the job loop without atmosphere.
+        Option<ResMut<crate::atmosphere::AtmosphereGrid>>,
+        ResMut<crate::coolant::CoolantStats>,
+    ),
     clock: Res<SimClock>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
@@ -1361,6 +1367,7 @@ pub fn crew_task_system(
                             &mut cables,
                             &mut pipes,
                             &mut thermal,
+                            atmo.as_deref_mut(),
                             job.target,
                             &bp,
                             &crew_positions,
@@ -1453,6 +1460,7 @@ pub fn crew_task_system(
                             &mut water,
                             &mut cstats,
                             &mut thermal,
+                            atmo.as_deref_mut(),
                             job.target,
                             &b,
                             rack_contents,

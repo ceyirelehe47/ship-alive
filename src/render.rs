@@ -111,6 +111,31 @@ pub struct CompartmentOverlayRoot;
 #[derive(Component)]
 pub struct CompTile;
 
+/// Tags the atmosphere overlay root entity (Slice 5).
+#[derive(Component)]
+pub struct AtmosphereOverlayRoot;
+
+/// Pooled atmosphere tile sprite (one per gas tile incl. doors).
+#[derive(Component)]
+pub struct AtmoTile;
+
+#[derive(Resource)]
+pub struct AtmosphereOverlayVis {
+    pub root: Entity,
+    /// Membership signature: map geometry version.
+    pub last_sig: u64,
+    /// One sprite per gas tile, in `map.iter_tiles()` order.
+    pub tiles: Vec<Entity>,
+    /// Last color bucket per pool slot (quantized pressure | hazard | door |
+    /// hover).
+    pub bucket: Vec<u32>,
+    /// "VENTING" warning labels at exposed-region centroids.
+    pub labels: Vec<Entity>,
+    pub refresh_acc: f32,
+    pub rebuilds: u32,
+    pub color_writes: u64,
+}
+
 #[derive(Resource)]
 pub struct CompartmentOverlayVis {
     pub root: Entity,
@@ -316,6 +341,7 @@ impl Plugin for RenderPlugin {
                 thermal_overlay_system,
                 coolant_overlay_system,
                 compartment_overlay_system,
+                atmosphere_overlay_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -479,6 +505,13 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
             Visibility::Hidden,
         ))
         .id();
+    let atmosphere_root = commands
+        .spawn((
+            AtmosphereOverlayRoot,
+            Transform::default(),
+            Visibility::Hidden,
+        ))
+        .id();
     commands.insert_resource(Markers {
         selection,
         hover,
@@ -521,6 +554,16 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
         tiles: Vec::new(),
         bucket: Vec::new(),
         labels: Vec::new(),
+        rebuilds: 0,
+        color_writes: 0,
+    });
+    commands.insert_resource(AtmosphereOverlayVis {
+        root: atmosphere_root,
+        last_sig: u64::MAX,
+        tiles: Vec::new(),
+        bucket: Vec::new(),
+        labels: Vec::new(),
+        refresh_acc: 0.0,
         rebuilds: 0,
         color_writes: 0,
     });
@@ -1722,6 +1765,187 @@ fn compartment_overlay_system(
             }
         }
     }
+}
+
+/// Atmosphere / pressure overlay (Slice 5): one pooled sprite per gas tile,
+/// tinted by derived pressure (vacuum dark → low blue → normal green → high
+/// yellow/red), with composition hazards overriding in warning colors, doors
+/// keeping the sealed-red / open-green convention, and the hovered tile
+/// brightened. Pressure is quantized into color buckets, so the refresh is a
+/// bucket compare per tile on a wall-clock cadence with writes only on
+/// actual change — no per-frame repaint of a static ship.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn atmosphere_overlay_system(
+    mut commands: Commands,
+    real: Res<Time<Real>>,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    atmo: Res<crate::atmosphere::AtmosphereGrid>,
+    thermal: Res<crate::thermal::ThermalGrid>,
+    comps: Res<crate::airtight::Compartments>,
+    overlay: Res<crate::OverlayMode>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    mut vis: ResMut<AtmosphereOverlayVis>,
+    mut root_q: Query<&mut Visibility, With<AtmosphereOverlayRoot>>,
+    children_q: Query<&Children>,
+    mut tile_q: Query<&mut Sprite, With<AtmoTile>>,
+) {
+    let active = *overlay == crate::OverlayMode::Atmosphere;
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        let want = if active {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *v != want {
+            *v = want;
+        }
+    }
+    if !active {
+        return;
+    }
+
+    // Hovered tile (same cursor→tile mapping as the compartment overlay).
+    let hovered_tile = (|| {
+        let cursor = windows.single().ok()?.cursor_position()?;
+        let (cam, cam_gt) = camera.single().ok()?;
+        let world = cam.viewport_to_world_2d(cam_gt, cursor).ok()?;
+        map.tile_at_world(world)
+    })()
+    .unwrap_or(TilePos::new(-1, -1));
+
+    // Membership signature: geometry version.
+    let sig = map.version;
+    if sig != vis.last_sig {
+        vis.last_sig = sig;
+        vis.rebuilds += 1;
+        if let Ok(children) = children_q.get(vis.root) {
+            for &c in children {
+                commands.entity(c).despawn();
+            }
+        }
+        vis.tiles.clear();
+        vis.bucket.clear();
+        for (pos, tile) in map.iter_tiles() {
+            if matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall) {
+                continue;
+            }
+            let id = commands
+                .spawn((
+                    AtmoTile,
+                    Sprite {
+                        image: art.floor.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE)),
+                        color: Color::WHITE,
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(pos).extend(0.71)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.tiles.push(id);
+            vis.bucket.push(u32::MAX);
+        }
+        vis.labels.clear();
+        for r in &comps.regions {
+            if !r.exposed {
+                continue;
+            }
+            let id = commands
+                .spawn((
+                    Text2d::new("VENTING TO SPACE"),
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.45, 0.3)),
+                    Transform::from_translation(map.world_pos(r.centroid).extend(0.95)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.labels.push(id);
+        }
+    }
+
+    // Color cadence (visual follows the sim at 10 Hz, not per frame).
+    vis.refresh_acc += real.delta_secs();
+    if vis.refresh_acc < OVERLAY_REFRESH_SECS {
+        return;
+    }
+    vis.refresh_acc = 0.0;
+
+    let interior: Vec<(TilePos, crate::map::Tile)> = map
+        .iter_tiles()
+        .filter(|(_, t)| !matches!(t, crate::map::Tile::Wall | crate::map::Tile::BuiltWall))
+        .collect();
+    for (ti, (pos, tile)) in interior.iter().enumerate() {
+        let door = *tile == crate::map::Tile::Door;
+        let hovered = *pos == hovered_tile;
+        let door_open = door && map.door_state(*pos).is_some_and(|d| d.open >= 1.0);
+        let mix = atmo.mixture_at(*pos);
+        let total = mix.total();
+        let temp = thermal.amb[atmo.idx(*pos)];
+        let p = crate::atmosphere::pressure(total, temp);
+        // Hazard encoding: 0 none, 1 low O2, 2 high CO2, 3 pollutant.
+        let hazard = if crate::atmosphere::partial_pressure(mix.mol[3], total, temp)
+            > crate::atmosphere::POLLUTANT_HIGH_KPA
+        {
+            3
+        } else if crate::atmosphere::partial_pressure(mix.mol[2], total, temp)
+            > crate::atmosphere::CO2_HIGH_KPA
+        {
+            2
+        } else if crate::atmosphere::partial_pressure(mix.mol[0], total, temp)
+            < crate::atmosphere::O2_SAFE_KPA
+            && total > 0.01
+        {
+            1
+        } else {
+            0
+        };
+        // 0.5 kPa quantization keeps buckets stable between sim events.
+        let p_bucket = (p * 2.0).clamp(0.0, u32::MAX as f32) as u32;
+        let bucket = (p_bucket & 0x00FF_FFFF)
+            | (hazard << 24)
+            | (u32::from(hovered) << 26)
+            | (u32::from(door) << 27)
+            | (u32::from(door_open) << 28);
+        if bucket != vis.bucket[ti] {
+            vis.bucket[ti] = bucket;
+            let color = if door {
+                door_overlay_color(door_open, hovered)
+            } else {
+                let base = match hazard {
+                    3 => Color::srgb(0.85, 0.30, 0.95),
+                    2 => Color::srgb(0.95, 0.55, 0.20),
+                    1 => Color::srgb(0.45, 0.55, 0.75),
+                    _ => crate::atmosphere::pressure_color(p),
+                };
+                if hovered {
+                    brighten(base, 0.45)
+                } else {
+                    base
+                }
+            };
+            if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+                sprite.color = color;
+                vis.color_writes += 1;
+            }
+        }
+    }
+}
+
+/// Lift a color toward white by `f` (hover feedback).
+fn brighten(c: Color, f: f32) -> Color {
+    let Color::Srgba(v) = c else { return c };
+    Color::Srgba(Srgba {
+        red: v.red + (1.0 - v.red) * f,
+        green: v.green + (1.0 - v.green) * f,
+        blue: v.blue + (1.0 - v.blue) * f,
+        alpha: v.alpha,
+    })
 }
 
 /// Selection ring, path preview dots, job target marker, hover ring and the

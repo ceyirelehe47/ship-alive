@@ -145,7 +145,7 @@ const SEL_LINES: usize = 12;
 const SEL_BTNS: usize = 16;
 /// Fixed text lines in the inspect pane's environment view (room for the
 /// full power / thermal / compartments / storage / production blocks).
-const ENV_LINES: usize = 26;
+const ENV_LINES: usize = 32;
 
 #[derive(Resource)]
 pub struct Hud {
@@ -202,7 +202,7 @@ fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color)
 
 /// Read-only world view bundled into one system param (keeps the selection
 /// panel and sidebars under the 16-parameter limit). Thermal + coolant +
-/// airtight state, including the live door query.
+/// airtight + atmosphere state, including the live door query.
 #[derive(SystemParam)]
 pub struct ThermalView<'w, 's> {
     pub grid: Res<'w, ThermalGrid>,
@@ -210,6 +210,9 @@ pub struct ThermalView<'w, 's> {
     pub water: Res<'w, WaterGrid>,
     pub comps: Res<'w, crate::airtight::Compartments>,
     pub doors: Query<'w, 's, &'static crate::airtight::Door>,
+    pub atmo: Res<'w, crate::atmosphere::AtmosphereGrid>,
+    pub atmo_summary: Res<'w, crate::atmosphere::AtmoSummary>,
+    pub atmo_stats: Res<'w, crate::atmosphere::AtmoStats>,
 }
 
 fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, width: f32) -> Entity {
@@ -252,7 +255,11 @@ impl Plugin for UiPlugin {
                 overlay_summary_system,
                 debug_toggle_system,
                 (hud_update_system, selection_panel_system).chain(),
-                crate::ui_overlay::tooltip_system,
+                (
+                    crate::ui_overlay::tooltip_system,
+                    crate::ui_overlay::atmosphere_tooltip_system,
+                )
+                    .chain(),
                 crate::ui_overlay::box_rect_system,
             )
                 .in_set(crate::Set::Sync),
@@ -959,6 +966,66 @@ fn sidebar_system(
             ),
             Color::WHITE,
         ));
+        // Atmosphere block (Slice 5) — reads the cached summary only, never
+        // a per-frame grid scan.
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("ATMOSPHERE".to_string(), dim));
+        let a = &thermal.atmo_summary;
+        let exposed = comps.exposed_count();
+        lines.push((
+            format!(
+                "Pressure     {:.0}–{:.0} kPa",
+                a.min_pressure, a.max_pressure
+            ),
+            if a.low_cells > 0 || a.vacuum_cells > 0 {
+                Color::srgb(1.0, 0.45, 0.35)
+            } else {
+                Color::WHITE
+            },
+        ));
+        lines.push((
+            format!(
+                "O2 partial   {:.1}–{:.1} kPa",
+                a.min_o2_partial, a.max_o2_partial
+            ),
+            if a.low_o2_cells > 0 {
+                Color::srgb(1.0, 0.6, 0.4)
+            } else {
+                Color::WHITE
+            },
+        ));
+        lines.push((
+            format!(
+                "Gas retained {:.0}%{}",
+                a.retained * 100.0,
+                if a.max_co2_partial > crate::atmosphere::CO2_HIGH_KPA {
+                    format!(" | CO2 {:.1} kPa", a.max_co2_partial)
+                } else {
+                    String::new()
+                }
+            ),
+            if a.high_co2_cells > 0 || a.polluted_cells > 0 {
+                Color::srgb(1.0, 0.7, 0.35)
+            } else {
+                Color::WHITE
+            },
+        ));
+        lines.push((
+            format!(
+                "Exposed      {} compartments{}",
+                exposed,
+                if a.active_cells > 0 {
+                    format!(" | venting, {} cells active", a.active_cells)
+                } else {
+                    String::new()
+                }
+            ),
+            if exposed > 0 {
+                Color::srgb(1.0, 0.45, 0.35)
+            } else {
+                Color::WHITE
+            },
+        ));
         lines.push((String::new(), Color::WHITE));
         lines.push(("STORAGE".to_string(), dim));
         lines.push((
@@ -1232,6 +1299,20 @@ fn overlay_summary_system(
                     comps.doors_open,
                 );
             }
+            OverlayMode::Atmosphere => {
+                let a = &thermal.atmo_summary;
+                let exposed = thermal.comps.exposed_count();
+                summary = format!(
+                    "ATMOSPHERE | pressure {:.0}–{:.0} kPa | O2 {:.1}–{:.1} kPa | retained {:.0}% | exposed {} | active {} | hover a tile",
+                    a.min_pressure,
+                    a.max_pressure,
+                    a.min_o2_partial,
+                    a.max_o2_partial,
+                    a.retained * 100.0,
+                    exposed,
+                    a.active_cells,
+                );
+            }
             OverlayMode::Off => {}
         }
         set_text_if_changed(&mut text, summary);
@@ -1240,9 +1321,18 @@ fn overlay_summary_system(
         }
     }
 
+    // ---- atmosphere alert (visible even without the overlay) ----
+    // Atmosphere loss outranks thermal warnings: air going out the hull is
+    // the most time-critical thing on the ship.
+    let atmo_alert = thermal.atmo_summary.alert();
+
     // ---- thermal alert (always visible when something is wrong) ----
     let mut alert = String::new();
     let mut any_critical = false;
+    if let Some(a) = atmo_alert {
+        alert = a.to_string();
+        any_critical = alert.starts_with("ATMOSPHERE LOSS");
+    }
     for (_, state) in reactors.iter() {
         match state {
             crate::thermal::ThermalState::Critical => {

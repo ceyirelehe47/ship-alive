@@ -495,10 +495,14 @@ pub fn compartment_sync_system(
 /// mirror state into the map (pathfinding) + thermal seal (heat) + air
 /// connectivity graph when a seal actually flips.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 pub fn door_system(
     clock: Res<crate::simtime::SimClock>,
     mut map: ResMut<ShipMap>,
     mut thermal: ResMut<crate::thermal::ThermalGrid>,
+    // Optional so minimal test worlds can run the door logic standalone;
+    // the full app always inserts the grid at setup.
+    mut atmo: Option<ResMut<crate::atmosphere::AtmosphereGrid>>,
     mut comps: ResMut<Compartments>,
     mut demand: ResMut<DoorDemand>,
     mut doors: Query<(Entity, &TilePos, &mut Door)>,
@@ -573,6 +577,12 @@ pub fn door_system(
         // Thermal seal + connectivity only on real flips (never per step).
         if door.sealed() != thermal.door_sealed_at(pos) {
             thermal.set_door_sealed(pos, door.sealed());
+            // Gas starts (or stops) exchanging across this doorway this very
+            // step: wake the door cell and both sides — the deterministic
+            // door/atmosphere sync contract.
+            if let Some(a) = &mut atmo {
+                a.wake_around(pos);
+            }
             any_seal_flip = true;
         }
         if door.progress >= 1.0 {

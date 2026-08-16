@@ -105,6 +105,12 @@ pub enum Action {
     /// transient tile entity the work system tears down; water is preserved
     /// into the network where possible).
     MarkPipeDeconstruct { pos: TilePos },
+    // ---- Slice 4: doors -------------------------------------------------
+    /// Set a door's player mode (Auto / Hold Open / Lock Closed).
+    SetDoorMode {
+        door: Entity,
+        mode: crate::airtight::DoorMode,
+    },
 }
 
 pub struct JobsPlugin;
@@ -506,6 +512,9 @@ pub fn actions_system(
             }
             Action::SetTool { .. } => {
                 // Consumed by the input plugin.
+            }
+            Action::SetDoorMode { .. } => {
+                // Consumed by airtight::door_action_system.
             }
         }
     }

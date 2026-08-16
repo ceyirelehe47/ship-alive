@@ -193,6 +193,20 @@ pub fn setup_world(
                     ThermalState::default(),
                 ));
             }
+            SpawnReq::Door { pos } => {
+                let axis =
+                    crate::airtight::door_axis(&map, pos).unwrap_or(crate::airtight::DoorAxis::Ns);
+                commands.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Door,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    crate::airtight::Door::new(axis),
+                ));
+            }
             SpawnReq::Item { pos, kind } => {
                 items::spawn_item(&mut commands, pos, kind);
             }
@@ -219,5 +233,6 @@ pub fn setup_world(
         (map.width * map.height) as usize,
     ));
     commands.insert_resource(crate::thermal::ThermalStats::default());
+    commands.insert_resource(crate::airtight::Compartments::rebuild(&map));
     commands.insert_resource(map);
 }

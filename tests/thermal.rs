@@ -145,6 +145,20 @@ fn setup_world() -> World {
                     ThermalState::default(),
                 ));
             }
+            SpawnReq::Door { pos } => {
+                let axis = ship_alive::airtight::door_axis(world.resource::<ShipMap>(), pos)
+                    .unwrap_or(ship_alive::airtight::DoorAxis::Ns);
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Door,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::airtight::Door::new(axis),
+                ));
+            }
             SpawnReq::Item { pos, kind } => {
                 world.spawn((pos, ship_alive::items::Item { kind }));
             }

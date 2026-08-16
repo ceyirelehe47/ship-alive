@@ -50,6 +50,12 @@ pub const K_AIR_AIR: f32 = 22.0;
 pub const K_AIR_SOLID: f32 = 0.35;
 /// Conduction through solid material (wall to wall) — very slow.
 pub const K_SOLID_SOLID: f32 = 0.25;
+/// Conduction between a sealed (closed) door tile and its neighbours. The
+/// door leaf stays an ordinary air node with constant capacity — only its
+/// conductivity drops, so opening/closing can never create or destroy heat.
+/// Airtight ≠ adiabatic: a closed door still lets heat seep, ~3× faster
+/// than through a wall surface but ~18× slower than open air.
+pub const K_DOOR_SEALED: f32 = 1.2;
 
 /// Steps a tile stays awake after its last significant exchange.
 pub const WAKE_STEPS: u32 = 600;
@@ -117,6 +123,10 @@ pub struct ThermalGrid {
     pub solid_temp: Vec<f32>,
     /// Structural heat capacity per tile; 0.0 = open tile (air only).
     pub solid_cap: Vec<f32>,
+    /// Airtight-sealed door tiles (Slice 4): the tile is still an air node,
+    /// but conducts with its neighbours at `K_DOOR_SEALED` instead of
+    /// `K_AIR_AIR`. Written by the door system; capacity never changes here.
+    pub sealed: Vec<bool>,
     wake: Vec<u32>,
     /// Worklist of awake tile indices (exactly those with `wake > 0`).
     awake: Vec<usize>,
@@ -126,13 +136,16 @@ impl ThermalGrid {
     pub fn new(map: &ShipMap) -> Self {
         let n = (map.width * map.height) as usize;
         let mut solid_cap = vec![0.0f32; n];
+        let mut sealed = vec![false; n];
         for (p, tile) in map.iter_tiles() {
             let i = (p.y * map.width + p.x) as usize;
-            solid_cap[i] = match tile {
-                Tile::Wall => HULL_WALL_CAP,
-                Tile::BuiltWall => BUILT_WALL_CAP,
-                Tile::Floor | Tile::Door | Tile::Machine => 0.0,
-            };
+            match tile {
+                Tile::Wall => solid_cap[i] = HULL_WALL_CAP,
+                Tile::BuiltWall => solid_cap[i] = BUILT_WALL_CAP,
+                // Doors boot closed: an airtight boundary until opened.
+                Tile::Door => sealed[i] = true,
+                Tile::Floor | Tile::Machine => {}
+            }
         }
         Self {
             width: map.width,
@@ -140,6 +153,7 @@ impl ThermalGrid {
             amb: vec![AMBIENT_START; n],
             solid_temp: vec![AMBIENT_START; n],
             solid_cap,
+            sealed,
             wake: vec![0; n],
             awake: Vec::new(),
         }
@@ -252,7 +266,28 @@ impl ThermalGrid {
         };
         self.solid_cap[i] = new_cap;
         self.solid_temp[i] = self.amb[i];
+        // A fresh door tile starts sealed (closed); anything else unseals.
+        self.sealed[i] = new_tile == Tile::Door;
         self.wake(i);
+    }
+
+    /// Seal or unseal a door tile (thermal side of a door state flip).
+    /// Temperature and capacity are untouched — only the conductivity to
+    /// the neighbours changes — so heat is conserved across the toggle by
+    /// construction. Wakes the tile so exchange with both sides resumes.
+    pub fn set_door_sealed(&mut self, p: TilePos, sealed: bool) {
+        if !self.in_bounds(p) {
+            return;
+        }
+        let i = self.idx(p);
+        if self.sealed[i] != sealed {
+            self.sealed[i] = sealed;
+            self.wake(i);
+        }
+    }
+
+    pub fn door_sealed_at(&self, p: TilePos) -> bool {
+        self.in_bounds(p) && self.sealed[self.idx(p)]
     }
 }
 
@@ -561,12 +596,19 @@ pub fn thermal_air_system(
                     let mj = dev_mass[j];
                     let mut ta = grid.amb[i];
                     let mut tb = grid.amb[j];
+                    // Sealed door tiles are airtight boundaries: the same
+                    // exchange runs at the slow structure-like rate.
+                    let k = if grid.sealed[i] || grid.sealed[j] {
+                        K_DOOR_SEALED
+                    } else {
+                        K_AIR_AIR
+                    };
                     let moved = conduct(
                         &mut ta,
                         grid.air_cap(mass_i),
                         &mut tb,
                         grid.air_cap(mj),
-                        K_AIR_AIR,
+                        k,
                         dt,
                     );
                     grid.amb[i] = ta;
@@ -785,7 +827,12 @@ mod tests {
                     (false, false) => {
                         let mut ta = grid.amb[i];
                         let mut tb = grid.amb[j];
-                        let m = conduct(&mut ta, AMB_CAP, &mut tb, AMB_CAP, K_AIR_AIR, dt);
+                        let k = if grid.sealed[i] || grid.sealed[j] {
+                            K_DOOR_SEALED
+                        } else {
+                            K_AIR_AIR
+                        };
+                        let m = conduct(&mut ta, AMB_CAP, &mut tb, AMB_CAP, k, dt);
                         grid.amb[i] = ta;
                         grid.amb[j] = tb;
                         m

@@ -19,6 +19,7 @@ fn main() {
             autotest::AutotestPlugin,
             ship_alive::simtime::SimTimePlugin,
             ship_alive::power::PowerPlugin,
+            ship_alive::airtight::AirtightPlugin,
             render::RenderPlugin,
             time_ctrl::TimeCtrlPlugin,
             input::InputPlugin,

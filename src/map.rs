@@ -21,6 +21,7 @@ use bevy::prelude::*;
 ///  `W` coolant reservoir (implies a pipe underneath)
 ///  `H` heat exchanger (implies a pipe underneath)
 ///  `Z` radiator (implies a pipe underneath; must be hull-adjacent)
+///  `D` preinstalled auto door (Slice 4 airtight boundary)
 ///  `1` crate item      `2` ore item      `3` machinery part item
 ///  `X` item inside a sealed pocket (permanently unreachable — scenario C)
 ///
@@ -43,10 +44,10 @@ pub const MAP_LAYOUT: [&str; 19] = [
     "#.3....3...#....C.....#..........2.#",
     "#..1....1..#....C.....#...2...2....#",
     "#........1.#....C.....#........2...#",
-    "######.#########.###########.#######",
+    "######D#########D###########D#######",
     "#..................................#",
     "#.............3............3.......#",
-    "#####.###########.#########.####.###",
+    "#####D###########D#########.####.###",
     "#..........#..........#....SPS.....#",
     "#..........#..........#....SPS.....#",
     "#..........#...FF.....#............#",
@@ -65,10 +66,20 @@ pub enum Tile {
     Floor,
     /// Player-built interior wall (blocks movement, deconstructable).
     BuiltWall,
-    /// Player-built door (walkable, future airlock hook).
+    /// Door tile (walkable while unlocked; a runtime `Door` device entity on
+    /// it owns the open/closed state — see `airtight.rs`).
     Door,
     /// Tile occupied by a multi-tile machine footprint (blocks movement).
     Machine,
+}
+
+/// Runtime state of one door tile, mirrored from the ECS `Door` component so
+/// pathfinding and movement can read it from the pure map with no queries.
+/// `open` 0 = closed .. 1 = fully open; `locked` = Lock Closed mode.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct DoorTileState {
+    pub open: f32,
+    pub locked: bool,
 }
 
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -84,11 +95,15 @@ impl TilePos {
 }
 
 /// Dense grid of the ship interior. Rows are stored top-to-bottom.
-#[derive(Resource)]
+#[derive(Resource, Clone)]
 pub struct ShipMap {
     pub width: i32,
     pub height: i32,
     tiles: Vec<Tile>,
+    /// Door runtime state per tile (meaningful where `tiles` is `Door`).
+    /// Written by the door system only — never bumps `version` (door state
+    /// is runtime data, not geometry).
+    doors: Vec<DoorTileState>,
     /// Bumped on every `set_tile` so overlays can detect tile-set changes
     /// (walls built/torn) without re-scanning the grid.
     pub version: u64,
@@ -152,6 +167,10 @@ impl ShipMap {
                         spawns.push(SpawnReq::Pipe { pos });
                         spawns.push(SpawnReq::Pump { pos });
                     }
+                    'D' => {
+                        tiles.push(Tile::Door);
+                        spawns.push(SpawnReq::Door { pos });
+                    }
                     'W' => {
                         tiles.push(Tile::Floor);
                         spawns.push(SpawnReq::Pipe { pos });
@@ -201,6 +220,7 @@ impl ShipMap {
                 width,
                 height,
                 tiles,
+                doors: vec![DoorTileState::default(); (width * height) as usize],
                 version: 0,
             },
             spawns,
@@ -220,7 +240,41 @@ impl ShipMap {
     }
 
     pub fn is_walkable(&self, p: TilePos) -> bool {
+        match self.tile(p) {
+            Some(Tile::Floor) => true,
+            // A locked door is a wall to everyone (until unlocked); an auto
+            // or held-open door is walkable even while still closed — crew
+            // open it by demanding passage.
+            Some(Tile::Door) => !self.doors[(p.y * self.width + p.x) as usize].locked,
+            _ => false,
+        }
+    }
+
+    /// Tiles a crew may *stand* on: floor plus any door — including a locked
+    /// one, because whoever stands inside it when it locks must still be able
+    /// to walk out (pathfinding out of the tile they occupy is legal).
+    pub fn is_standable(&self, p: TilePos) -> bool {
         matches!(self.tile(p), Some(Tile::Floor) | Some(Tile::Door))
+    }
+
+    /// Door runtime state at `p` (Some only where the tile is a door).
+    pub fn door_state(&self, p: TilePos) -> Option<DoorTileState> {
+        if self.tile(p) == Some(Tile::Door) {
+            Some(self.doors[(p.y * self.width + p.x) as usize])
+        } else {
+            None
+        }
+    }
+
+    /// Write the runtime state of the door tile at `p`. Runtime state is not
+    /// geometry: this deliberately does NOT bump `version`, so compartment
+    /// caches only rebuild on real structural edits.
+    pub fn set_door_state(&mut self, p: TilePos, state: DoorTileState) {
+        assert!(
+            self.tile(p) == Some(Tile::Door),
+            "set_door_state on a non-door tile at {p:?}"
+        );
+        self.doors[(p.y * self.width + p.x) as usize] = state;
     }
 
     /// Overwrite one tile (used when buildings complete or are torn down).
@@ -228,6 +282,8 @@ impl ShipMap {
     pub fn set_tile(&mut self, p: TilePos, tile: Tile) {
         assert!(self.in_bounds(p), "set_tile out of bounds at {p:?}");
         self.tiles[(p.y * self.width + p.x) as usize] = tile;
+        // New doors boot closed + unlocked; any other tile clears the slot.
+        self.doors[(p.y * self.width + p.x) as usize] = DoorTileState::default();
         self.version += 1;
     }
 
@@ -288,6 +344,10 @@ pub enum SpawnReq {
     },
     /// Coolant hardware standing on the pipe at `pos`.
     Pump {
+        pos: TilePos,
+    },
+    /// Preinstalled auto door on the tile at `pos` (Slice 4).
+    Door {
         pos: TilePos,
     },
     Reservoir {
@@ -442,6 +502,14 @@ mod tests {
                 .filter(|s| matches!(s, SpawnReq::Radiator { .. }))
                 .count(),
             2
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Door { .. }))
+                .count(),
+            5,
+            "five preinstalled auto doors (6 sealed compartments at boot)"
         );
         assert_eq!(
             spawns

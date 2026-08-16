@@ -154,7 +154,10 @@ pub fn find_path(
     if from == to {
         return Some(Vec::new());
     }
-    if !map.is_walkable(to) || !map.is_walkable(from) {
+    // The goal must be enterable (a locked door is a wall); the start only
+    // standable — a crew member caught inside a door tile when it locks must
+    // still be able to path *out* of it.
+    if !map.is_walkable(to) || !map.is_standable(from) {
         return None;
     }
     let heuristic = |p: TilePos| octile_cost(p, to);

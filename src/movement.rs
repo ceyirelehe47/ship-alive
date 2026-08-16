@@ -35,9 +35,13 @@ impl Plugin for MovementPlugin {
     }
 }
 
+#[allow(clippy::type_complexity)]
 pub fn movement_system(
     map: Res<ShipMap>,
     clock: Res<crate::simtime::SimClock>,
+    // Optional so bare test worlds can run movement without the airtight
+    // plugin's resource (the live app always registers it).
+    mut demand: Option<ResMut<crate::airtight::DoorDemand>>,
     mut crews: Query<(Entity, &Crew, &mut TilePos, &mut Movement)>,
 ) {
     let dt = clock.dt() as f32;
@@ -72,6 +76,22 @@ pub fn movement_system(
             continue;
         }
         let next = mov.path[0];
+        // Stale plan (a door on our route was locked after we planned):
+        // drop the path; the task system re-paths and, if the goal is now
+        // unreachable, fails into its rescan cooldown instead of thrashing.
+        if !map.is_walkable(next) {
+            mov.path.clear();
+            continue;
+        }
+        // Waiting for a door to finish opening is NOT congestion: register a
+        // passage demand and hold still with every avoidance clock frozen —
+        // no sidestep ping-pong, no pass-through, no watchdog force.
+        if map.door_state(next).is_some_and(|d| d.open < 1.0) {
+            if let Some(d) = demand.as_mut() {
+                d.0.insert(next);
+            }
+            continue;
+        }
         mov.sidestep_ready = (mov.sidestep_ready + dt).min(SIDESTEP_COOLDOWN);
         let blocked_by = occupied
             .iter()

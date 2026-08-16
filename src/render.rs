@@ -99,6 +99,29 @@ pub struct CoolantOverlayRoot;
 #[derive(Component)]
 pub struct PipeDot;
 
+/// Tags the compartment overlay root entity (Slice 4).
+#[derive(Component)]
+pub struct CompartmentOverlayRoot;
+
+/// Pooled compartment tile sprite (one per interior tile incl. doors).
+#[derive(Component)]
+pub struct CompTile;
+
+#[derive(Resource)]
+pub struct CompartmentOverlayVis {
+    pub root: Entity,
+    /// Membership signature: compartment geometry version.
+    pub last_sig: u64,
+    /// One sprite per interior tile, in `map.iter_tiles()` order.
+    pub tiles: Vec<Entity>,
+    /// Last color bucket per pool slot (region | hover | exposed | door).
+    pub bucket: Vec<u32>,
+    /// "EXPOSED" warning labels at exposed-region centroids.
+    pub labels: Vec<Entity>,
+    pub rebuilds: u32,
+    pub color_writes: u64,
+}
+
 #[derive(Resource)]
 pub struct CoolantOverlayVis {
     pub root: Entity,
@@ -282,11 +305,13 @@ impl Plugin for RenderPlugin {
                 sync_item_visuals_system,
                 sync_rack_labels_system,
                 sync_building_visuals_system,
+                sync_door_visuals_system,
                 sync_selection_system,
                 ghost_system,
                 power_overlay_system,
                 thermal_overlay_system,
                 coolant_overlay_system,
+                compartment_overlay_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -443,6 +468,13 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
     let coolant_root = commands
         .spawn((CoolantOverlayRoot, Transform::default(), Visibility::Hidden))
         .id();
+    let compartment_root = commands
+        .spawn((
+            CompartmentOverlayRoot,
+            Transform::default(),
+            Visibility::Hidden,
+        ))
+        .id();
     commands.insert_resource(Markers {
         selection,
         hover,
@@ -474,6 +506,17 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
         rings: Vec::new(),
         ring_sig: 0,
         refresh_acc: 0.0,
+        rebuilds: 0,
+        color_writes: 0,
+    });
+    commands.insert_resource(CompartmentOverlayVis {
+        root: compartment_root,
+        // u64::MAX forces the first activation to build the pool (the boot
+        // geometry version is legitimately 0).
+        last_sig: u64::MAX,
+        tiles: Vec::new(),
+        bucket: Vec::new(),
+        labels: Vec::new(),
         rebuilds: 0,
         color_writes: 0,
     });
@@ -1412,6 +1455,205 @@ fn pipe_bucket(amount: f32, temp: f32) -> u32 {
     (t << 8) | a
 }
 
+// =====================================================================================
+// Slice 4: doors & compartments
+// =====================================================================================
+
+/// Normal-view door readability: the leaf squashes along its wall line as it
+/// opens (Ns doors shrink horizontally, Ew vertically), locked doors take a
+/// red tint. `Door` mutates every step while moving, so Changed<> filters
+/// idle frames for free.
+fn sync_door_visuals_system(
+    index: Res<VisualIndex>,
+    doors: Query<(Entity, &crate::airtight::Door)>,
+    mut sprites: Query<&mut Sprite, Without<Text2d>>,
+) {
+    for (e, door) in doors.iter() {
+        let Some(ve) = index.get(e, Role::BuildingSprite) else {
+            continue;
+        };
+        let Ok(mut sprite) = sprites.get_mut(ve) else {
+            continue;
+        };
+        let base = crate::TILE * 0.98;
+        let (w, h) = match door.axis {
+            // Wall line runs east-west: the leaf retracts along X.
+            crate::airtight::DoorAxis::Ns => (base * (1.0 - door.progress).max(0.12), base),
+            // Wall line runs north-south: the leaf retracts along Y.
+            crate::airtight::DoorAxis::Ew => (base, base * (1.0 - door.progress).max(0.12)),
+        };
+        sprite.custom_size = Some(Vec2::new(w.max(4.0), h.max(4.0)));
+        sprite.color = if door.mode == crate::airtight::DoorMode::LockClosed {
+            Color::srgb(1.0, 0.45, 0.4)
+        } else if door.progress >= 1.0 {
+            Color::srgba(0.75, 0.95, 1.0, 0.45)
+        } else {
+            Color::WHITE
+        };
+    }
+}
+
+/// Stable per-region hue (same topology ⇒ same colors; region ids are scan
+/// order, so only geometry edits can renumber them).
+fn region_color(region: u16, exposed: bool, hovered: bool) -> Color {
+    if exposed {
+        return if hovered {
+            Color::srgba(1.0, 0.42, 0.22, 0.62)
+        } else {
+            Color::srgba(1.0, 0.35, 0.2, 0.45)
+        };
+    }
+    let mut c = Color::hsl((region as f32 * 47.0) % 360.0, 0.75, 0.62);
+    if let Color::Hsla(ref mut h) = c {
+        h.alpha = if hovered { 0.68 } else { 0.48 };
+    }
+    c
+}
+
+/// Door tiles inside the overlay: sealed = red barrier, open = green link.
+fn door_overlay_color(open: bool, hovered: bool) -> Color {
+    if open {
+        Color::srgba(0.35, 1.0, 0.5, if hovered { 0.95 } else { 0.8 })
+    } else {
+        Color::srgba(0.95, 0.3, 0.28, if hovered { 0.95 } else { 0.85 })
+    }
+}
+
+/// Compartment / airtight overlay: one pooled sprite per interior tile,
+/// tinted by structural compartment (stable hues), doors drawn as red
+/// barriers / green links, exposed regions flashing a warning color, and the
+/// hovered compartment brightened so its extent reads at a glance. Colors
+/// are static per topology, so the refresh is a bucket compare per tile with
+/// writes only on actual change (hover moves repaint two compartments).
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn compartment_overlay_system(
+    mut commands: Commands,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    comps: Res<crate::airtight::Compartments>,
+    overlay: Res<crate::OverlayMode>,
+    windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    mut vis: ResMut<CompartmentOverlayVis>,
+    mut root_q: Query<&mut Visibility, With<CompartmentOverlayRoot>>,
+    children_q: Query<&Children>,
+    mut tile_q: Query<&mut Sprite, With<CompTile>>,
+) {
+    let active = *overlay == crate::OverlayMode::Compartments;
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        let want = if active {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *v != want {
+            *v = want;
+        }
+    }
+    if !active {
+        return;
+    }
+
+    // Hovered tile → hovered compartment (pure cursor→tile mapping; entities
+    // not involved — plain floor counts too).
+    let hovered_tile = (|| {
+        let cursor = windows.single().ok()?.cursor_position()?;
+        let (cam, cam_gt) = camera.single().ok()?;
+        let world = cam.viewport_to_world_2d(cam_gt, cursor).ok()?;
+        map.tile_at_world(world)
+    })()
+    .unwrap_or(TilePos::new(-1, -1));
+    let hovered_region = comps.region_at(hovered_tile);
+
+    // Membership signature: compartment geometry version.
+    let sig = comps.geometry_version;
+    if sig != vis.last_sig {
+        vis.last_sig = sig;
+        vis.rebuilds += 1;
+        if let Ok(children) = children_q.get(vis.root) {
+            for &c in children {
+                commands.entity(c).despawn();
+            }
+        }
+        vis.tiles.clear();
+        vis.bucket.clear();
+        for (pos, tile) in map.iter_tiles() {
+            if matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall) {
+                continue;
+            }
+            let id = commands
+                .spawn((
+                    CompTile,
+                    Sprite {
+                        image: art.floor.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE)),
+                        color: Color::WHITE,
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(pos).extend(0.71)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.tiles.push(id);
+            vis.bucket.push(u32::MAX);
+        }
+        vis.labels.clear();
+        for r in &comps.regions {
+            if !r.exposed {
+                continue;
+            }
+            let id = commands
+                .spawn((
+                    Text2d::new("EXPOSED TO SPACE"),
+                    TextFont {
+                        font_size: 13.0,
+                        ..default()
+                    },
+                    TextColor(Color::srgb(1.0, 0.5, 0.35)),
+                    Transform::from_translation(map.world_pos(r.centroid).extend(0.95)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.labels.push(id);
+        }
+    }
+
+    // Per-tile color bucket compare (region | hover | exposed | door state).
+    let interior: Vec<(TilePos, crate::map::Tile)> = map
+        .iter_tiles()
+        .filter(|(_, t)| !matches!(t, crate::map::Tile::Wall | crate::map::Tile::BuiltWall))
+        .collect();
+    for (ti, (pos, tile)) in interior.iter().enumerate() {
+        let door = *tile == crate::map::Tile::Door;
+        let region = comps.region_at(*pos);
+        let exposed = region != crate::airtight::NO_REGION
+            && comps
+                .regions
+                .get(region as usize)
+                .is_some_and(|r| r.exposed);
+        let hovered = hovered_region != crate::airtight::NO_REGION && region == hovered_region;
+        let door_open = door && map.door_state(*pos).is_some_and(|d| d.open >= 1.0);
+        let bucket = (region as u32 & 0x3FFF)
+            | (u32::from(hovered) << 14)
+            | (u32::from(exposed) << 15)
+            | (u32::from(door) << 16)
+            | (u32::from(door_open) << 17);
+        if bucket != vis.bucket[ti] {
+            vis.bucket[ti] = bucket;
+            let color = if door {
+                door_overlay_color(door_open, hovered)
+            } else {
+                region_color(region, exposed, hovered)
+            };
+            if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+                sprite.color = color;
+                vis.color_writes += 1;
+            }
+        }
+    }
+}
+
 /// Selection ring, path preview dots, job target marker, hover ring and the
 /// build-tool ghost.
 #[allow(clippy::type_complexity)]
@@ -1617,9 +1859,18 @@ fn ghost_system(
             let (color, text) = match &check {
                 Ok(()) => {
                     let cost: u32 = d.cost.iter().sum();
+                    let name = if kind == BuildingKind::Door {
+                        // Show the inferred passage axis on the ghost.
+                        match crate::airtight::door_axis(&map, tile) {
+                            Some(axis) => format!("Door ({})", axis.label()),
+                            None => "Door".to_string(),
+                        }
+                    } else {
+                        d.label.to_string()
+                    };
                     (
                         Color::srgba(0.4, 1.0, 0.5, 0.55),
-                        format!("{} — {} part", d.label, cost),
+                        format!("{name} — {cost} part"),
                     )
                 }
                 Err(e) => (Color::srgba(1.0, 0.35, 0.3, 0.55), e.label().to_string()),

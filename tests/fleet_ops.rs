@@ -147,6 +147,20 @@ fn setup_full_world() -> World {
                     ship_alive::coolant::Radiator { hull_ok: true },
                 ));
             }
+            SpawnReq::Door { pos } => {
+                let axis = ship_alive::airtight::door_axis(world.resource::<ShipMap>(), pos)
+                    .unwrap_or(ship_alive::airtight::DoorAxis::Ns);
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Door,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::airtight::Door::new(axis),
+                ));
+            }
             SpawnReq::Item { pos, kind } => {
                 world.spawn((pos, Item { kind }));
             }
@@ -170,6 +184,9 @@ fn setup_full_world() -> World {
     world.insert_resource(ship_alive::coolant::CoolantStats::default());
     world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(ship_alive::simtime::SimClock::default());
+    let comps = world.resource_scope(|_, map| ship_alive::airtight::Compartments::rebuild(&map));
+    world.insert_resource(comps);
+    world.insert_resource(ship_alive::airtight::DoorDemand::default());
     world.init_resource::<Events<Action>>();
     world
 }
@@ -184,6 +201,7 @@ fn fab_fleet_builds_with_material_conservation() {
             ship_alive::power::power_network_system,
             jobs::crew_task_system,
             jobs::crew_scan_system,
+            ship_alive::airtight::door_system,
             ship_alive::movement::movement_system,
         )
             .chain(),
@@ -393,6 +411,7 @@ fn sealed_blueprint_does_not_pump_storage() {
             ship_alive::power::power_network_system,
             jobs::crew_task_system,
             jobs::crew_scan_system,
+            ship_alive::airtight::door_system,
             ship_alive::movement::movement_system,
         )
             .chain(),

@@ -143,8 +143,9 @@ fn collapse_hidden_system(mut q: Query<(&Visibility, &mut Node), With<CollapseWh
 /// Number of fixed text lines / button slots in the selection panel.
 const SEL_LINES: usize = 12;
 const SEL_BTNS: usize = 16;
-/// Fixed text lines in the inspect pane's environment view.
-const ENV_LINES: usize = 16;
+/// Fixed text lines in the inspect pane's environment view (room for the
+/// full power / thermal / compartments / storage / production blocks).
+const ENV_LINES: usize = 26;
 
 #[derive(Resource)]
 pub struct Hud {
@@ -199,13 +200,16 @@ fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color)
         .id()
 }
 
-/// Read-only thermal/coolant world view bundled into one system param
-/// (keeps the selection panel under the 16-parameter limit).
+/// Read-only world view bundled into one system param (keeps the selection
+/// panel and sidebars under the 16-parameter limit). Thermal + coolant +
+/// airtight state, including the live door query.
 #[derive(SystemParam)]
-pub struct ThermalView<'w> {
+pub struct ThermalView<'w, 's> {
     pub grid: Res<'w, ThermalGrid>,
     pub coolant: Res<'w, CoolantState>,
     pub water: Res<'w, WaterGrid>,
+    pub comps: Res<'w, crate::airtight::Compartments>,
+    pub doors: Query<'w, 's, &'static crate::airtight::Door>,
 }
 
 fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, width: f32) -> Entity {
@@ -925,6 +929,36 @@ fn sidebar_system(
                 Color::WHITE,
             ));
         }
+        // Airtight compartments block (Slice 4).
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("COMPARTMENTS".to_string(), dim));
+        let comps = &thermal.comps;
+        let exposed = comps.exposed_count();
+        lines.push((
+            format!(
+                "{} structural | {} sealed | {} exposed",
+                comps.regions.len(),
+                comps.sealed_count(),
+                exposed
+            ),
+            if exposed > 0 {
+                Color::srgb(1.0, 0.45, 0.35)
+            } else {
+                Color::WHITE
+            },
+        ));
+        let air_note = if comps.air_groups as usize == comps.regions.len() {
+            String::new()
+        } else {
+            format!(" | air regions {}", comps.air_groups)
+        };
+        lines.push((
+            format!(
+                "Doors: {} closed / {} open{air_note}",
+                comps.doors_closed, comps.doors_open
+            ),
+            Color::WHITE,
+        ));
         lines.push((String::new(), Color::WHITE));
         lines.push(("STORAGE".to_string(), dim));
         lines.push((
@@ -1181,6 +1215,22 @@ fn overlay_summary_system(
                         .collect();
                     summary = format!("COOLANT | {}", parts.join(" | "));
                 }
+            }
+            OverlayMode::Compartments => {
+                let comps = &thermal.comps;
+                let air_note = if comps.air_groups as usize == comps.regions.len() {
+                    String::new()
+                } else {
+                    format!(" | air regions {}", comps.air_groups)
+                };
+                summary = format!(
+                    "COMPARTMENTS | {} structural | {} sealed | {} exposed | doors {} closed/{} open{air_note} | hover a room",
+                    comps.regions.len(),
+                    comps.sealed_count(),
+                    comps.exposed_count(),
+                    comps.doors_closed,
+                    comps.doors_open,
+                );
             }
             OverlayMode::Off => {}
         }
@@ -1439,6 +1489,12 @@ enum SelSig {
         demo: bool,
         temp_q: u16,
     },
+    Door {
+        e: Entity,
+        /// DoorMode index (0 Auto, 1 HoldOpen, 2 LockClosed).
+        mode: u8,
+        demo: bool,
+    },
 }
 
 fn prio_code(p: &crate::crew::WorkPriorities) -> [u8; 3] {
@@ -1571,6 +1627,19 @@ fn selection_panel_system(
                     on,
                     demo: demo.is_some(),
                     temp_q: thermal.grid.amb_at(*pos).max(0.0) as u16,
+                }
+            } else if let Ok(door) = thermal.doors.get(e) {
+                SelSig::Door {
+                    e,
+                    mode: match door.mode {
+                        crate::airtight::DoorMode::Auto => 0,
+                        crate::airtight::DoorMode::HoldOpen => 1,
+                        crate::airtight::DoorMode::LockClosed => 2,
+                    },
+                    demo: buildings
+                        .get(e)
+                        .ok()
+                        .is_some_and(|(_, _, _, d)| d.is_some()),
                 }
             } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 SelSig::Building {
@@ -1829,6 +1898,89 @@ fn selection_panel_system(
                     "Toggle the reactor below; inspect cables with Power [P].".to_string(),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
+            } else if let (Ok(door), Ok((_, pos, _, demo))) =
+                (thermal.doors.get(e), buildings.get(e))
+            {
+                lines.push((
+                    format!("Door ({},{})", pos.x, pos.y),
+                    Color::srgb(0.65, 0.9, 1.0),
+                ));
+                lines.push((
+                    format!(
+                        "State: {} | Mode: {}",
+                        door.phase.label(),
+                        door.mode.label()
+                    ),
+                    match door.mode {
+                        crate::airtight::DoorMode::LockClosed => Color::srgb(1.0, 0.55, 0.45),
+                        _ => Color::WHITE,
+                    },
+                ));
+                lines.push((
+                    format!(
+                        "Passage: {} ({})",
+                        door.axis.label(),
+                        match door.axis {
+                            crate::airtight::DoorAxis::Ns => "walls east+west",
+                            crate::airtight::DoorAxis::Ew => "walls north+south",
+                        }
+                    ),
+                    Color::srgb(0.75, 0.78, 0.82),
+                ));
+                // Adjacent compartments + current airtight connectivity.
+                let portal = thermal
+                    .comps
+                    .doors
+                    .iter()
+                    .find(|p| p.entity == Some(e) || p.pos == *pos);
+                let region_label = |id: u16| {
+                    if id == crate::airtight::NO_REGION {
+                        "structure".to_string()
+                    } else {
+                        format!("Compartment {}", id + 1)
+                    }
+                };
+                if let Some(p) = portal {
+                    let (a, b) = (p.side_a, p.side_b);
+                    let joined = a != crate::airtight::NO_REGION
+                        && b != crate::airtight::NO_REGION
+                        && thermal.comps.air_group[a as usize]
+                            == thermal.comps.air_group[b as usize];
+                    lines.push((
+                        format!(
+                            "Sides: {} {} {}",
+                            region_label(a),
+                            if joined { "<-air-linked" } else { "| sealed |" },
+                            region_label(b)
+                        ),
+                        if joined {
+                            Color::srgb(0.6, 1.0, 0.7)
+                        } else {
+                            Color::srgb(1.0, 0.75, 0.45)
+                        },
+                    ));
+                    lines.push((
+                        format!(
+                            "Airtight: {}",
+                            if door.sealed() {
+                                "sealed boundary"
+                            } else {
+                                "open — air flows"
+                            }
+                        ),
+                        Color::WHITE,
+                    ));
+                }
+                if demo.is_some() {
+                    lines.push((
+                        "MARKED FOR DECONSTRUCTION".into(),
+                        Color::srgb(1.0, 0.7, 0.25),
+                    ));
+                }
+                lines.push((
+                    "Set the door mode below; View [P] → Compartments.".to_string(),
+                    Color::srgb(0.6, 0.66, 0.72),
+                ));
             } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 lines.push((
                     format!("{} ({},{})", b.kind.label(), pos.x, pos.y),
@@ -2071,6 +2223,32 @@ fn selection_panel_system(
                     Action::SetGeneratorOn { gen: *e, on: !*on },
                 )
                 .active(*on)];
+                if *demo {
+                    v.push(BtnCfg::new(
+                        "Cancel deconstruction",
+                        Action::UnmarkDeconstruct { building: *e },
+                    ));
+                } else {
+                    v.push(BtnCfg::new(
+                        "Deconstruct",
+                        Action::MarkDeconstruct { building: *e },
+                    ));
+                }
+                v
+            }
+            SelSig::Door { e, mode, demo } => {
+                let current = match mode {
+                    1 => crate::airtight::DoorMode::HoldOpen,
+                    2 => crate::airtight::DoorMode::LockClosed,
+                    _ => crate::airtight::DoorMode::Auto,
+                };
+                let mut v: Vec<BtnCfg> = crate::airtight::DoorMode::ALL
+                    .iter()
+                    .map(|&m| {
+                        BtnCfg::new(m.label(), Action::SetDoorMode { door: *e, mode: m })
+                            .active(m == current)
+                    })
+                    .collect();
                 if *demo {
                     v.push(BtnCfg::new(
                         "Cancel deconstruction",

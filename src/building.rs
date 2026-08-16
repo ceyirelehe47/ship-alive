@@ -360,6 +360,9 @@ pub enum PlacementError {
     PipeExists,
     NoPipe,
     NotAtHull,
+    /// Doors must sit in a one-tile wall opening (walls flanking the leaf,
+    /// open passage on both sides) — an unambiguous, airtight orientation.
+    BadDoorSpot,
 }
 
 impl PlacementError {
@@ -374,6 +377,7 @@ impl PlacementError {
             PlacementError::PipeExists => "a pipe already runs here",
             PlacementError::NoPipe => "needs a coolant pipe under it",
             PlacementError::NotAtHull => "radiators must sit against the outer hull",
+            PlacementError::BadDoorSpot => "doors need a one-tile wall opening",
         }
     }
 }
@@ -441,6 +445,13 @@ pub fn can_place(
         if kind == BuildingKind::Radiator && !hull_adjacent(map, origin) {
             return Err(PlacementError::NotAtHull);
         }
+    }
+    // A door must resolve to exactly one passage axis (walls flanking the
+    // leaf, open interior on both passage sides). Ambiguous or open-hall
+    // spots are rejected — a magic airtight cube in the middle of a room
+    // would be a lie.
+    if kind == BuildingKind::Door && crate::airtight::door_axis(map, origin).is_none() {
+        return Err(PlacementError::BadDoorSpot);
     }
     for (other, is_bp) in buildings {
         if foot_overlap(&foot, other) {
@@ -610,6 +621,14 @@ pub fn complete_building(
     match bp.kind {
         BuildingKind::Rack => {
             ec.insert(crate::storage::StorageCell::default());
+        }
+        BuildingKind::Door => {
+            // A completed door boots Auto + closed; the grid tile already
+            // flipped to Tile::Door (mirror reset, thermal sealed) above.
+            let origin = TilePos::new(bp.foot.x, bp.foot.y);
+            let axis =
+                crate::airtight::door_axis(map, origin).unwrap_or(crate::airtight::DoorAxis::Ns);
+            ec.insert(crate::airtight::Door::new(axis));
         }
         BuildingKind::Fabricator => {
             ec.insert(crate::production::Fabricator::default());

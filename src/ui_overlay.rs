@@ -117,7 +117,7 @@ pub fn tooltip_system(
         Option<&MarkedForDeconstruct>,
     )>,
     blueprints: Query<(&TilePos, &Blueprint)>,
-    buildings: Query<(&TilePos, &Building), Without<Blueprint>>,
+    buildings: Query<(&TilePos, &Building, Option<&crate::airtight::Door>), Without<Blueprint>>,
     mut node_q: Query<&mut Node, With<ZIndex>>,
     mut text_q: Query<(&mut Text, &mut TextColor)>,
     mut vis_q: Query<&mut Visibility>,
@@ -166,15 +166,27 @@ pub fn tooltip_system(
             Err(_) => (None, None),
         },
         Some(Selected::Building(e)) => {
-            if let Ok((p, b)) = buildings.get(e) {
+            if let Ok((p, b, door)) = buildings.get(e) {
                 (
                     Some(format!("{} ({},{})", b.kind.label(), p.x, p.y)),
-                    Some(match b.kind {
-                        crate::building::BuildingKind::Rack => "storage rack".to_string(),
-                        crate::building::BuildingKind::Fabricator => {
-                            "2x2 machine — select for orders".to_string()
-                        }
-                        _ => "player-built structure".to_string(),
+                    Some(match door {
+                        Some(d) => format!(
+                            "{} ({}) — {}",
+                            d.phase.label(),
+                            d.mode.label(),
+                            if d.sealed() {
+                                "airtight"
+                            } else {
+                                "air flows through"
+                            }
+                        ),
+                        None => match b.kind {
+                            crate::building::BuildingKind::Rack => "storage rack".to_string(),
+                            crate::building::BuildingKind::Fabricator => {
+                                "2x2 machine — select for orders".to_string()
+                            }
+                            _ => "player-built structure".to_string(),
+                        },
                     }),
                 )
             } else {

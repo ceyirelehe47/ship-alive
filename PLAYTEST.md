@@ -1,4 +1,4 @@
-# Ship Alive — 试玩指南（Slice 0 / 0B / 1）
+# Ship Alive — 试玩指南（Slice 0 / 0B / 1 / 2 / 3 / 4）
 
 ## 启动
 
@@ -194,6 +194,37 @@ SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全�
 - **选中设备看细节**：反应堆（核心温度/状态/热输出/网络）、泵（环路流量）、
   换热器（吸热率/水温）、散热器（排放率）、水箱（蓄水量/水温）。
 
+## Slice 4 新玩法：气密舱室与门（Airtight Compartments & Doors）
+
+- **开局有 5 扇真门**：CARGO HOLD / CREW QUARTERS / ORE BAY / PARTS ROOM /
+  FABRICATION 各自唯一的墙口都预装了 **Auto 门**（关闭 = 气密边界）。
+  船员走到门前门自动开启（门叶沿墙线缩回），通过后约 0.6 秒自动关闭；
+  连续人流会保持开门不抖动；门绝不会夹到船员（有人就暂停关闭）。
+- **`P` 第 4 档视图：Compartments**：每个结构舱室一种稳定颜色、
+  **关着的门 = 红色方块**、开着的门 = 绿色链接；贴到太空的破口区域会
+  亮红并标注 **EXPOSED TO SPACE**；悬停某格会提亮它所在的整个舱室。
+  顶栏摘要：`COMPARTMENTS | 7 structural | 7 sealed | 0 exposed | …`。
+- **SHIP STATUS 新增舱室块**：`COMPARTMENTS — 7 structural | 7 sealed |
+  0 exposed` 与 `Doors: 5 closed / 0 open`（开门连通合并时会显示
+  `air regions N`）。
+- **选中门**：显示状态（Closed/Opening/Open/Closing + 百分比）、模式、
+  朝向（N-S = 两侧是东西向墙）、两侧舱室与当前连通关系
+  （`Compartment 5 | sealed | Compartment 6` 或 `<-air-linked`），以及三个
+  模式按钮：
+  - **Auto**：正常自动门（默认）。
+  - **Hold Open**：常开 —— 高频物流走廊 / 想让两个舱室换热时用。
+  - **Lock Closed**：锁闭 —— 对寻路是墙（显示红色），舱室彻底隔离。
+    注意：锁门后里面的物品会"不可达"（有冷却重试，不会刷屏）。
+- **热服从门**：关门时两侧空气不直接混合（只有 1.2H/K/s 的缓慢渗热，
+  开门是 22）；开关门不制造/消灭任何热量。玩法：让 FABRICATION 制热，
+  关门看走廊保持凉爽，Hold Open 看热量涌进走廊，再关上看温差重新拉开。
+- **自己建门**：BUILD → Structure → Door。**必须放在一格宽的墙口**
+  （两侧是墙、通行方向是开放地面），ghost 会显示推导出的朝向
+  （`Door (N-S)`）；开阔地板或十字墙角会被拒绝并提示原因。
+- **空间改造闭环**：建墙 → 舱室分裂（Compartments 视图立刻变色）→
+  在墙口装门 → Hold Open / Lock Closed 控制连通 → 拆墙/拆门看舱室合并
+  （拆门 = 永久连通，不留幽灵边界）。门不需要电（临时设定）。
+
 ## 开发者工具
 
 - 顶栏 **Debug** 开关（默认折叠）：+Crate / +Ore / +Part 生成、`X` 删除选中物品。
@@ -203,4 +234,8 @@ SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全�
 - `SLICE3_SCENARIO=A cargo run`：Slice 3 热能验收场景（A 启动稳定 / B 冷却故障
   级联+修复 / C 泵断电滞止 / E 拆管保水 / F 覆盖层循环 / R 全栈回归 / V 配合
   SLICE3_VIEW_N 截图）。
-- `cargo test`：112 个单元/集成测试。
+- `SLICE4_SCENARIO=A cargo run`：Slice 4 气密验收场景（A 舱室+物流 /
+  B 开关门相位 / C 多人连续通行 / D Hold Open / E Lock Closed /
+  F 建墙分裂 / G 拆墙合并 / H 建门 / I 拆门 / J-K-L 热隔离-连通-再关闭 /
+  N 缓存稳定 / O 门开关性能 / P 倍速等价，配 `SLICE4_SPEED=1|2|4`）。
+- `cargo test`：142 个单元/集成测试。

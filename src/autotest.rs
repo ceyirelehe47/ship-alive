@@ -21,7 +21,8 @@ impl Plugin for AutotestPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (scenario_driver, slice2_driver, slice3_driver).in_set(crate::Set::Input),
+            (scenario_driver, slice2_driver, slice3_driver, slice4_driver)
+                .in_set(crate::Set::Input),
         );
     }
 }
@@ -433,7 +434,7 @@ fn scenario_driver(
                 });
                 let _ = actions.write(Action::PlaceBlueprint {
                     kind: BuildingKind::Door,
-                    pos: TilePos::new(20, 11),
+                    pos: TilePos::new(27, 9),
                 });
                 if let Some((e, _, _)) = fabs.iter().next() {
                     let _ = actions.write(Action::FabAddOrder { fab: e, batches: 3 });
@@ -492,9 +493,11 @@ fn scenario_driver(
                 });
             });
             fire("p1_door", 0.9, t, &mut fired, &mut actions, |a| {
+                // (27,9) is STORAGE's one-tile corridor opening; doors must
+                // sit in a wall gap since Slice 4.
                 let _ = a.write(Action::PlaceBlueprint {
                     kind: BuildingKind::Door,
-                    pos: TilePos::new(19, 11),
+                    pos: TilePos::new(27, 9),
                 });
             });
             // Cancel the wall blueprint while its material may still be in transit.
@@ -534,7 +537,7 @@ fn scenario_driver(
                 && fired.contains(&"p1_rebuild");
             let door_built = buildings
                 .iter()
-                .any(|(_, p, b)| b.kind == BuildingKind::Door && p.x == 19 && p.y == 11);
+                .any(|(_, p, b)| b.kind == BuildingKind::Door && p.x == 27 && p.y == 9);
             if !fired.contains(&"done") && ((t >= 20.0 && rebuilt && door_built) || t >= 240.0) {
                 fired.push("done");
                 println!(
@@ -542,7 +545,7 @@ fn scenario_driver(
                     fired.contains(&"p1_cancel"),
                     buildings
                         .iter()
-                        .any(|(_, p, b)| b.kind == BuildingKind::Door && p.x == 19 && p.y == 11),
+                        .any(|(_, p, b)| b.kind == BuildingKind::Door && p.x == 27 && p.y == 9),
                 );
                 dump_and_exit(
                     "P1", &items, &crews, &racks, &reserved, &stats, &log, &mut exit,
@@ -1354,6 +1357,606 @@ fn slice3_driver(
             if !fired.contains(&"done") && t >= 600.0 {
                 fired.push("done");
                 dump("R");
+            }
+        }
+        _ => {}
+    }
+}
+
+// =====================================================================================
+// Slice 4 acceptance scenarios (Airtight Compartments & Doors), driven by
+// SLICE4_SCENARIO. Preinstalled doors: (6,6) CARGO, (16,6) CREW, (28,6) ORE
+// BAY, (5,9) PARTS, (17,9) FABRICATION. STORAGE keeps both corridor gaps
+// ((27,9)/(32,9)) open. Heavy numeric verification (conservation, thermal
+// isolation rates, cache behavior, perf) lives in tests/airtight.rs; these
+// drive the full app wiring end to end.
+// =====================================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn slice4_driver(
+    clock: Res<crate::simtime::SimClock>,
+    mut actions: EventWriter<Action>,
+    mut exit: EventWriter<AppExit>,
+    map: Res<crate::map::ShipMap>,
+    comps: Res<crate::airtight::Compartments>,
+    thermal: Res<crate::thermal::ThermalGrid>,
+    doors: Query<(Entity, &TilePos, &crate::airtight::Door)>,
+    crews: Query<(Entity, &Crew, &CrewTask, &TilePos), With<Crew>>,
+    marked: Query<(Entity, &Item), With<MarkedForHaul>>,
+    racks: Query<(Entity, &TilePos, &StorageCell)>,
+    buildings: Query<(Entity, &TilePos, &Building)>,
+    stats: Res<crate::stats::Stats>,
+    log: Res<EventLog>,
+    mut fired: Local<Vec<&'static str>>,
+    mut phase_seq: Local<Vec<&'static str>>,
+) {
+    let Some(scenario) = std::env::var("SLICE4_SCENARIO").ok() else {
+        return;
+    };
+    // Old-gameplay-second semantics so windows stay comparable with the
+    // earlier slice drivers (1 unit = 1 real s at 1x).
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
+    let door_at = |x: i32, y: i32| {
+        doors
+            .iter()
+            .find(|(_, p, _)| p.x == x && p.y == y)
+            .map(|(e, _, d)| (e, d.phase, d.progress, d.mode, d.cycles))
+    };
+    let mut dump = |ctx: &str| {
+        let door_dump: Vec<String> = doors
+            .iter()
+            .map(|(_, p, d)| {
+                format!(
+                    "({},{})={} {} {} cycles={}",
+                    p.x,
+                    p.y,
+                    d.phase.label(),
+                    d.mode.label(),
+                    d.axis.label(),
+                    d.cycles
+                )
+            })
+            .collect();
+        println!(
+            "S4_RESULT scenario={ctx} t={t:.1} regions={} sealed={} exposed={} air_groups={} portals={} rebuilds={} air_recomputes={} doors=[{}] stats=[{}]",
+            comps.regions.len(),
+            comps.sealed_count(),
+            comps.exposed_count(),
+            comps.air_groups,
+            comps.doors.len(),
+            comps.rebuilds,
+            comps.air_recomputes,
+            door_dump.join(", "),
+            stats.summary(),
+        );
+        println!("S4_LOG_BEGIN");
+        for e in log
+            .entries
+            .iter()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
+            println!("  [{:.0}s] {:?} {}", e.time, e.kind, e.text);
+        }
+        println!("S4_LOG_END");
+        exit.write(AppExit::Success);
+    };
+
+    match scenario.as_str() {
+        // A - starter compartments: boots with 6 sealed compartments, five
+        // working preinstalled doors, and hauls keep flowing through them.
+        "A" => {
+            fire("s4a_mark", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4a_speed", 0.6, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let stored: u32 = racks.iter().map(|(_, _, s)| s.stored()).sum();
+            if !fired.contains(&"done") && ((t >= 40.0 && stored >= 20) || t >= 200.0) {
+                fired.push("done");
+                println!(
+                    "S4_A_COMPARTMENTS regions={} sealed={} exposed={} stored={stored}",
+                    comps.regions.len(),
+                    comps.sealed_count(),
+                    comps.exposed_count(),
+                );
+                dump("A");
+            }
+        }
+        // B - auto door passage: one door cycles Closed -> Opening -> Open
+        // -> (crew passes) -> Closing -> Closed while hauling runs.
+        "B" => {
+            fire("s4b_mark", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4b_speed", 0.5, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if let Some((_, phase, ..)) = door_at(6, 6) {
+                let label = match phase {
+                    crate::airtight::DoorPhase::Closed => "Closed",
+                    crate::airtight::DoorPhase::Opening => "Opening",
+                    crate::airtight::DoorPhase::Open => "Open",
+                    crate::airtight::DoorPhase::Closing => "Closing",
+                };
+                if phase_seq.last().copied() != Some(label) {
+                    phase_seq.push(label);
+                }
+            }
+            let saw_all = phase_seq.contains(&"Opening")
+                && phase_seq.contains(&"Open")
+                && phase_seq.contains(&"Closing")
+                && phase_seq.last() == Some(&"Closed");
+            if !fired.contains(&"done") && ((t >= 8.0 && saw_all) || t >= 200.0) {
+                fired.push("done");
+                println!("S4_B_PHASE_SEQ {:?}", phase_seq);
+                dump("B");
+            }
+        }
+        // C - multiple crew drain: a stream of haulers must pass one door
+        // without open/close flapping (cycles stay low while hauls rack up).
+        "C" => {
+            fire("s4c_mark", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4c_spawn", 0.5, t, &mut fired, &mut actions, |a| {
+                for _ in 0..10 {
+                    let _ = a.write(Action::SpawnItem {
+                        kind: ItemKind::Ore,
+                    });
+                }
+            });
+            fire("s4c_speed", 0.7, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"done") && t >= 120.0 {
+                fired.push("done");
+                let (cycles, phase) = door_at(6, 6)
+                    .map(|(_, ph, _, _, c)| (c, ph))
+                    .unwrap_or((0, crate::airtight::DoorPhase::Closed));
+                println!(
+                    "S4_C_DRAIN hauls={} door_cycles={cycles} final_phase={:?} marked_left={}",
+                    stats.hauls_done,
+                    phase,
+                    marked.iter().count()
+                );
+                dump("C");
+            }
+        }
+        // D - Hold Open: door opens, stays open, air groups merge, traffic
+        // flows without interruption.
+        "D" => {
+            fire("s4d_hold", 0.8, t, &mut fired, &mut actions, |a| {
+                if let Some((e, ..)) = door_at(6, 6) {
+                    let _ = a.write(Action::SetDoorMode {
+                        door: e,
+                        mode: crate::airtight::DoorMode::HoldOpen,
+                    });
+                }
+            });
+            fire("s4d_mark", 1.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4d_speed", 1.5, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let open = door_at(6, 6).is_some_and(|(_, _, p, _, _)| p >= 1.0);
+            let merged = comps.air_groups < comps.regions.len() as u16;
+            if !fired.contains(&"done") && ((t >= 30.0 && open && merged) || t >= 120.0) {
+                fired.push("done");
+                println!(
+                    "S4_D_HOLD open={open} air_groups={}/{}",
+                    comps.air_groups,
+                    comps.regions.len()
+                );
+                dump("D");
+            }
+        }
+        // E - Lock Closed: the cargo door becomes a wall; marked items behind
+        // it are unreachable, no crew squeezes through, no claim thrash.
+        "E" => {
+            fire("s4e_lock", 0.8, t, &mut fired, &mut actions, |a| {
+                if let Some((e, ..)) = door_at(6, 6) {
+                    let _ = a.write(Action::SetDoorMode {
+                        door: e,
+                        mode: crate::airtight::DoorMode::LockClosed,
+                    });
+                }
+            });
+            fire("s4e_mark", 1.5, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4e_speed", 2.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let cargo_region = comps.region_at(TilePos::new(5, 3));
+            let crew_inside = crews
+                .iter()
+                .filter(|(_, _, _, p)| comps.region_at(**p) == cargo_region)
+                .count();
+            if !fired.contains(&"done") && t >= 60.0 {
+                fired.push("done");
+                println!(
+                    "S4_E_LOCK marked_left={} crew_inside_cargo={crew_inside} hauling_still={}",
+                    marked.iter().count(),
+                    crews
+                        .iter()
+                        .filter(|(_, _, task, _)| matches!(task, CrewTask::Haul(_)))
+                        .count(),
+                );
+                dump("E");
+            }
+        }
+        // F - structural split: wall both STORAGE corridor gaps; the storage
+        // bay becomes its own sealed compartment.
+        "F" => {
+            fire("s4f_wall", 0.4, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(27, 9),
+                });
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(32, 9),
+                });
+            });
+            fire("s4f_speed", 0.7, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let walls_built = buildings
+                .iter()
+                .filter(|(_, p, b)| {
+                    b.kind == BuildingKind::Wall && p.y == 9 && (p.x == 27 || p.x == 32)
+                })
+                .count();
+            let split = comps.regions.len() >= 7;
+            if !fired.contains(&"done") && ((t >= 30.0 && walls_built == 2 && split) || t >= 200.0)
+            {
+                fired.push("done");
+                println!(
+                    "S4_F_SPLIT walls={walls_built} regions={} rebuilds={}",
+                    comps.regions.len(),
+                    comps.rebuilds
+                );
+                dump("F");
+            }
+        }
+        // G - structural merge: after the F split, tear one wall back out.
+        "G" => {
+            fire("s4g_wall", 0.4, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(27, 9),
+                });
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(32, 9),
+                });
+            });
+            fire("s4g_speed", 0.7, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let both = buildings
+                .iter()
+                .filter(|(_, p, b)| {
+                    b.kind == BuildingKind::Wall && p.y == 9 && (p.x == 27 || p.x == 32)
+                })
+                .count()
+                == 2;
+            if both && !fired.contains(&"s4g_demo") && t >= 15.0 {
+                if let Some((e, _, _)) = buildings
+                    .iter()
+                    .find(|(_, p, b)| b.kind == BuildingKind::Wall && p.x == 27 && p.y == 9)
+                {
+                    fired.push("s4g_demo");
+                    let _ = actions.write(Action::MarkDeconstruct { building: e });
+                }
+            }
+            let merged = comps.regions.len() == 7;
+            if !fired.contains(&"done")
+                && ((t >= 40.0 && fired.contains(&"s4g_demo") && merged) || t >= 200.0)
+            {
+                fired.push("done");
+                println!(
+                    "S4_G_MERGE regions={} rebuilds={}",
+                    comps.regions.len(),
+                    comps.rebuilds
+                );
+                dump("G");
+            }
+        }
+        // H - build a door: wall one STORAGE gap, door the other; the door
+        // must resolve N-S orientation, seal when closed, and pass crew.
+        "H" => {
+            fire("s4h_wall", 0.4, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(27, 9),
+                });
+            });
+            fire("s4h_door", 0.6, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Door,
+                    pos: TilePos::new(32, 9),
+                });
+            });
+            fire("s4h_mark", 1.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkAll);
+            });
+            fire("s4h_speed", 1.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let door = doors.iter().find(|(_, p, _)| p.x == 32 && p.y == 9);
+            let stored: u32 = racks.iter().map(|(_, _, s)| s.stored()).sum();
+            if !fired.contains(&"done")
+                && ((t >= 60.0 && door.is_some() && stored >= 10) || t >= 240.0)
+            {
+                fired.push("done");
+                let (axis, sealed) = door
+                    .map(|(_, _, d)| (d.axis, d.sealed()))
+                    .unwrap_or((crate::airtight::DoorAxis::Ns, true));
+                println!(
+                    "S4_H_BUILD door_axis={} sealed={sealed} regions={} stored={stored}",
+                    axis.label(),
+                    comps.regions.len(),
+                );
+                dump("H");
+            }
+        }
+        // I - door demolition: after the H setup, tear the door out; the
+        // portal disappears and the regions merge permanently.
+        "I" => {
+            fire("s4i_wall", 0.4, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(27, 9),
+                });
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Door,
+                    pos: TilePos::new(32, 9),
+                });
+            });
+            fire("s4i_speed", 0.7, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            let door_built = doors.iter().any(|(_, p, _)| p.x == 32 && p.y == 9);
+            let storage_sealed = comps.regions.len() >= 7;
+            if door_built && storage_sealed && !fired.contains(&"s4i_demo") && t >= 20.0 {
+                if let Some((e, _, _)) = doors.iter().find(|(_, p, _)| p.x == 32 && p.y == 9) {
+                    fired.push("s4i_demo");
+                    let _ = actions.write(Action::MarkDeconstruct { building: e });
+                }
+            }
+            let door_gone = doors.iter().all(|(_, p, _)| !(p.x == 32 && p.y == 9));
+            let merged = comps.regions.len() == 7;
+            if !fired.contains(&"done")
+                && ((t >= 50.0 && fired.contains(&"s4i_demo") && door_gone && merged) || t >= 240.0)
+            {
+                fired.push("done");
+                println!(
+                    "S4_I_DEMO door_gone={door_gone} portals={} regions={} boundary_open={}",
+                    comps.doors.len(),
+                    comps.regions.len(),
+                    crate::airtight::boundary(&map, TilePos::new(32, 8), TilePos::new(32, 9))
+                        == crate::airtight::Boundary::Open,
+                );
+                dump("I");
+            }
+        }
+        // J - thermal isolation: FABRICATION heats while its door stays
+        // closed; the corridor must not follow (no fast ambient mixing).
+        "J" => {
+            fire("s4j_order", 0.4, t, &mut fired, &mut actions, |a| {
+                // Order the starter fabricator: repeat production keeps heat
+                // flowing. The fabs query is not available here, so drive it
+                // through a hauler-friendly order via the first fab entity
+                // found by the generic building query.
+                if let Some((e, _, _)) = buildings
+                    .iter()
+                    .find(|(_, _, b)| b.kind == BuildingKind::Fabricator)
+                {
+                    let _ = a.write(Action::FabAddOrder { fab: e, batches: 5 });
+                }
+            });
+            fire("s4j_speed", 0.8, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"s4j_t1") && t >= 45.0 {
+                fired.push("s4j_t1");
+                println!(
+                    "S4_J_T1 t={t:.0} fab={:.1}C corridor={:.1}C door_closed={}",
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                    door_at(17, 9).is_none_or(|(_, _, p, _, _)| p < 1.0),
+                );
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                let (fab, corridor) = (
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                );
+                println!(
+                    "S4_J_ISOLATED fab={fab:.1}C corridor={corridor:.1}C delta={:.1}",
+                    fab - corridor
+                );
+                dump("J");
+            }
+        }
+        // K - thermal connection: hold the fabrication door open; heat from
+        // the hot room starts spreading into the corridor.
+        "K" => {
+            fire("s4k_order", 0.4, t, &mut fired, &mut actions, |a| {
+                if let Some((e, _, _)) = buildings
+                    .iter()
+                    .find(|(_, _, b)| b.kind == BuildingKind::Fabricator)
+                {
+                    let _ = a.write(Action::FabAddOrder { fab: e, batches: 5 });
+                }
+            });
+            fire("s4k_hold", 0.6, t, &mut fired, &mut actions, |a| {
+                if let Some((e, ..)) = door_at(17, 9) {
+                    let _ = a.write(Action::SetDoorMode {
+                        door: e,
+                        mode: crate::airtight::DoorMode::HoldOpen,
+                    });
+                }
+            });
+            fire("s4k_speed", 1.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"s4k_t1") && t >= 30.0 {
+                fired.push("s4k_t1");
+                println!(
+                    "S4_K_T1 t={t:.0} fab={:.1}C corridor={:.1}C",
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                );
+            }
+            if !fired.contains(&"done") && t >= 75.0 {
+                fired.push("done");
+                let (fab, corridor) = (
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                );
+                println!(
+                    "S4_K_CONNECTED fab={fab:.1}C corridor={corridor:.1}C delta={:.1}",
+                    fab - corridor
+                );
+                dump("K");
+            }
+        }
+        // L - re-close: direct exchange stops again; no temperature resets.
+        "L" => {
+            fire("s4l_order", 0.4, t, &mut fired, &mut actions, |a| {
+                if let Some((e, _, _)) = buildings
+                    .iter()
+                    .find(|(_, _, b)| b.kind == BuildingKind::Fabricator)
+                {
+                    let _ = a.write(Action::FabAddOrder { fab: e, batches: 5 });
+                }
+            });
+            fire("s4l_open", 0.5, t, &mut fired, &mut actions, |a| {
+                if let Some((e, ..)) = door_at(17, 9) {
+                    let _ = a.write(Action::SetDoorMode {
+                        door: e,
+                        mode: crate::airtight::DoorMode::HoldOpen,
+                    });
+                }
+            });
+            fire("s4l_speed", 0.8, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"s4l_close") && t >= 25.0 {
+                fired.push("s4l_close");
+                if let Some((e, ..)) = door_at(17, 9) {
+                    let _ = actions.write(Action::SetDoorMode {
+                        door: e,
+                        mode: crate::airtight::DoorMode::Auto,
+                    });
+                }
+                println!(
+                    "S4_L_CLOSING fab={:.1}C corridor={:.1}C",
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                );
+            }
+            if !fired.contains(&"done") && t >= 70.0 {
+                fired.push("done");
+                let (fab, corridor) = (
+                    thermal.amb_at(TilePos::new(14, 12)),
+                    thermal.amb_at(TilePos::new(14, 7)),
+                );
+                println!(
+                    "S4_L_RECLOSED fab={fab:.1}C corridor={corridor:.1}C delta={:.1}",
+                    fab - corridor
+                );
+                dump("L");
+            }
+        }
+        // N - stable cache: long run, no geometry/door changes -> zero
+        // structural rebuilds, no spurious air recomputes.
+        "N" => {
+            fire("s4n_speed", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                println!(
+                    "S4_N_CACHE rebuilds={} air_recomputes={} regions={}",
+                    comps.rebuilds,
+                    comps.air_recomputes,
+                    comps.regions.len()
+                );
+                dump("N");
+            }
+        }
+        // O - door toggle performance: flap a door's mode constantly; the
+        // structural partition must not rebuild (only air recompute).
+        "O" => {
+            fire("s4o_speed", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            for i in 0..24 {
+                let tag: &'static str = Box::leak(format!("s4o_t{i}").into_boxed_str());
+                let at = 1.0 + i as f64 * 1.2;
+                fire(tag, at, t, &mut fired, &mut actions, |a| {
+                    if let Some((e, _, _, mode, _)) = door_at(6, 6) {
+                        let next = match mode {
+                            crate::airtight::DoorMode::Auto
+                            | crate::airtight::DoorMode::LockClosed => {
+                                crate::airtight::DoorMode::HoldOpen
+                            }
+                            crate::airtight::DoorMode::HoldOpen => {
+                                crate::airtight::DoorMode::LockClosed
+                            }
+                        };
+                        let _ = a.write(Action::SetDoorMode {
+                            door: e,
+                            mode: next,
+                        });
+                    }
+                });
+            }
+            if !fired.contains(&"done") && t >= 40.0 {
+                fired.push("done");
+                println!(
+                    "S4_O_TOGGLE rebuilds={} air_recomputes={}",
+                    comps.rebuilds, comps.air_recomputes
+                );
+                dump("O");
+            }
+        }
+        // P - time equivalence: run at SLICE4_SPEED (1|2|4) and dump the
+        // door/compartment state at a fixed sim time; compare across runs.
+        "P" => {
+            let idx: usize = std::env::var("SLICE4_SPEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            fire("s4p_speed", 0.3, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: idx });
+            });
+            if !fired.contains(&"done") && clock.now() >= 6000.0 {
+                fired.push("done");
+                let door_states: Vec<String> = doors
+                    .iter()
+                    .map(|(_, p, d)| {
+                        format!("({},{})={} {:.2}", p.x, p.y, d.phase.label(), d.progress)
+                    })
+                    .collect();
+                println!(
+                    "S4_P_EQ speed={idx} sim_t={:.0} doors=[{}] regions={} air_groups={}",
+                    clock.now(),
+                    door_states.join(", "),
+                    comps.regions.len(),
+                    comps.air_groups,
+                );
+                dump("P");
             }
         }
         _ => {}

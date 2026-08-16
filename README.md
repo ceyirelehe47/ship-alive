@@ -1,6 +1,8 @@
-# Ship Alive — Playable Slice 3 / Thermal & Cooling
+# Ship Alive — Playable Slice 4 / Airtight Compartments & Doors
 
-> **Slice 3 新增：热量成为真实、守恒、空间分布、可运输的量。**
+> **Slice 4 新增：门成为真实动态设备；墙和门把船内空间分成气密舱室。**
+
+> **Slice 3：热量成为真实、守恒、空间分布、可运输的量。**
 
 一个用 **Rust + Bevy 0.16** 实现的飞船殖民模拟切片。4 名船员在一艘固定
 Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改造自己的飞船**：
@@ -32,13 +34,25 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
   邻管/水箱，满了才诚实溢出）；Thermal/Coolant 覆盖层（`P` 循环 Off→Power→
   Thermal→Coolant）；SHIP STATUS 热能块、反应堆/泵/水箱/换热器/散热器选中
   面板、常显热警告；BUILD→Thermal 分类（Pipe 拖拽铺设同电缆）
+- **Slice 4 — 气密舱室与门**：门有真实运行状态（Closed/Opening/Open/Closing，
+  Auto/Hold Open/Lock Closed 三种模式，全程模拟时间驱动）；结构舱室
+  （Structural Compartment）是从 Hull/Wall 几何派生的缓存（仅在几何变化时
+  重建），门是舱室之间的 portal；当前气密连通（开门即并组、关门即隔离）
+  与结构分区分离——门开关只做 portal 图 union-find，绝不全图 flood-fill；
+  热服从同一边界（关门=1.2H/K/s 缓慢渗热、开门=22 快速混合，切换严格
+  守恒）；Lock Closed 对寻路是墙、船员等门不算拥堵（避让时钟冻结）、
+  绝不夹人；门必须建在一格墙口（自动推导 N-S/E-W 朝向，模糊位置拒绝）；
+  预装 5 扇 Auto 门（开局 7 个全密封舱室）；Compartments 覆盖层（`P` 第 4
+  档：舱室稳定着色、关门红/开门绿、贴太空区域 EXPOSED 警告、悬停高亮整
+  舱室）；SHIP STATUS 舱室摘要 + 门选中面板（状态/朝向/两侧舱室/模式按钮）
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 113 个单元/集成测试
+cargo test                     # 142 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
+SLICE4_SCENARIO=A cargo run    # Slice 4 气密验收场景（A–F、H–L、N–P）
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 ```
 
@@ -60,7 +74,11 @@ src/
                  热交换器/散热器交换、水守恒(拆管重分配/诚实溢出)
   production.rs  Fabricator：配方(2 Ore→1 Part)/订单(Produce N|Repeat)/状态机/缓冲
   jobs.rs        核心：玩家动作、四类任务执行、统一工作扫描与优先级领取
-  movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制）
+  airtight.rs    Slice 4：门运行时（Auto/HoldOpen/LockClosed 状态机、通行需求、
+                 防夹人）、结构舱室派生缓存（flood-fill+portal）、气密连通
+                 union-find、统一环境边界 boundary() 查询
+  movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制；
+                 等门冻结避让时钟）
   simtime.rs     统一模拟时钟（i64 µs、T+HHH:MM:SS、固定步长泵/累加器/退避）
   time_ctrl.rs   玩家倍率 Pause/1×/2×/4×（Space 记忆上次倍率）
   input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
@@ -73,6 +91,8 @@ src/
   bin/prep_art.rs 生成美术的后处理（去背/裁切/缩放）
 tests/
   path8.rs       8 向移动测试（对角速度一致/混合步/禁穿角/避让）
+  airtight.rs    Slice 4 气密测试（舱室/暴露/门户/连通/门模式/防夹/等门/
+                 禁穿锁门/热隔离与守恒/缓存/128×128 性能）
   haul_logic.rs  Slice 0B 无头集成测试（领取互斥/框选/满仓/…）
   ship_ops.rs    Slice 1 无头集成测试（建造/拆除/生产/过滤/优先级）
   power_ops.rs   Slice 2 电力测试（拓扑/分割/并网/过载/断电生产）

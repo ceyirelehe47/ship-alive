@@ -1,24 +1,35 @@
-//! Simulation speed control: Pause / 1x / 2x / 4x, driven by keys or UI buttons.
+//! Player time-scale control: Pause / 1× / 2× / 4×.
+//!
+//! The scale itself lives in `GameSpeed`; the *pacing* of simulation time is
+//! owned by `simtime` (`sim_pump_system` reads `GameSpeed` and steers the
+//! fixed-update loop). Space toggles between Pause and the last non-paused
+//! speed.
 
 use crate::jobs::Action;
 use crate::log::{EventLog, LogKind};
+use crate::simtime::{speed_label, SPEED_SCALES};
 use bevy::prelude::*;
 
 #[derive(Clone, Copy, PartialEq, Eq, Resource)]
 pub struct GameSpeed {
-    /// Index into [`crate::SPEED_STEPS`] (0 = paused).
+    /// Index into [`crate::simtime::SPEED_SCALES`] (0 = paused).
     pub index: usize,
+    /// Last explicitly chosen non-paused index (for Space resume).
+    pub last_nonzero: usize,
 }
 
 impl Default for GameSpeed {
     fn default() -> Self {
-        Self { index: 1 }
+        Self {
+            index: 1,
+            last_nonzero: 1,
+        }
     }
 }
 
 impl GameSpeed {
     pub fn label(&self) -> &'static str {
-        ["Paused", "1×", "2×", "4×"][self.index]
+        speed_label(self.index)
     }
 }
 
@@ -29,7 +40,7 @@ impl Plugin for TimeCtrlPlugin {
         app.init_resource::<GameSpeed>();
         app.add_systems(
             Update,
-            (speed_keys_system, speed_action_system, apply_speed_system)
+            (speed_keys_system, speed_action_system)
                 .chain()
                 .in_set(crate::Set::Input),
         );
@@ -38,7 +49,7 @@ impl Plugin for TimeCtrlPlugin {
 
 fn speed_keys_system(keys: Res<ButtonInput<KeyCode>>, mut actions: EventWriter<Action>) {
     if keys.just_pressed(KeyCode::Space) {
-        actions.write(Action::SetSpeed { index: 0 });
+        actions.write(Action::TogglePause);
     }
     if keys.just_pressed(KeyCode::Digit1) {
         actions.write(Action::SetSpeed { index: 1 });
@@ -51,36 +62,42 @@ fn speed_keys_system(keys: Res<ButtonInput<KeyCode>>, mut actions: EventWriter<A
     }
 }
 
-fn speed_action_system(
+/// Apply speed actions: explicit picks remember the last non-paused speed;
+/// TogglePause (Space) flips between Pause and that remembered speed.
+pub fn speed_action_system(
     mut events: EventReader<Action>,
     mut speed: ResMut<GameSpeed>,
     mut log: ResMut<EventLog>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     for action in events.read() {
-        if let Action::SetSpeed { index } = *action {
-            let index = index.min(crate::SPEED_STEPS.len() - 1);
-            if speed.index == index {
-                continue;
+        match *action {
+            Action::SetSpeed { index } => {
+                let index = index.min(SPEED_SCALES.len() - 1);
+                if index == 0 {
+                    // Pause request (speed button): pause, or resume when
+                    // already paused.
+                    if speed.index == 0 {
+                        speed.index = speed.last_nonzero;
+                    } else {
+                        speed.index = 0;
+                    }
+                } else {
+                    speed.index = index;
+                    speed.last_nonzero = index;
+                }
+                log.push(now, LogKind::Info, format!("Speed: {}", speed.label()));
             }
-            // Space toggles between pause and the last non-paused speed.
-            if index == 0 && speed.index == 0 {
-                speed.index = 1;
-            } else {
-                speed.index = index;
+            Action::TogglePause => {
+                if speed.index == 0 {
+                    speed.index = speed.last_nonzero;
+                } else {
+                    speed.index = 0;
+                }
+                log.push(now, LogKind::Info, format!("Speed: {}", speed.label()));
             }
-            log.push(now, LogKind::Info, format!("Speed: {}", speed.label()));
+            _ => {}
         }
-    }
-}
-
-fn apply_speed_system(speed: Res<GameSpeed>, mut virtual_time: ResMut<Time<Virtual>>) {
-    let multiplier = crate::SPEED_STEPS[speed.index];
-    if multiplier == 0.0 {
-        virtual_time.pause();
-    } else {
-        virtual_time.unpause();
-        virtual_time.set_relative_speed(multiplier);
     }
 }

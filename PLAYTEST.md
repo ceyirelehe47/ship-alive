@@ -68,6 +68,17 @@ Fabricator）/ STORAGE（淡琥珀色高亮）。
 - 玩家可以表达"Ava 专搬箱子、Rex 专搞建造、Mio 看机器"。
 - 同档内按距离就近领活；高档显著优先。
 
+## 时间（统一模拟时钟）
+
+- 顶栏与右侧边栏显示 **SHIP TIME T+HHH:MM:SS**：从开局连续累计的船内时间，
+  **小时超过 24 不回卷、没有"天"的概念**；
+- 1 现实秒（1×）= **1 船分钟**：Fabricator 一炉 = 6 船分钟，建造/搬运
+  剩余时间都以船时显示（"6m left"、"retry in 15m"）；事件日志时间戳为
+  `[T+001:23:45]`；
+- `Space` 在 **Pause 与上次使用的倍率**之间切换（4× → Pause → 4×）；
+  `1`/`2`/`3` 直接设定并记忆；Pause 时模拟完全冻结但 UI/相机/下蓝图可用；
+- Debug 展开后有 SIM 遥测行（steps/frame、peak、backlog、base rate）。
+
 ## 右侧边栏（SHIP STATUS）
 
 - **默认（未选中任何东西）显示环境信息**：时间与倍速、**POWER** 每个电网的
@@ -163,4 +174,4 @@ SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全�
 - `SLICE0_TRACE=1 SLICE0_SCENARIO=... cargo run`：每 2 秒打印船员轨迹。
 - `SLICE0_SCAN_DEBUG=1 ...`：打印工作扫描/任务内部状态（诊断用）。
 - `SLICE0_SHOT=<frame>[:<path>] cargo run`：引擎内截图（无窗口抓屏的可靠替代）。
-- `cargo test`：76 个单元/集成测试。
+- `cargo test`：91 个单元/集成测试。

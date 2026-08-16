@@ -93,7 +93,7 @@ pub fn build_overlay(mut commands: Commands) {
 pub fn tooltip_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     hovered: Res<Hovered>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     overlay: Res<Overlay>,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &Movement)>,
     items: Query<
@@ -115,7 +115,7 @@ pub fn tooltip_system(
     mut text_q: Query<(&mut Text, &mut TextColor)>,
     mut vis_q: Query<&mut Visibility>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     let (title, detail) = match hovered.0 {
         Some(Selected::Crew(e)) => match crews.get(e) {
             Ok((_, c, task, ..)) => (

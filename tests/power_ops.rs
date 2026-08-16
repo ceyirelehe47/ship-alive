@@ -14,7 +14,6 @@ use ship_alive::map::{ShipMap, Tile, TilePos};
 use ship_alive::power::{CableGrid, NetworkInfo, PowerRole, PowerState, PowerStatus};
 use ship_alive::production::Fabricator;
 use ship_alive::storage::StorageCell;
-use std::time::Duration;
 
 const LAYOUT: [&str; 7] = [
     "#########",
@@ -79,7 +78,7 @@ impl Harness {
         world.insert_resource(ship_alive::stats::Stats::default());
         world.insert_resource(CableGrid::new(w, h));
         world.insert_resource(PowerState::default());
-        world.insert_resource(Time::<Virtual>::default());
+        world.insert_resource(ship_alive::simtime::SimClock::default());
         world.init_resource::<Events<Action>>();
         let mut schedule = Schedule::default();
         schedule.add_systems(
@@ -97,8 +96,8 @@ impl Harness {
 
     fn step(&mut self, dt: f32) {
         self.world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(dt));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(dt as f64 * ship_alive::simtime::BASE_SIM_RATE);
         self.world.resource_mut::<Events<Action>>().update();
         self.schedule.run(&mut self.world);
     }

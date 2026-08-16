@@ -23,6 +23,7 @@ pub mod power;
 pub mod production;
 pub mod render;
 pub mod setup;
+pub mod simtime;
 pub mod stats;
 pub mod storage;
 pub mod time_ctrl;

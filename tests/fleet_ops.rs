@@ -13,7 +13,6 @@ use ship_alive::log::EventLog;
 use ship_alive::map::{ShipMap, SpawnReq, TilePos, MAP_LAYOUT};
 use ship_alive::power::{CableGrid, PowerRole, PowerStatus, FABRICATOR_DEMAND};
 use ship_alive::storage::StorageCell;
-use std::time::Duration;
 
 const ROSTER: [(&str, [f32; 3]); 4] = [
     ("Ava", [0.98, 0.45, 0.42]),
@@ -98,7 +97,7 @@ fn setup_full_world() -> World {
     }
     world.insert_resource(cables);
     world.insert_resource(ship_alive::power::PowerState::default());
-    world.insert_resource(Time::<Virtual>::default());
+    world.insert_resource(ship_alive::simtime::SimClock::default());
     world.init_resource::<Events<Action>>();
     world
 }
@@ -156,12 +155,12 @@ fn fab_fleet_builds_with_material_conservation() {
 
     for i in 0..8000 {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(0.05));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(0.05 * ship_alive::simtime::BASE_SIM_RATE);
         world.resource_mut::<Events<Action>>().update();
         schedule.run(&mut world);
         if i % 1000 == 0 {
-            let t = world.resource::<Time<Virtual>>().elapsed().as_secs_f32();
+            let t = world.resource::<ship_alive::simtime::SimClock>().now() as f32;
             let carried = world
                 .query_filtered::<&Item, With<ship_alive::items::CarriedBy>>()
                 .iter(&world)
@@ -337,8 +336,8 @@ fn sealed_blueprint_does_not_pump_storage() {
 
     for _ in 0..2000 {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(0.05));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(0.05 * ship_alive::simtime::BASE_SIM_RATE);
         world.resource_mut::<Events<Action>>().update();
         schedule.run(&mut world);
     }

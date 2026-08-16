@@ -9,11 +9,12 @@ use ship_alive::crew::{Crew, CrewTask, Movement};
 use ship_alive::log::EventLog;
 use ship_alive::map::{ShipMap, Tile, TilePos};
 use ship_alive::path;
-use std::time::Duration;
 
-fn crew(name: &str, speed: f32) -> Crew {
+fn crew(name: &str, tiles_per_real_sec: f32) -> Crew {
     let mut c = Crew::new(name, Color::WHITE);
-    c.speed = speed;
+    // Crew::new already expresses the default 3 tiles/real-s in sim units;
+    // tests specify real-second speeds for readability.
+    c.speed = tiles_per_real_sec / ship_alive::simtime::BASE_SIM_RATE as f32;
     c
 }
 
@@ -23,7 +24,7 @@ fn movement_world(rows: &[&str]) -> World {
     let (map, _) = ShipMap::from_layout(rows);
     world.insert_resource(map);
     world.insert_resource(EventLog::default());
-    world.insert_resource(Time::<Virtual>::default());
+    world.insert_resource(ship_alive::simtime::SimClock::default());
     world
 }
 
@@ -37,8 +38,8 @@ fn run_until_arrival(
     let mut t = 0.0;
     while t < max_secs {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(dt));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(dt as f64 * ship_alive::simtime::BASE_SIM_RATE);
         schedule.run(world);
         t += dt;
         if world.get::<Movement>(mover).unwrap().path.is_empty() {
@@ -259,8 +260,8 @@ fn soft_avoidance_headon_and_diagonal_merge() {
     let mut t = 0.0;
     while t < 30.0 {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(1.0 / 60.0 * ship_alive::simtime::BASE_SIM_RATE);
         schedule.run(&mut world);
         t += 1.0 / 60.0;
         if world.get::<Movement>(a).unwrap().path.is_empty()
@@ -307,8 +308,8 @@ fn soft_avoidance_headon_and_diagonal_merge() {
     let mut t = 0.0;
     while t < 30.0 {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(1.0 / 60.0 * ship_alive::simtime::BASE_SIM_RATE);
         schedule.run(&mut world);
         t += 1.0 / 60.0;
         if world.get::<Movement>(c).unwrap().path.is_empty()
@@ -359,8 +360,8 @@ fn one_wide_door_drains() {
     let mut t = 0.0;
     while t < 30.0 {
         world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(1.0 / 60.0));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(1.0 / 60.0 * ship_alive::simtime::BASE_SIM_RATE);
         schedule.run(&mut world);
         t += 1.0 / 60.0;
         if crew_ids

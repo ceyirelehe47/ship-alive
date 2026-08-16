@@ -93,7 +93,7 @@ fn dump_and_exit(
 
 #[allow(clippy::too_many_arguments)]
 fn scenario_driver(
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     mut actions: EventWriter<Action>,
     items: Query<(Entity, &Item), With<MarkedForHaul>>,
     reserved: Query<(Entity, &ReservedBy)>,
@@ -118,7 +118,9 @@ fn scenario_driver(
     let Some(scenario) = std::env::var("SLICE0_SCENARIO").ok() else {
         return;
     };
-    let t = time.elapsed().as_secs_f64();
+    // Old-gameplay-second semantics (1 unit = 1 real s at 1×) so the
+    // historically tuned scenario thresholds keep their meaning.
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
 
     // Optional movement trace for debugging congestion (SLICE0_TRACE=1).
     if std::env::var("SLICE0_TRACE").is_ok() && t - *last_trace >= 2.0 {
@@ -745,7 +747,7 @@ fn scenario_driver(
 
 #[allow(clippy::too_many_arguments)]
 fn slice2_driver(
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     mut actions: EventWriter<Action>,
     mut exit: EventWriter<AppExit>,
     power_state: Res<crate::power::PowerState>,
@@ -763,7 +765,9 @@ fn slice2_driver(
     let Some(scenario) = std::env::var("SLICE2_SCENARIO").ok() else {
         return;
     };
-    let t = time.elapsed().as_secs_f64();
+    // Old-gameplay-second semantics (1 unit = 1 real s at 1×) so the
+    // historically tuned scenario thresholds keep their meaning.
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
 
     let fab_power = || fabs.iter().next().map(|(p, _)| *p);
     let gen_e = || {

@@ -111,6 +111,7 @@ const ENV_LINES: usize = 16;
 pub struct Hud {
     pub speed_buttons: Vec<Entity>,
     pub stats: Entity,
+    pub ship_time: Entity,
     pub chips: Vec<Entity>,
     pub sel_lines: Vec<Entity>,
     pub sel_btn_row1: Entity,
@@ -119,6 +120,7 @@ pub struct Hud {
     pub log_lines: Vec<Entity>,
     pub debug_row: Entity,
     pub debug_button_label: Entity,
+    pub sim_telemetry: Entity,
     pub tool_hint: Entity,
     pub tool_buttons: Vec<Entity>,
     pub power_button_label: Entity,
@@ -194,12 +196,14 @@ impl Plugin for UiPlugin {
 fn build_hud(mut commands: Commands) {
     let mut speed_buttons = Vec::new();
     let mut stats = Entity::PLACEHOLDER;
+    let mut ship_time_label = Entity::PLACEHOLDER;
     let mut chips = Vec::new();
     let mut sel_lines = Vec::new();
     let mut sel_btns = Vec::new();
     let mut log_lines = Vec::new();
     let mut debug_row = Entity::PLACEHOLDER;
     let mut debug_button_label = Entity::PLACEHOLDER;
+    let mut sim_telemetry = Entity::PLACEHOLDER;
     let mut tool_hint = Entity::PLACEHOLDER;
     let mut tool_buttons = Vec::new();
     let mut power_button_label = Entity::PLACEHOLDER;
@@ -257,6 +261,7 @@ fn build_hud(mut commands: Commands) {
                     }
 
                     stats = label(row, "", 14.0, Color::WHITE);
+                    ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
 
                     button(row, "Haul All [H]", Action::MarkAll, 96.0);
                     button(row, "Cancel All [C]", Action::CancelAll, 104.0);
@@ -445,6 +450,7 @@ fn build_hud(mut commands: Commands) {
                             11.0,
                             Color::srgb(0.55, 0.6, 0.66),
                         );
+                        sim_telemetry = label(row, "", 11.0, Color::srgb(0.6, 0.8, 0.7));
                     })
                     .id();
 
@@ -615,6 +621,7 @@ fn build_hud(mut commands: Commands) {
     commands.insert_resource(Hud {
         speed_buttons: speed_buttons.clone(),
         stats,
+        ship_time: ship_time_label,
         chips,
         sel_lines,
         sel_btn_row1: Entity::PLACEHOLDER,
@@ -623,6 +630,7 @@ fn build_hud(mut commands: Commands) {
         log_lines,
         debug_row,
         debug_button_label,
+        sim_telemetry,
         tool_hint,
         tool_buttons,
         power_button_label,
@@ -675,7 +683,7 @@ fn button_system(
 fn sidebar_system(
     hud: Res<Hud>,
     selection: Res<Selection>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     speed: Res<GameSpeed>,
     stats: Res<crate::stats::Stats>,
     power_state: Res<PowerState>,
@@ -704,8 +712,7 @@ fn sidebar_system(
     }
     if !entity_mode {
         // ---- environment content ----
-        let now = time.elapsed().as_secs_f64() as i64;
-        let clock = format!("{:02}:{:02}", now / 60, now % 60);
+        let ship_time = crate::simtime::format_sim_stamp(clock.now());
 
         let stored: u32 = racks.iter().map(|c| c.stored()).sum();
         let cap: u32 = racks.iter().map(|c| c.capacity).sum();
@@ -732,7 +739,10 @@ fn sidebar_system(
 
         let dim = Color::srgb(0.55, 0.6, 0.66);
         let mut lines: Vec<(String, Color)> = vec![
-            (format!("Time {clock} | {}", speed.label()), Color::WHITE),
+            (
+                format!("Time {ship_time} | {}", speed.label()),
+                Color::WHITE,
+            ),
             (String::new(), Color::WHITE),
             ("POWER".to_string(), dim),
         ];
@@ -896,7 +906,7 @@ fn power_view_toggle_system(
     mut overlay: ResMut<PowerOverlay>,
     hud: Res<Hud>,
     mut log: ResMut<EventLog>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     mut text_q: Query<&mut Text>,
 ) {
     let mut toggled = false;
@@ -909,7 +919,7 @@ fn power_view_toggle_system(
     if !toggled {
         return;
     }
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     log.push(
         now,
         LogKind::Info,
@@ -1148,7 +1158,7 @@ fn prio_code(p: &crate::crew::WorkPriorities) -> [u8; 3] {
 fn selection_panel_system(
     hud: Res<Hud>,
     selection: Res<Selection>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     mut commands: Commands,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &crate::crew::Movement)>,
     items: Query<
@@ -1203,7 +1213,7 @@ fn selection_panel_system(
     >,
     mut last_sig: Local<SelSig>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     // ---- selection panel: text lines ----
     let mut lines: Vec<(String, Color)> = Vec::new();
     let sig = match selection.0 {
@@ -1342,7 +1352,10 @@ fn selection_panel_system(
                 if let Some(c) = cooled {
                     if c.0 > now {
                         lines.push((
-                            format!("Unreachable (retry in {:.0}s)", c.0 - now),
+                            format!(
+                                "Unreachable (retry in {})",
+                                crate::simtime::format_sim_duration(c.0 - now)
+                            ),
                             Color::srgb(1.0, 0.45, 0.4),
                         ));
                     }
@@ -1533,7 +1546,7 @@ fn selection_panel_system(
                     ));
                 }
                 lines.push((
-                    "Recipe: 2 Asteroid Ore -> 1 Machinery Part (6s)".to_string(),
+                    "Recipe: 2 Ore -> 1 Part (6 ship minutes)".to_string(),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
             }
@@ -1736,7 +1749,7 @@ fn selection_panel_system(
 fn hud_update_system(
     hud: Res<Hud>,
     speed: Res<GameSpeed>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     stats: Res<crate::stats::Stats>,
     log: Res<EventLog>,
     build_mode: Res<BuildMode>,
@@ -1766,7 +1779,7 @@ fn hud_update_system(
     racks: Query<(&TilePos, &StorageCell), With<StorageCell>>,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
 
     // ---- speed buttons ----
     for (idx, interaction, mut bg) in speed_btn_q.iter_mut() {
@@ -1823,6 +1836,25 @@ fn hud_update_system(
         }
     }
 
+    // ---- sim scheduler telemetry (debug row) ----
+    if let Ok((mut text, _, _)) = texts.get_mut(hud.sim_telemetry) {
+        text.0 = format!(
+            "| SIM steps/frame {} peak {} backlog {:.2}s base {}/s",
+            clock.steps_last_frame,
+            clock.peak_steps,
+            clock.backlog_secs(),
+            crate::simtime::BASE_SIM_RATE,
+        );
+    }
+
+    // ---- SHIP TIME ----
+    if let Ok((mut text, _, _)) = texts.get_mut(hud.ship_time) {
+        text.0 = format!(
+            "SHIP TIME {}",
+            crate::simtime::format_sim_stamp(clock.now())
+        );
+    }
+
     // ---- stats line ----
     let marked = items.iter().filter(|(.., m, _, _, _)| m.is_some()).count();
     let stored: u32 = racks.iter().map(|(_, s)| s.stored()).sum();
@@ -1831,8 +1863,7 @@ fn hud_update_system(
         .iter()
         .filter(|(_, _, t, ..)| matches!(t, CrewTask::Idle(_)))
         .count();
-    let secs = now as i64;
-    let clock = format!("{:02}:{:02}", secs / 60, secs % 60);
+    let clock = crate::simtime::format_sim_stamp(now);
     if let Ok((mut text, mut color, _)) = texts.get_mut(hud.stats) {
         text.0 = format!(
             "Marked: {marked} | Storage: {stored}/cap{} | Parts made: {} | Built: {} | Crew idle: {}/4 | {clock} | {}",
@@ -1883,7 +1914,7 @@ fn hud_update_system(
         if let Ok((mut text, mut color, _)) = texts.get_mut(*line_e) {
             if entry_idx < log.entries.len() {
                 let e = &log.entries[entry_idx];
-                text.0 = format!("[{:>4}s] {}", e.time as i64, e.text);
+                text.0 = format!("[{}] {}", crate::simtime::format_sim_stamp(e.time), e.text);
                 color.0 = match e.kind {
                     LogKind::Info => Color::srgb(0.68, 0.72, 0.78),
                     LogKind::Job => Color::srgb(0.65, 0.9, 0.7),

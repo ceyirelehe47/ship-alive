@@ -13,7 +13,6 @@ use ship_alive::log::EventLog;
 use ship_alive::map::{ShipMap, Tile, TilePos};
 use ship_alive::production::{Fabricator, MachineState};
 use ship_alive::storage::StorageCell;
-use std::time::Duration;
 
 /// Roomy test ship: open floor with a rack at (5,1) and a fabricator 2x2 at
 /// (4,3)-(5,4) placed manually by the tests that need it.
@@ -124,7 +123,7 @@ impl Harness {
         world.insert_resource(ship_alive::stats::Stats::default());
         world.insert_resource(ship_alive::power::CableGrid::new(w, h));
         world.insert_resource(ship_alive::power::PowerState::default());
-        world.insert_resource(Time::<Virtual>::default());
+        world.insert_resource(ship_alive::simtime::SimClock::default());
         world.init_resource::<Events<Action>>();
         let mut schedule = Schedule::default();
         schedule.add_systems(
@@ -142,8 +141,8 @@ impl Harness {
 
     fn step(&mut self, dt: f32) {
         self.world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(dt));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(dt as f64 * ship_alive::simtime::BASE_SIM_RATE);
         self.world.resource_mut::<Events<Action>>().update();
         self.schedule.run(&mut self.world);
     }

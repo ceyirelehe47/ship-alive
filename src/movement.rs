@@ -15,32 +15,32 @@ use crate::crew::{Crew, Movement};
 use crate::map::{ShipMap, TilePos};
 use bevy::prelude::*;
 
-/// Seconds of accumulated blocking before re-pathing around the blocker.
-const REPATH_AFTER: f32 = 0.6;
-/// Seconds of blocking after which the crew walks through it.
-const PASS_THROUGH_AFTER: f32 = 1.5;
+/// Blocking before re-pathing around the blocker (sim seconds).
+const REPATH_AFTER: f32 = 0.6 * crate::simtime::BASE_SIM_RATE as f32;
+/// Blocking after which the crew walks through it (sim seconds).
+const PASS_THROUGH_AFTER: f32 = 1.5 * crate::simtime::BASE_SIM_RATE as f32;
 /// Seconds of blocking before trying to sidestep out of the way.
-const SIDESTEP_AFTER: f32 = 0.35;
+const SIDESTEP_AFTER: f32 = 0.35 * crate::simtime::BASE_SIM_RATE as f32;
 /// Cooldown between sidesteps so yielding cannot oscillate.
-const SIDESTEP_COOLDOWN: f32 = 1.2;
+const SIDESTEP_COOLDOWN: f32 = 1.2 * crate::simtime::BASE_SIM_RATE as f32;
 /// Hard ceiling without any tile advance before forcing pass-through — the
 /// monotone backstop above every other avoidance mechanism.
-const STUCK_ABORT: f32 = 2.5;
+const STUCK_ABORT: f32 = 2.5 * crate::simtime::BASE_SIM_RATE as f32;
 
 pub struct MovementPlugin;
 
 impl Plugin for MovementPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, movement_system.in_set(crate::Set::Move));
+        app.add_systems(FixedUpdate, movement_system.in_set(crate::Set::Move));
     }
 }
 
 pub fn movement_system(
     map: Res<ShipMap>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     mut crews: Query<(Entity, &Crew, &mut TilePos, &mut Movement)>,
 ) {
-    let dt = time.delta().as_secs_f32();
+    let dt = clock.dt() as f32;
 
     // Occupancy snapshot: tiles a crew member physically stands on right now.
     // "Entering" tiles are deliberately NOT reserved: two crew may pick the

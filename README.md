@@ -24,7 +24,7 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 76 个单元/集成测试
+cargo test                     # 91 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
@@ -45,7 +45,8 @@ src/
   production.rs  Fabricator：配方(2 Ore→1 Part)/订单(Produce N|Repeat)/状态机/缓冲
   jobs.rs        核心：玩家动作、四类任务执行、统一工作扫描与优先级领取
   movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制）
-  time_ctrl.rs   暂停/1×/2×/4×（Bevy 虚拟时钟）
+  simtime.rs     统一模拟时钟（i64 µs、T+HHH:MM:SS、固定步长泵/累加器/退避）
+  time_ctrl.rs   玩家倍率 Pause/1×/2×/4×（Space 记忆上次倍率）
   input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
   render.rs      建筑/蓝图/机器状态可视化 + 放置 ghost + 房间标注
   ui.rs          HUD：右侧边栏(环境信息/选中实体属性+操作)、BUILD 分类栏/船员状态/事件日志

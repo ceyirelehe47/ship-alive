@@ -8,7 +8,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
-                title: "Ship Alive — Slice 1".to_string(),
+                title: "Ship Alive".to_string(),
                 resolution: (1440., 860.).into(),
                 ..default()
             }),
@@ -17,6 +17,7 @@ fn main() {
         .add_plugins((
             setup::SetupPlugin,
             autotest::AutotestPlugin,
+            ship_alive::simtime::SimTimePlugin,
             ship_alive::power::PowerPlugin,
             render::RenderPlugin,
             time_ctrl::TimeCtrlPlugin,
@@ -32,10 +33,11 @@ fn main() {
                 .before(render::spawn_tile_visuals)
                 .before(render::spawn_markers),
         )
-        .configure_sets(
-            Update,
-            (Set::Input, Set::Jobs, Set::Move, Set::Sync).chain(),
-        )
+        // Gameplay advances in fixed sim steps (SimClock-driven); input and
+        // presentation stay frame-based. FixedUpdate runs before Update
+        // within a frame, so Sync always renders the latest world state.
+        .configure_sets(FixedUpdate, (Set::Jobs, Set::Move).chain())
+        .configure_sets(Update, (Set::Input, Set::Sync).chain())
         .add_systems(Update, (smoke_autoquit, auto_screenshot))
         .run();
 }

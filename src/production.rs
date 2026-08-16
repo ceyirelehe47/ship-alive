@@ -24,7 +24,7 @@ pub const RECIPE: Recipe = Recipe {
     in_qty: 2,
     out_kind: ItemKind::Part,
     out_qty: 1,
-    work_secs: 6.0,
+    work_secs: 6.0 * crate::simtime::BASE_SIM_RATE as f32, // 6 ship minutes
 };
 
 /// One production order: `batches` more runs, or endless when `repeat`.

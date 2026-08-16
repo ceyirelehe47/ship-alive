@@ -12,7 +12,8 @@ use bevy::prelude::*;
 pub struct Crew {
     pub name: String,
     pub tint: Color,
-    /// Tiles per (virtual) second at 1x speed.
+    /// Tiles per SIM second. 3 tiles per real second at 1× — with the 60×
+    /// base rate that is 3/60 tiles per ship-second.
     pub speed: f32,
     /// Game time (seconds) after which this crew rescans for work.
     pub next_scan: f64,
@@ -30,7 +31,7 @@ impl Crew {
         Self {
             name: name.to_string(),
             tint,
-            speed: 3.0,
+            speed: 3.0 / crate::simtime::BASE_SIM_RATE as f32,
             next_scan: 0.0,
             delivered: 0,
             built: 0,

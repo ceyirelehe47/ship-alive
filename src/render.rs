@@ -608,7 +608,7 @@ fn dimmed(c: Color) -> Color {
 #[allow(clippy::type_complexity)]
 fn sync_item_visuals_system(
     map: Res<ShipMap>,
-    time: Res<Time<Virtual>>,
+    clock: Res<crate::simtime::SimClock>,
     items: Query<
         (
             Entity,
@@ -623,7 +623,7 @@ fn sync_item_visuals_system(
     crews: Query<(Entity, &Crew)>,
     mut sprites: Query<(&Visual, &mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     // Stack offset so several items on one tile remain visible.
     let mut per_tile: std::collections::HashMap<TilePos, usize> = std::collections::HashMap::new();
     for (_, pos, _, _, carried, _) in items.iter() {

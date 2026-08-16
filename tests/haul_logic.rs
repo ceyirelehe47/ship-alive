@@ -10,7 +10,6 @@ use ship_alive::jobs::{self, Action};
 use ship_alive::log::EventLog;
 use ship_alive::map::{ShipMap, TilePos};
 use ship_alive::storage::StorageCell;
-use std::time::Duration;
 
 /// Tiny ship: crew room left, storage right, connected by a corridor.
 const LAYOUT: [&str; 5] = ["#######", "#C..S.#", "#.....#", "#.....#", "#######"];
@@ -63,7 +62,7 @@ impl Harness {
         world.insert_resource(ship_alive::stats::Stats::default());
         world.insert_resource(ship_alive::power::CableGrid::new(w, h));
         world.insert_resource(ship_alive::power::PowerState::default());
-        world.insert_resource(Time::<Virtual>::default());
+        world.insert_resource(ship_alive::simtime::SimClock::default());
         world.init_resource::<Events<Action>>();
 
         let mut schedule = Schedule::default();
@@ -82,8 +81,8 @@ impl Harness {
     /// Advance virtual time by `dt` and run one frame.
     fn step(&mut self, dt: f32) {
         self.world
-            .resource_mut::<Time<Virtual>>()
-            .advance_by(Duration::from_secs_f32(dt));
+            .resource_mut::<ship_alive::simtime::SimClock>()
+            .advance_sim(dt as f64 * ship_alive::simtime::BASE_SIM_RATE);
         self.world.resource_mut::<Events<Action>>().update();
         self.schedule.run(&mut self.world);
     }
@@ -235,7 +234,7 @@ fn unreachable_item_gets_cooldown_not_reservation() {
     world.insert_resource(ship_alive::stats::Stats::default());
     world.insert_resource(ship_alive::power::CableGrid::new(w, h));
     world.insert_resource(ship_alive::power::PowerState::default());
-    world.insert_resource(Time::<Virtual>::default());
+    world.insert_resource(ship_alive::simtime::SimClock::default());
     world.init_resource::<Events<Action>>();
     let mut schedule = Schedule::default();
     schedule.add_systems((

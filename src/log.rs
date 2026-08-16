@@ -36,6 +36,7 @@ impl EventLog {
         });
     }
 
-    /// Seconds a `NoPathUntil`-style cooldown should suppress retries.
-    pub const UNREACHABLE_COOLDOWN: f64 = 15.0;
+    /// Cooldown before retrying an unreachable target (sim seconds;
+    /// 15 real seconds at 1× = 15 ship minutes).
+    pub const UNREACHABLE_COOLDOWN: f64 = 15.0 * crate::simtime::BASE_SIM_RATE;
 }

@@ -19,7 +19,24 @@ use crate::log::{EventLog, LogKind};
 use crate::map::{find_drop_tile, ShipMap, TilePos};
 use crate::power::{CableGrid, PowerRole, PowerStatus};
 use crate::production::Fabricator;
+use crate::simtime::{SimClock, BASE_SIM_RATE};
 use crate::storage::StorageCell;
+
+// ---- gameplay durations in SIM seconds (1 real s at 1× = 60 sim s) ----
+/// Haul pickup beat (was 0.3 real s).
+const PICKUP_SECS: f32 = 0.3 * BASE_SIM_RATE as f32;
+/// Deposit/store beat (was 0.25 real s).
+const DELIVER_SECS: f32 = 0.25 * BASE_SIM_RATE as f32;
+/// Rescan cooldown after a canceled job (was 0.2 real s).
+const RESCAN_CANCELED: f32 = 0.2 * BASE_SIM_RATE as f32;
+/// Rescan cooldown after a failed job (was 0.3 real s).
+const RESCAN_FAILED: f32 = 0.3 * BASE_SIM_RATE as f32;
+/// Rescan cooldown when unreachable (was 0.5 real s).
+const RESCAN_UNREACHABLE: f32 = 0.5 * BASE_SIM_RATE as f32;
+/// Idle scan cadence (was 0.6 real s).
+const SCAN_IDLE: f32 = 0.6 * BASE_SIM_RATE as f32;
+/// Slower re-scan when repeatedly nothing to do (was 1.0 real s).
+const SCAN_IDLE_SLOW: f32 = 1.0 * BASE_SIM_RATE as f32;
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
 
@@ -41,8 +58,10 @@ pub enum Action {
     SpawnItem { kind: ItemKind },
     /// UI-only: show/hide the developer toolbar (consumed by the UI plugin).
     ToggleDebug,
-    /// Set simulation speed by index into [`crate::SPEED_STEPS`].
+    /// Set simulation speed by index into [`crate::simtime::SPEED_SCALES`].
     SetSpeed { index: usize },
+    /// Toggle between Pause and the last non-paused speed (Space).
+    TogglePause,
     // ---- Slice 1: construction -----------------------------------------
     /// Place a construction blueprint (origin = top-left footprint tile).
     PlaceBlueprint { kind: BuildingKind, pos: TilePos },
@@ -90,10 +109,12 @@ impl Plugin for JobsPlugin {
     fn build(&self, app: &mut App) {
         app.add_event::<Action>();
         app.init_resource::<crate::stats::Stats>();
+        // Player actions are frame-based (events must fire exactly once per
+        // frame); everything downstream advances per fixed sim step.
+        app.add_systems(Update, actions_system.in_set(crate::Set::Input));
         app.add_systems(
-            Update,
+            FixedUpdate,
             (
-                actions_system,
                 crate::power::power_network_system,
                 crew_task_system,
                 crew_scan_system,
@@ -117,7 +138,7 @@ pub fn actions_system(
     mut commands: Commands,
     map: Res<ShipMap>,
     mut log: ResMut<EventLog>,
-    time: Res<Time<Virtual>>,
+    clock: Res<SimClock>,
     mut crews: Query<(Entity, &mut Crew, &mut CrewTask, &TilePos, &mut Movement), Without<Item>>,
     items: Query<(Entity, &TilePos, Option<&MarkedForHaul>), With<Item>>,
     rack_tiles: Query<&TilePos, (With<StorageCell>, Without<Crew>)>,
@@ -129,7 +150,7 @@ pub fn actions_system(
     cables: Res<CableGrid>,
     cable_tiles: Query<(Entity, &TilePos), (With<Building>, With<MarkedForDeconstruct>)>,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
     let racks_list: Vec<(TilePos, Entity)> = rack_tiles
         .iter()
         .map(|p| (*p, Entity::PLACEHOLDER))
@@ -437,7 +458,7 @@ pub fn actions_system(
             Action::TogglePowerView => {
                 // Consumed by the UI plugin.
             }
-            Action::SetSpeed { .. } => {
+            Action::SetSpeed { .. } | Action::TogglePause => {
                 // Consumed by time_ctrl::speed_action_system.
             }
             Action::ToggleDebug => {
@@ -703,7 +724,7 @@ fn fail_haul(
             detail: detail.to_string(),
         },
     );
-    crew.next_scan = now + 0.3;
+    crew.next_scan = now + RESCAN_FAILED as f64;
 }
 
 /// Whether a crew standing on `pos` can interact with `foot`.
@@ -738,7 +759,7 @@ fn end_work(
 pub fn crew_task_system(
     mut map: ResMut<ShipMap>,
     mut cables: ResMut<CableGrid>,
-    time: Res<Time<Virtual>>,
+    clock: Res<SimClock>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
     mut commands: Commands,
@@ -779,8 +800,8 @@ pub fn crew_task_system(
         (Without<Crew>, Without<Blueprint>),
     >,
 ) {
-    let dt = time.delta().as_secs_f32();
-    let now = time.elapsed().as_secs_f64();
+    let dt = clock.dt() as f32;
+    let now = clock.now();
     let crew_positions: Vec<(Entity, TilePos)> =
         crews.iter().map(|(e, _, _, p, _)| (e, *p)).collect();
     let ground_now: Vec<TilePos> = items.iter().map(|(_, p, ..)| *p).collect();
@@ -795,7 +816,7 @@ pub fn crew_task_system(
                     detail: "target vanished".into(),
                 });
                 mov.path.clear();
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 log.push(
                     now,
                     LogKind::Fail,
@@ -817,7 +838,7 @@ pub fn crew_task_system(
                     detail: "item unmarked".into(),
                 });
                 mov.path.clear();
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 log.push(
                     now,
                     LogKind::Fail,
@@ -833,7 +854,7 @@ pub fn crew_task_system(
                         detail: "item claimed elsewhere".into(),
                     });
                     mov.path.clear();
-                    crew.next_scan = now + 0.2;
+                    crew.next_scan = now + RESCAN_CANCELED as f64;
                     log.push(
                         now,
                         LogKind::Fail,
@@ -847,7 +868,7 @@ pub fn crew_task_system(
                 HaulPhase::ToItem => {
                     if mov.path.is_empty() && *pos == *item_pos {
                         job.phase = HaulPhase::PickingUp;
-                        job.timer = 0.3;
+                        job.timer = PICKUP_SECS;
                     } else if mov.path.is_empty() {
                         match crate::path::find_path(&map, *pos, *item_pos, |_| false) {
                             Some(p) => mov.path = p,
@@ -1042,7 +1063,7 @@ pub fn crew_task_system(
                         if mov.path.is_empty() && *pos == rack_pos {
                             if rack_free {
                                 job.phase = HaulPhase::Delivering;
-                                job.timer = 0.25;
+                                job.timer = DELIVER_SECS;
                             } else {
                                 match choose_rack(&map, *pos, &racks_for_kind(&racks, item.kind)) {
                                     Some((rack, path)) => {
@@ -1092,7 +1113,7 @@ pub fn crew_task_system(
                         let foot = *foot;
                         if mov.path.is_empty() && at_interaction(&map, *pos, &foot) {
                             job.phase = HaulPhase::Delivering;
-                            job.timer = 0.25;
+                            job.timer = DELIVER_SECS;
                         } else if mov.path.is_empty() {
                             match building::path_to_interaction(&map, *pos, &foot) {
                                 Some(p) => mov.path = p,
@@ -1121,7 +1142,7 @@ pub fn crew_task_system(
                         let foot = *foot;
                         if mov.path.is_empty() && at_interaction(&map, *pos, &foot) {
                             job.phase = HaulPhase::Delivering;
-                            job.timer = 0.25;
+                            job.timer = DELIVER_SECS;
                         } else if mov.path.is_empty() {
                             match building::path_to_interaction(&map, *pos, &foot) {
                                 Some(p) => mov.path = p,
@@ -1233,7 +1254,7 @@ pub fn crew_task_system(
                     detail: "blueprint gone".into(),
                 });
                 mov.path.clear();
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 log.push(now, LogKind::Fail, format!("{name}: blueprint gone"));
                 continue;
             };
@@ -1261,7 +1282,7 @@ pub fn crew_task_system(
                                     &name,
                                     "no path to blueprint",
                                 );
-                                crew.next_scan = now + 0.5;
+                                crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
                         }
                     }
@@ -1303,7 +1324,7 @@ pub fn crew_task_system(
                     detail: "building gone".into(),
                 });
                 mov.path.clear();
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 log.push(now, LogKind::Fail, format!("{name}: building gone"));
                 continue;
             };
@@ -1321,7 +1342,7 @@ pub fn crew_task_system(
                     &name,
                     "deconstruction unmarked",
                 );
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 continue;
             }
             let phase = job.phase;
@@ -1347,7 +1368,7 @@ pub fn crew_task_system(
                                     &name,
                                     "no path to building",
                                 );
-                                crew.next_scan = now + 0.5;
+                                crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
                         }
                     }
@@ -1391,7 +1412,7 @@ pub fn crew_task_system(
                     detail: "machine gone".into(),
                 });
                 mov.path.clear();
-                crew.next_scan = now + 0.2;
+                crew.next_scan = now + RESCAN_CANCELED as f64;
                 log.push(now, LogKind::Fail, format!("{name}: machine gone"));
                 continue;
             };
@@ -1413,7 +1434,7 @@ pub fn crew_task_system(
                             &name,
                             "order canceled while walking",
                         );
-                        crew.next_scan = now + 0.2;
+                        crew.next_scan = now + RESCAN_CANCELED as f64;
                         continue;
                     }
                     if mov.path.is_empty() && at_interaction(&map, *pos, &foot) {
@@ -1437,7 +1458,7 @@ pub fn crew_task_system(
                                     &name,
                                     "no path to machine",
                                 );
-                                crew.next_scan = now + 0.5;
+                                crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
                         }
                     }
@@ -1458,7 +1479,7 @@ pub fn crew_task_system(
                             &name,
                             "power lost",
                         );
-                        crew.next_scan = now + 0.3;
+                        crew.next_scan = now + RESCAN_FAILED as f64;
                         continue;
                     }
                     if !f.active || !at_interaction(&map, *pos, &foot) {
@@ -1476,7 +1497,7 @@ pub fn crew_task_system(
                             &name,
                             "production interrupted",
                         );
-                        crew.next_scan = now + 0.3;
+                        crew.next_scan = now + RESCAN_FAILED as f64;
                         continue;
                     }
                     job.timer -= dt;
@@ -1619,7 +1640,7 @@ fn best_source_for(
 #[allow(clippy::too_many_arguments)]
 pub fn crew_scan_system(
     map: Res<ShipMap>,
-    time: Res<Time<Virtual>>,
+    clock: Res<SimClock>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
     mut commands: Commands,
@@ -1658,7 +1679,7 @@ pub fn crew_scan_system(
         (Without<Crew>, Without<Blueprint>),
     >,
 ) {
-    let now = time.elapsed().as_secs_f64();
+    let now = clock.now();
 
     // Inbound supply: how many haulers are already en route to each consumer.
     let mut inbound: HashMap<(Entity, usize), u32> = HashMap::new();
@@ -1879,7 +1900,7 @@ pub fn crew_scan_system(
                 IdleCause::NothingToDo
             };
             *task = CrewTask::Idle(cause);
-            crew.next_scan = now + 0.6;
+            crew.next_scan = now + SCAN_IDLE as f64;
             continue;
         }
 
@@ -2127,7 +2148,7 @@ pub fn crew_scan_system(
                 IdleCause::NothingToDo
             };
             *task = CrewTask::Idle(cause);
-            crew.next_scan = now + 1.0;
+            crew.next_scan = now + SCAN_IDLE_SLOW as f64;
         }
     }
 }

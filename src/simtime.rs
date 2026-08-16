@@ -17,7 +17,11 @@
 //! `Time<Virtual>`; the engine's fixed loop then executes 0..N steps per
 //! frame, flushing commands between steps, so high speeds NEVER re-run the
 //! whole frame's logic manually and N steps behave exactly like N frames at
-//! 1×. `Time<Virtual>::max_delta` (250 ms) caps per-frame catch-up so a
+//! 1×. `Time<Fixed>` follows `Time<Virtual>` (which runs at
+//! `BASE_SIM_RATE × scale`), so the fixed timestep is `SIM_STEP` of virtual
+//! time — the loop executes exactly `BASE_SIM_RATE × scale` steps per real
+//! second, matching what the backlog gate dispenses.
+//! `Time<Virtual>::max_delta` (250 ms) caps per-frame catch-up so a
 //! hitch cannot spiral; `SimClock` only advances inside FixedUpdate, hence
 //! the clock can never run ahead of actually-processed world state. Leftover
 //! unprocessed time is reported as `backlog`.
@@ -41,10 +45,6 @@ pub const SIM_STEP: f64 = 1.0;
 /// Player time scales, single source of truth (index 0 = pause).
 pub const SPEED_SCALES: [f64; 4] = [0.0, 1.0, 2.0, 4.0];
 
-/// Upper bound of catch-up steps executed in one frame (spiral-of-death
-/// guard on top of `Time<Virtual>::max_delta`).
-pub const MAX_STEPS_PER_FRAME: u64 = 120;
-
 /// The authoritative simulation clock. Internal time is integer microseconds
 /// so long campaigns (1000 h = 3.6e12 µs) never lose second-level precision.
 #[derive(Resource)]
@@ -54,6 +54,9 @@ pub struct SimClock {
     step_dt: f64,
     /// Sim time offered by the pump but not yet executed (catch-up backlog).
     backlog_us: i64,
+    /// Steps executed during the current frame (moved to `steps_last_frame`
+    /// by the PostUpdate telemetry bookkeeping).
+    pending_steps: u64,
     /// Telemetry: steps executed in the last frame.
     pub steps_last_frame: u64,
     /// Telemetry: peak steps in any single frame since startup.
@@ -66,6 +69,7 @@ impl Default for SimClock {
             elapsed_us: 0,
             step_dt: 0.0,
             backlog_us: 0,
+            pending_steps: 0,
             steps_last_frame: 0,
             peak_steps: 0,
         }
@@ -115,13 +119,16 @@ impl SimClock {
         self.backlog_us -= (SIM_STEP * 1e6) as i64;
         self.elapsed_us += (SIM_STEP * 1e6) as i64;
         self.step_dt = SIM_STEP;
+        self.pending_steps += 1;
         true
     }
 
-    /// Called once per frame after the fixed loop for telemetry bookkeeping.
-    pub fn frame_bookkeeping(&mut self, executed_steps: u64) {
-        self.steps_last_frame = executed_steps;
-        self.peak_steps = self.peak_steps.max(executed_steps);
+    /// Called once per frame after the fixed loop: publish the frame's step
+    /// count telemetry.
+    pub fn frame_bookkeeping(&mut self) {
+        self.steps_last_frame = self.pending_steps;
+        self.peak_steps = self.peak_steps.max(self.pending_steps);
+        self.pending_steps = 0;
     }
 
     // ---- test/manual driving ----------------------------------------------
@@ -212,36 +219,31 @@ fn sim_pump_system(
         virtual_time.set_relative_speed(effective);
     }
     virtual_time.set_max_delta(Duration::from_millis(250));
-    // Fixed step in REAL time: one SIM_STEP of sim time at 1× pacing.
-    fixed_time.set_timestep(Duration::from_secs_f64(SIM_STEP / BASE_SIM_RATE));
+    // Fixed step in VIRTUAL seconds (Time<Fixed> follows Time<Virtual>, which
+    // already runs at BASE_SIM_RATE × scale): one step = one SIM_STEP. The
+    // loop then executes 60 × scale steps per real second, exactly matching
+    // the backlog the SimClock gate dispenses. (A timestep of
+    // SIM_STEP / BASE_SIM_RATE was a real-seconds unit slip that made the
+    // fixed loop run 60× too often — every extra run burned CPU while the
+    // backlog gate kept the dt at 0, which at 4× collapsed the frame rate.)
+    fixed_time.set_timestep(Duration::from_secs_f64(SIM_STEP));
 }
 
 /// Runs inside FixedUpdate, before gameplay: pull one fixed step from the
-/// backlog. If the backlog is empty (frame budget spent), short-circuit the
-/// whole gameplay set for this scheduled run.
+/// backlog. The loop pacing (timestep = SIM_STEP virtual seconds) offers
+/// exactly as many runs as the backlog holds, so this normally succeeds on
+/// every run; the gate stays as a defensive bound, marking `dt() == 0.0`
+/// for any stray run so gameplay systems cheaply no-op.
 fn sim_tick_system(mut clock: ResMut<SimClock>, mut commands: Commands) {
     if !clock.begin_fixed_step() {
-        // No budget left this frame: skip gameplay by panicking? No — Bevy
-        // would abort. Instead the fixed loop itself is paced by
-        // Time<Virtual>; running out here means the loop should not have been
-        // entered, which the pacing already prevents. Guard anyway: leave dt
-        // at the last value but mark zero so systems can cheaply no-op via
-        // `dt() == 0.0` (defensive only, not expected in practice).
         let _ = &mut commands;
         clock.step_dt = 0.0;
     }
 }
 
 /// Telemetry after the loop: how many steps actually ran this frame.
-fn sim_telemetry_system(
-    fixed: Res<Time<Fixed>>,
-    mut clock: ResMut<SimClock>,
-    speed: Res<GameSpeed>,
-) {
-    // Steps executed = discrete ticks the fixed loop consumed this frame.
-    let executed = (fixed.delta().as_secs_f64() / SIM_STEP).round() as u64;
-    clock.frame_bookkeeping(executed);
-    let _ = speed;
+fn sim_telemetry_system(mut clock: ResMut<SimClock>) {
+    clock.frame_bookkeeping();
 }
 
 #[cfg(test)]

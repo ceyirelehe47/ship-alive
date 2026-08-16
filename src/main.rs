@@ -38,8 +38,63 @@ fn main() {
         // within a frame, so Sync always renders the latest world state.
         .configure_sets(FixedUpdate, (Set::Jobs, Set::Move).chain())
         .configure_sets(Update, (Set::Input, Set::Sync).chain())
-        .add_systems(Update, (smoke_autoquit, auto_screenshot, ui_layout_debug))
+        .add_systems(
+            Update,
+            (
+                smoke_autoquit,
+                auto_screenshot,
+                ui_layout_debug,
+                perf_report,
+            ),
+        )
         .run();
+}
+
+/// Dev helper: `SLICE0_PERF=1` prints average frame ms, sim steps per frame
+/// and sim-seconds per real second every 120 frames. `SLICE0_SPEED=0..3`
+/// additionally forces the starting speed, so 1×/2×/4× can be compared
+/// without touching the UI (this is how the 4× fixed-timestep pacing bug
+/// was quantified).
+#[allow(clippy::type_complexity)]
+fn perf_report(
+    real: Res<Time<Real>>,
+    clock: Res<ship_alive::simtime::SimClock>,
+    mut speed: ResMut<time_ctrl::GameSpeed>,
+    // Nested tuple = one system param (the flat list would exceed the limit).
+    (mut frames, mut ms_sum, mut steps_sum, mut last_now, mut last_wall): (
+        Local<u64>,
+        Local<f64>,
+        Local<u64>,
+        Local<f64>,
+        Local<f64>,
+    ),
+) {
+    if let Some(idx) = std::env::var("SLICE0_SPEED")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+    {
+        speed.index = idx;
+    }
+    if std::env::var("SLICE0_PERF").is_err() {
+        return;
+    }
+    *ms_sum += real.delta_secs_f64() * 1000.0;
+    *steps_sum += clock.steps_last_frame;
+    *frames += 1;
+    if frames.is_multiple_of(120) {
+        let wall = real.elapsed_secs_f64();
+        println!(
+            "PERF f={} avg_ms={:.2} steps/frame={:.2} sim_s_per_real_s={:.1} backlog={:.1}s",
+            *frames,
+            *ms_sum / *frames as f64,
+            *steps_sum as f64 / 120.0,
+            (clock.now() - *last_now) / (wall - *last_wall).max(1e-6),
+            clock.backlog_secs(),
+        );
+        *steps_sum = 0;
+        *last_now = clock.now();
+        *last_wall = wall;
+    }
 }
 
 /// Dev helper: `SLICE0_UI_DEBUG=1` prints the computed taffy layout of every

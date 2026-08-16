@@ -19,6 +19,7 @@ pub mod log;
 pub mod map;
 pub mod movement;
 pub mod path;
+pub mod power;
 pub mod production;
 pub mod render;
 pub mod setup;

@@ -115,6 +115,54 @@ fn process(name: &str) {
     println!("{} -> {} ok", src.display(), dst.display());
 }
 
+/// UI primitives are drawn procedurally — AI-generated raws for these have
+/// come back as solid magenta placeholders before, which would render as an
+/// opaque box hiding whatever it marks. A crisp annulus / soft dot done in
+/// code is deterministic and always correct.
+fn synth_ring() {
+    let s = OUT_SIZE;
+    let mut img = ImageBuffer::new(s, s);
+    let c = (s as f32 - 1.0) / 2.0;
+    let outer = s as f32 * 0.46;
+    let inner = s as f32 * 0.38;
+    let aa = 1.5; // anti-alias edge width in px
+    for y in 0..s {
+        for x in 0..s {
+            let dist = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
+            // Alpha ramp across both edges of the annulus.
+            let edge_out = (outer - dist) / aa + 0.5;
+            let edge_in = (dist - inner) / aa + 0.5;
+            let a = edge_out.clamp(0.0, 1.0) * edge_in.clamp(0.0, 1.0);
+            let a = (a * 255.0).round() as u8;
+            if a > 0 {
+                img.put_pixel(x, y, Rgba([255, 255, 255, a]));
+            }
+        }
+    }
+    img.save(Path::new("assets/art").join("ring.png")).unwrap();
+    println!("synthesized assets/art/ring.png");
+}
+
+fn synth_dot() {
+    let s = OUT_SIZE;
+    let mut img = ImageBuffer::new(s, s);
+    let c = (s as f32 - 1.0) / 2.0;
+    let r = s as f32 * 0.42;
+    let aa = 1.5;
+    for y in 0..s {
+        for x in 0..s {
+            let dist = ((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt();
+            let a = ((r - dist) / aa + 0.5).clamp(0.0, 1.0);
+            let a = (a * 235.0).round() as u8;
+            if a > 0 {
+                img.put_pixel(x, y, Rgba([255, 255, 255, a]));
+            }
+        }
+    }
+    img.save(Path::new("assets/art").join("dot.png")).unwrap();
+    println!("synthesized assets/art/dot.png");
+}
+
 fn main() {
     for name in [
         "floor",
@@ -123,13 +171,14 @@ fn main() {
         "door",
         "rack",
         "fabricator",
+        "reactor",
         "crate",
         "ore",
         "part",
         "crew",
-        "ring",
-        "dot",
     ] {
         process(name);
     }
+    synth_ring();
+    synth_dot();
 }

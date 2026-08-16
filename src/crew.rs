@@ -271,6 +271,14 @@ pub struct Movement {
     /// regular `blocked_for` decays on intermittently-free frames.
     pub blocked_tile: Option<crate::map::TilePos>,
     pub blocked_on_tile: f32,
+    /// Cooldown accumulator for sidestep yields (prevents oscillation).
+    pub sidestep_ready: f32,
+    /// The obstacle tile we already sidestepped for; a second blockage from
+    /// the same obstacle escalates straight to pass-through instead of
+    /// ping-ponging between sidestep tiles.
+    pub yield_for: Option<crate::map::TilePos>,
+    /// Monotone "no tile advanced" watchdog (reset only by real movement).
+    pub stuck_for: f32,
 }
 
 /// Reason of one unit of material demand (used by the logistics scan).

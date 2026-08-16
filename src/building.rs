@@ -12,21 +12,28 @@ use crate::items::{self, ItemKind};
 use crate::map::{ShipMap, Tile, TilePos};
 use bevy::prelude::*;
 
-/// Everything buildable in Slice 1.
+/// Everything buildable.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum BuildingKind {
     Wall,
     Door,
     Rack,
     Fabricator,
+    /// Underfloor power cable (1 tile; lives in the CableGrid, not as a
+    /// resting ECS entity).
+    PowerCable,
+    /// Starter Reactor: a 2x2 generator device.
+    Reactor,
 }
 
 impl BuildingKind {
-    pub const ALL: [BuildingKind; 4] = [
+    pub const ALL: [BuildingKind; 6] = [
         BuildingKind::Wall,
         BuildingKind::Door,
         BuildingKind::Rack,
         BuildingKind::Fabricator,
+        BuildingKind::PowerCable,
+        BuildingKind::Reactor,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -100,6 +107,30 @@ pub fn def(kind: BuildingKind) -> BuildingDef {
             cost: [0, 0, 4],
             work_secs: 8.0,
             demo_secs: 3.0,
+            blocks: true,
+            needs_clear_tiles: true,
+            tile: Tile::Machine,
+        },
+        BuildingKind::PowerCable => BuildingDef {
+            kind,
+            label: "Power Cable",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 0],
+            work_secs: 1.5,
+            demo_secs: 1.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Reactor => BuildingDef {
+            kind,
+            label: "Reactor",
+            w: 2,
+            h: 2,
+            cost: [0, 0, 8],
+            work_secs: 10.0,
+            demo_secs: 4.0,
             blocks: true,
             needs_clear_tiles: true,
             tile: Tile::Machine,
@@ -223,6 +254,7 @@ pub enum PlacementError {
     ItemInWay,
     OverlapsBuilding,
     OverlapsBlueprint,
+    CableExists,
 }
 
 impl PlacementError {
@@ -233,6 +265,7 @@ impl PlacementError {
             PlacementError::ItemInWay => "an item is in the way",
             PlacementError::OverlapsBuilding => "overlaps an existing building",
             PlacementError::OverlapsBlueprint => "overlaps another blueprint",
+            PlacementError::CableExists => "a cable already runs here",
         }
     }
 }
@@ -244,9 +277,36 @@ pub fn can_place(
     origin: TilePos,
     ground_items: &[TilePos],
     buildings: &[(Footprint, bool)], // (footprint, is_blueprint)
+    has_cable: impl Fn(TilePos) -> bool,
 ) -> Result<(), PlacementError> {
     let d = def(kind);
     let foot = Footprint::new(origin.x, origin.y, d.w, d.h);
+    if kind == BuildingKind::PowerCable {
+        // Underfloor: any interior tile works (under room walls, machines,
+        // doors), but never the hull shell — i.e. never the map border —
+        // never twice, never under a pending cable plan.
+        let on_border = origin.x == 0
+            || origin.y == 0
+            || origin.x == map.width - 1
+            || origin.y == map.height - 1;
+        return if on_border || !map.in_bounds(origin) {
+            Err(PlacementError::OutsideShip)
+        } else {
+            match map.tile(origin) {
+                _ if has_cable(origin) => Err(PlacementError::CableExists),
+                _ => {
+                    let dup_bp = buildings
+                        .iter()
+                        .any(|(f, is_bp)| *is_bp && f.w == 1 && f.h == 1 && f.contains(origin));
+                    if dup_bp {
+                        Err(PlacementError::CableExists)
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+        };
+    }
     for t in foot.tiles() {
         match map.tile(t) {
             Some(Tile::Floor) => {}
@@ -336,6 +396,7 @@ pub fn spawn_blueprint(commands: &mut Commands, kind: BuildingKind, origin: Tile
 pub fn complete_building(
     commands: &mut Commands,
     map: &mut ShipMap,
+    cables: &mut crate::power::CableGrid,
     blueprint: Entity,
     bp: &Blueprint,
     crew_positions: &[(Entity, TilePos)],
@@ -345,6 +406,20 @@ pub fn complete_building(
     now: f64,
 ) {
     let d = def(bp.kind);
+    if bp.kind == BuildingKind::PowerCable {
+        // Cables rest in the dense underfloor grid, never as entities.
+        for t in bp.foot.tiles() {
+            cables.set(t, true);
+        }
+        commands.entity(blueprint).despawn();
+        stats.built += 1;
+        log.push(
+            now,
+            crate::log::LogKind::Job,
+            format!("Power cable laid at ({},{})", bp.foot.x, bp.foot.y),
+        );
+        return;
+    }
     for t in bp.foot.tiles() {
         map.set_tile(t, d.tile);
     }
@@ -388,6 +463,14 @@ pub fn complete_building(
         }
         BuildingKind::Fabricator => {
             ec.insert(crate::production::Fabricator::default());
+            ec.insert(crate::power::PowerRole::consumer(
+                crate::power::FABRICATOR_DEMAND,
+            ));
+            ec.insert(crate::power::PowerStatus::default());
+        }
+        BuildingKind::Reactor => {
+            ec.insert(crate::power::PowerRole::generator());
+            ec.insert(crate::power::PowerStatus::default());
         }
         _ => {}
     }
@@ -424,6 +507,7 @@ pub fn nearest_walkable(map: &ShipMap, around: TilePos) -> Option<TilePos> {
 pub fn complete_deconstruction(
     commands: &mut Commands,
     map: &mut ShipMap,
+    cables: &mut crate::power::CableGrid,
     building: Entity,
     b: &Building,
     rack_contents: Option<[u32; 3]>,
@@ -433,6 +517,20 @@ pub fn complete_deconstruction(
     now: f64,
 ) {
     let d = def(b.kind);
+    if b.kind == BuildingKind::PowerCable {
+        // The transient tile entity goes away; the cable leaves the grid.
+        for t in b.foot.tiles() {
+            cables.set(t, false);
+        }
+        commands.entity(building).despawn();
+        stats.deconstructed += 1;
+        log.push(
+            now,
+            crate::log::LogKind::Job,
+            format!("Power cable removed at ({},{})", b.foot.x, b.foot.y),
+        );
+        return;
+    }
     for t in b.foot.tiles() {
         map.set_tile(t, Tile::Floor);
     }

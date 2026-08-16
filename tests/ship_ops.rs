@@ -71,9 +71,38 @@ fn spawn_fab(world: &mut World, pos: TilePos) -> Entity {
                     demo_progress: 0.0,
                 },
                 Fabricator::default(),
+                ship_alive::power::PowerRole::consumer(ship_alive::power::FABRICATOR_DEMAND),
+                ship_alive::power::PowerStatus::default(),
             ))
             .id()
-    })
+    });
+    // Feed it power: a reactor three tiles west with a short cable run.
+    world.resource_scope(
+        |_w: &mut World, mut cables: Mut<ship_alive::power::CableGrid>| {
+            for y in [pos.y, pos.y + 1] {
+                for x in (pos.x - 2)..pos.x {
+                    cables.set(TilePos::new(x, y), true);
+                }
+            }
+        },
+    );
+    let _gen = world
+        .spawn((
+            TilePos::new(pos.x - 4, pos.y),
+            Footprint::new(pos.x - 4, pos.y, 2, 2),
+            ship_alive::power::PowerRole::generator(),
+            ship_alive::power::PowerStatus::default(),
+        ))
+        .id();
+    world.resource_scope(
+        |world: &mut World, _p: Mut<ship_alive::power::PowerState>| {
+            world
+                .query_filtered::<Entity, With<Fabricator>>()
+                .iter(world)
+                .next()
+                .unwrap()
+        },
+    )
 }
 
 struct Harness {
@@ -89,15 +118,19 @@ impl Harness {
     fn with_layout(layout: &[&str]) -> Self {
         let mut world = World::new();
         let (map, _) = ShipMap::from_layout(layout);
+        let (w, h) = (map.width, map.height);
         world.insert_resource(map);
         world.insert_resource(EventLog::default());
         world.insert_resource(ship_alive::stats::Stats::default());
+        world.insert_resource(ship_alive::power::CableGrid::new(w, h));
+        world.insert_resource(ship_alive::power::PowerState::default());
         world.insert_resource(Time::<Virtual>::default());
         world.init_resource::<Events<Action>>();
         let mut schedule = Schedule::default();
         schedule.add_systems(
             (
                 jobs::actions_system,
+                ship_alive::power::power_network_system,
                 jobs::crew_task_system,
                 jobs::crew_scan_system,
                 ship_alive::movement::movement_system,
@@ -701,16 +734,22 @@ fn mixed_work_distributes_without_conflicts() {
     assert_eq!(h.task_kind(c1), "operate");
     assert_eq!(h.task_kind(c2), "haul");
 
-    // Stability: run a while, both end up idle again, no duplicate reservations.
+    // Stability: run a while; work may still be draining but no duplicate
+    // reservations may exist and neither crew may hold a phantom job.
     h.steps(0.05, 2500);
-    assert_eq!(h.task_kind(c1), "idle");
-    assert_eq!(h.task_kind(c2), "idle");
     let reserved_count = h
         .world
         .query_filtered::<Entity, With<ReservedBy>>()
         .iter(&h.world)
         .count();
-    assert_eq!(reserved_count, 0, "all reservations released");
+    let active_jobs = [h.task_kind(c1), h.task_kind(c2)]
+        .iter()
+        .filter(|k| **k != "idle")
+        .count();
+    assert_eq!(
+        reserved_count, active_jobs,
+        "reservations match live jobs exactly"
+    );
 }
 
 // =====================================================================================

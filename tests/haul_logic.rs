@@ -57,9 +57,12 @@ impl Harness {
     fn new() -> Self {
         let mut world = World::new();
         let (map, _) = ShipMap::from_layout(&LAYOUT);
+        let (w, h) = (map.width, map.height);
         world.insert_resource(map);
         world.insert_resource(EventLog::default());
         world.insert_resource(ship_alive::stats::Stats::default());
+        world.insert_resource(ship_alive::power::CableGrid::new(w, h));
+        world.insert_resource(ship_alive::power::PowerState::default());
         world.insert_resource(Time::<Virtual>::default());
         world.init_resource::<Events<Action>>();
 
@@ -226,9 +229,12 @@ fn unreachable_item_gets_cooldown_not_reservation() {
     ];
     let mut world = World::new();
     let (map, _) = ShipMap::from_layout(&layout);
+    let (w, h) = (map.width, map.height);
     world.insert_resource(map);
     world.insert_resource(EventLog::default());
     world.insert_resource(ship_alive::stats::Stats::default());
+    world.insert_resource(ship_alive::power::CableGrid::new(w, h));
+    world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(Time::<Virtual>::default());
     world.init_resource::<Events<Action>>();
     let mut schedule = Schedule::default();

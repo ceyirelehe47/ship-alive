@@ -18,6 +18,7 @@ use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, Reserv
 use crate::jobs::Action;
 use crate::log::{EventLog, LogKind};
 use crate::map::TilePos;
+use crate::power::{PowerOverlay, PowerRole, PowerState, PowerStatus};
 use crate::storage::StorageCell;
 use crate::time_ctrl::GameSpeed;
 use bevy::prelude::*;
@@ -65,6 +66,8 @@ pub struct Hud {
     pub debug_button_label: Entity,
     pub tool_hint: Entity,
     pub tool_buttons: Vec<Entity>,
+    pub power_button_label: Entity,
+    pub power_line: Entity,
 }
 
 fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
@@ -113,6 +116,7 @@ impl Plugin for UiPlugin {
             (
                 button_system,
                 btn_label_system,
+                power_view_toggle_system,
                 debug_toggle_system,
                 (hud_update_system, selection_panel_system).chain(),
                 crate::ui_overlay::tooltip_system,
@@ -134,6 +138,8 @@ fn build_hud(mut commands: Commands) {
     let mut debug_button_label = Entity::PLACEHOLDER;
     let mut tool_hint = Entity::PLACEHOLDER;
     let mut tool_buttons = Vec::new();
+    let mut power_button_label = Entity::PLACEHOLDER;
+    let mut power_line = Entity::PLACEHOLDER;
     let mut pending_tool_btns: Vec<(Entity, Tool)> = Vec::new();
 
     commands
@@ -177,6 +183,27 @@ fn build_hud(mut commands: Commands) {
                     button(row, "Haul All [H]", Action::MarkAll, 96.0);
                     button(row, "Cancel All [C]", Action::CancelAll, 104.0);
 
+                    let power_btn = row
+                        .spawn((
+                            Button,
+                            Interaction::default(),
+                            OnPress(Action::TogglePowerView),
+                            Node {
+                                width: Val::Px(74.0),
+                                height: Val::Px(26.0),
+                                margin: UiRect::all(Val::Px(2.0)),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                ..default()
+                            },
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|b| {
+                            power_button_label = label(b, "Power [P]", 13.0, Color::WHITE);
+                        })
+                        .id();
+                    let _ = power_btn;
+
                     let debug_btn = row
                         .spawn((
                             Button,
@@ -219,6 +246,8 @@ fn build_hud(mut commands: Commands) {
                                 BuildingKind::Door => 56.0,
                                 BuildingKind::Wall => 56.0,
                                 BuildingKind::Rack => 96.0,
+                                BuildingKind::PowerCable => 96.0,
+                                BuildingKind::Reactor => 72.0,
                             },
                         );
                         pending_tool_btns.push((e, tool));
@@ -241,6 +270,14 @@ fn build_hud(mut commands: Commands) {
                     );
                     tool_hint = label(row, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
                 });
+
+                // Per-network power summary line (visible with the overlay).
+                power_line = label(
+                    bar,
+                    "",
+                    12.0,
+                    Color::srgb(0.62, 0.9, 0.8),
+                );
 
                 // Developer toolbar, hidden by default.
                 debug_row = bar
@@ -406,6 +443,8 @@ fn build_hud(mut commands: Commands) {
         debug_button_label,
         tool_hint,
         tool_buttons,
+        power_button_label,
+        power_line,
     });
     for (i, b) in speed_buttons.iter().enumerate() {
         commands.entity(*b).insert(SpeedIndex(i));
@@ -438,6 +477,40 @@ fn button_system(
         if *interaction == Interaction::Pressed {
             actions.write(on_press.0);
         }
+    }
+}
+
+/// Toggle the power overlay view (button + P hotkey).
+fn power_view_toggle_system(
+    mut events: EventReader<Action>,
+    mut overlay: ResMut<PowerOverlay>,
+    hud: Res<Hud>,
+    mut log: ResMut<EventLog>,
+    time: Res<Time<Virtual>>,
+    mut text_q: Query<&mut Text>,
+) {
+    let mut toggled = false;
+    for action in events.read() {
+        if matches!(action, Action::TogglePowerView) {
+            overlay.0 = !overlay.0;
+            toggled = true;
+        }
+    }
+    if !toggled {
+        return;
+    }
+    let now = time.elapsed().as_secs_f64();
+    log.push(
+        now,
+        LogKind::Info,
+        format!("Power view {}", if overlay.0 { "on" } else { "off" }),
+    );
+    if let Ok(mut text) = text_q.get_mut(hud.power_button_label) {
+        text.0 = if overlay.0 {
+            "Power ON".to_string()
+        } else {
+            "Power [P]".to_string()
+        };
     }
 }
 
@@ -641,6 +714,11 @@ enum SelSig {
         repeat: bool,
         ordered: bool,
     },
+    Generator {
+        e: Entity,
+        on: bool,
+        demo: bool,
+    },
 }
 
 fn prio_code(p: &crate::crew::WorkPriorities) -> [u8; 3] {
@@ -688,12 +766,21 @@ fn selection_panel_system(
         Entity,
         &TilePos,
         &crate::production::Fabricator,
+        &PowerStatus,
         Option<&MarkedForDeconstruct>,
     )>,
     buildings: Query<
         (Entity, &TilePos, &Building, Option<&MarkedForDeconstruct>),
         (With<Building>, Without<StorageCell>),
     >,
+    generators: Query<(
+        Entity,
+        &TilePos,
+        &PowerRole,
+        &PowerStatus,
+        Option<&MarkedForDeconstruct>,
+    )>,
+    power_state: Res<PowerState>,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
     mut btn_q: Query<
         (&Interaction, &mut BackgroundColor, &mut Visibility),
@@ -733,7 +820,13 @@ fn selection_panel_system(
             Err(_) => SelSig::None,
         },
         Some(Selected::Building(e)) => {
-            if let Ok((_, _, b, demo)) = buildings.get(e) {
+            if let Ok((_, _, role, _, demo)) = generators.get(e) {
+                SelSig::Generator {
+                    e,
+                    on: matches!(role, PowerRole::Generator { on: true, .. }),
+                    demo: demo.is_some(),
+                }
+            } else if let Ok((_, _, b, demo)) = buildings.get(e) {
                 SelSig::Building {
                     e,
                     kind: b.kind,
@@ -745,7 +838,7 @@ fn selection_panel_system(
                     demo: demo.is_some(),
                     allowed: cell.allowed,
                 }
-            } else if let Ok((_, _, f, demo)) = fabs.get(e) {
+            } else if let Ok((_, _, f, _, demo)) = fabs.get(e) {
                 SelSig::Fab {
                     e,
                     demo: demo.is_some(),
@@ -907,7 +1000,53 @@ fn selection_panel_system(
             }
         }
         Some(Selected::Building(e)) => {
-            if let Ok((_, pos, b, demo)) = buildings.get(e) {
+            if let Ok((_, pos, role, status, demo)) = generators.get(e) {
+                let PowerRole::Generator { output, on } = *role else {
+                    unreachable!("generators query filters by role")
+                };
+                lines.push((
+                    format!("Starter Reactor ({},{})", pos.x, pos.y),
+                    Color::srgb(0.6, 1.0, 0.75),
+                ));
+                lines.push((
+                    format!(
+                        "Output: {output} PU | Status: {} | Grid: {}",
+                        if on { "online" } else { "standby" },
+                        status.label(),
+                    ),
+                    if status.ok() && on {
+                        Color::srgb(0.55, 1.0, 0.65)
+                    } else {
+                        Color::srgb(1.0, 0.6, 0.45)
+                    },
+                ));
+                if let Some(net) = power_state.device_net.get(&e) {
+                    if let Some(info) = power_state.networks.get(*net) {
+                        lines.push((
+                            format!("Network {}: {}", net + 1, info.summary()),
+                            Color::WHITE,
+                        ));
+                        lines.push((
+                            format!("Status: {}", info.status_label()),
+                            if info.generation == 0 || info.demand > info.generation {
+                                Color::srgb(1.0, 0.6, 0.45)
+                            } else {
+                                Color::srgb(0.55, 1.0, 0.65)
+                            },
+                        ));
+                    }
+                }
+                if demo.is_some() {
+                    lines.push((
+                        "MARKED FOR DECONSTRUCTION".into(),
+                        Color::srgb(1.0, 0.7, 0.25),
+                    ));
+                }
+                lines.push((
+                    "Toggle the reactor below; inspect cables with Power [P].".to_string(),
+                    Color::srgb(0.6, 0.66, 0.72),
+                ));
+            } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 lines.push((
                     format!("{} ({},{})", b.kind.label(), pos.x, pos.y),
                     Color::srgb(0.85, 0.85, 0.9),
@@ -927,7 +1066,7 @@ fn selection_panel_system(
                         Color::srgb(0.6, 0.66, 0.72),
                     ));
                 }
-            } else if let Ok((_, pos, f, demo)) = fabs.get(e) {
+            } else if let Ok((_, pos, f, power, demo)) = fabs.get(e) {
                 let state = f.state();
                 lines.push((
                     format!("Fabricator ({},{})", pos.x, pos.y),
@@ -958,6 +1097,18 @@ fn selection_panel_system(
                     lines.push((
                         format!("Progress: {}%", (f.progress * 100.0) as u32),
                         Color::srgb(0.55, 1.0, 0.65),
+                    ));
+                }
+                if !power.ok() {
+                    lines.push((
+                        format!("POWER: {} — machine halted", power.label()),
+                        Color::srgb(1.0, 0.5, 0.4),
+                    ));
+                }
+                if !power.ok() {
+                    lines.push((
+                        format!("POWER: {} — machine halted", power.label()),
+                        Color::srgb(1.0, 0.5, 0.4),
                     ));
                 }
                 if demo.is_some() {
@@ -1063,6 +1214,25 @@ fn selection_panel_system(
                 }
                 v
             }
+            SelSig::Generator { e, on, demo } => {
+                let mut v = vec![BtnCfg::new(
+                    if *on { "Standby" } else { "Online" },
+                    Action::SetGeneratorOn { gen: *e, on: !*on },
+                )
+                .active(*on)];
+                if *demo {
+                    v.push(BtnCfg::new(
+                        "Cancel deconstruction",
+                        Action::UnmarkDeconstruct { building: *e },
+                    ));
+                } else {
+                    v.push(BtnCfg::new(
+                        "Deconstruct",
+                        Action::MarkDeconstruct { building: *e },
+                    ));
+                }
+                v
+            }
             SelSig::Blueprint { e } => vec![BtnCfg::new(
                 "Cancel blueprint (refund)",
                 Action::CancelBlueprint { blueprint: *e },
@@ -1155,6 +1325,8 @@ fn hud_update_system(
     stats: Res<crate::stats::Stats>,
     log: Res<EventLog>,
     build_mode: Res<BuildMode>,
+    power: Res<PowerOverlay>,
+    power_state: Res<PowerState>,
     mut speed_btn_q: Query<(&SpeedIndex, &Interaction, &mut BackgroundColor), With<SpeedIndex>>,
     mut tool_btn_q: Query<
         (&ToolIndex, &Interaction, &mut BackgroundColor),
@@ -1212,6 +1384,25 @@ fn hud_update_system(
             }
             None => String::new(),
         };
+    }
+
+    // ---- power network summary (power view) ----
+    if let Ok((mut text, _, _)) = texts.get_mut(hud.power_line) {
+        if power.0 {
+            if power_state.networks.is_empty() {
+                text.0 = "POWER: no networks".to_string();
+            } else {
+                let parts: Vec<String> = power_state
+                    .networks
+                    .iter()
+                    .enumerate()
+                    .map(|(i, net)| format!("NET {}: {}", i + 1, net.summary()))
+                    .collect();
+                text.0 = format!("POWER | {}", parts.join(" | "));
+            }
+        } else {
+            text.0 = String::new();
+        }
     }
 
     // ---- stats line ----

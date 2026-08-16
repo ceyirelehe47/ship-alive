@@ -17,6 +17,7 @@ fn main() {
         .add_plugins((
             setup::SetupPlugin,
             autotest::AutotestPlugin,
+            ship_alive::power::PowerPlugin,
             render::RenderPlugin,
             time_ctrl::TimeCtrlPlugin,
             input::InputPlugin,

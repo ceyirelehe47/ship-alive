@@ -8,11 +8,12 @@
 //! back to procedurally generated colored quads so the game stays playable
 //! before the art pass (see `Art::load`).
 
-use crate::building::{self, Blueprint, Building, BuildingKind, MarkedForDeconstruct};
+use crate::building::{self, Blueprint, Building, BuildingKind, Footprint, MarkedForDeconstruct};
 use crate::crew::{Crew, CrewTask, HaulDest, HaulPhase, Movement};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::map::{ShipMap, TilePos};
+use crate::power::{CableGrid, PowerOverlay, PowerRole, PowerState, PowerStatus};
 use crate::production::{MachineState, RECIPE};
 use crate::storage::StorageCell;
 use bevy::prelude::*;
@@ -50,6 +51,18 @@ pub struct Visual {
 #[derive(Component)]
 pub struct HasVisual;
 
+/// Tags the power overlay root entity.
+#[derive(Component)]
+pub struct PowerOverlayRoot;
+
+/// Power overlay rendering: one root entity whose children (cable tiles +
+/// device rings) are rebuilt whenever the grid or statuses change.
+#[derive(Resource)]
+pub struct PowerOverlayVis {
+    pub root: Entity,
+    pub last_sig: u64,
+}
+
 /// Persistent selection/path marker entities (pooled, hidden when unused).
 #[derive(Resource)]
 pub struct Markers {
@@ -71,6 +84,7 @@ pub struct Art {
     pub door: Handle<Image>,
     pub rack: Handle<Image>,
     pub fabricator: Handle<Image>,
+    pub reactor: Handle<Image>,
     pub crate_: Handle<Image>,
     pub ore: Handle<Image>,
     pub part: Handle<Image>,
@@ -94,6 +108,8 @@ impl Art {
             BuildingKind::Door => &self.door,
             BuildingKind::Rack => &self.rack,
             BuildingKind::Fabricator => &self.fabricator,
+            BuildingKind::Reactor => &self.reactor,
+            BuildingKind::PowerCable => &self.dot,
         }
     }
 
@@ -125,6 +141,7 @@ impl Art {
             door: fill("art/door.png", [96, 148, 178, 255]),
             rack: fill("art/rack.png", [58, 118, 118, 255]),
             fabricator: fill("art/fabricator.png", [112, 122, 146, 255]),
+            reactor: fill("art/reactor.png", [92, 168, 110, 255]),
             crate_: fill("art/crate.png", [198, 166, 112, 255]),
             ore: fill("art/ore.png", [150, 92, 62, 255]),
             part: fill("art/part.png", [134, 134, 172, 255]),
@@ -173,6 +190,7 @@ impl Plugin for RenderPlugin {
                 sync_building_visuals_system,
                 sync_selection_system,
                 ghost_system,
+                power_overlay_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -320,6 +338,9 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
             Visibility::Hidden,
         ))
         .id();
+    let power_root = commands
+        .spawn((PowerOverlayRoot, Transform::default(), Visibility::Hidden))
+        .id();
     commands.insert_resource(Markers {
         selection,
         hover,
@@ -327,6 +348,10 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
         dots,
         ghost,
         ghost_label,
+    });
+    commands.insert_resource(PowerOverlayVis {
+        root: power_root,
+        last_sig: 0,
     });
 }
 
@@ -476,7 +501,7 @@ fn ensure_visuals_system(
             },
             sprite(art.building(b.kind).clone(), size, 0.15, p, Color::WHITE),
         ));
-        if b.kind == BuildingKind::Fabricator {
+        if b.kind == BuildingKind::Fabricator || b.kind == BuildingKind::Reactor {
             commands.spawn((
                 Visual {
                     target: e,
@@ -668,7 +693,12 @@ fn sync_rack_labels_system(
 fn sync_building_visuals_system(
     blueprints: Query<(Entity, &Blueprint), Changed<Blueprint>>,
     buildings: Query<(Entity, &Building, Option<&MarkedForDeconstruct>), Changed<Building>>,
-    fabs: Query<(Entity, &crate::production::Fabricator), Changed<crate::production::Fabricator>>,
+    fabs: Query<(
+        Entity,
+        &crate::production::Fabricator,
+        &crate::power::PowerStatus,
+    )>,
+    generators: Query<(Entity, &crate::power::PowerRole, &crate::power::PowerStatus)>,
     mut sprites: Query<(&Visual, &mut Sprite), Without<Text2d>>,
     mut labels: Query<(&Visual, &mut Text2d, &mut TextColor)>,
 ) {
@@ -695,26 +725,44 @@ fn sync_building_visuals_system(
             }
         }
     }
-    for (e, f) in fabs.iter() {
+    // Fabricators: machine state, with power problems overriding the look so
+    // an unpowered machine reads as such in the normal view too.
+    for (e, f, power) in fabs.iter() {
         let state = f.state();
-        let (ring, text) = match state {
-            MachineState::NoOrder => (Color::srgba(0.6, 0.65, 0.7, 0.35), "no order".to_string()),
-            MachineState::WaitingInput => (
-                Color::srgba(1.0, 0.75, 0.25, 0.6),
-                format!("need {} ore", RECIPE.in_qty),
-            ),
-            MachineState::WaitingWorker => (
-                Color::srgba(0.35, 0.75, 1.0, 0.6),
-                "waiting for worker".to_string(),
-            ),
-            MachineState::Working => (
-                Color::srgba(0.35, 1.0, 0.5, 0.7),
-                format!("working {}%", (f.progress * 100.0) as u32),
-            ),
-            MachineState::OutputBlocked => (
-                Color::srgba(1.0, 0.35, 0.3, 0.7),
-                "output blocked".to_string(),
-            ),
+        let (ring, text, text_color) = if !power.ok() {
+            (
+                crate::power::PowerStatus::color(*power),
+                format!("NO POWER — {}", power.label()),
+                Color::srgb(1.0, 0.55, 0.45),
+            )
+        } else {
+            match state {
+                MachineState::NoOrder => (
+                    Color::srgba(0.6, 0.65, 0.7, 0.35),
+                    "no order".to_string(),
+                    Color::WHITE,
+                ),
+                MachineState::WaitingInput => (
+                    Color::srgba(1.0, 0.75, 0.25, 0.6),
+                    format!("need {} ore", RECIPE.in_qty),
+                    Color::WHITE,
+                ),
+                MachineState::WaitingWorker => (
+                    Color::srgba(0.35, 0.75, 1.0, 0.6),
+                    "waiting for worker".to_string(),
+                    Color::WHITE,
+                ),
+                MachineState::Working => (
+                    Color::srgba(0.35, 1.0, 0.5, 0.7),
+                    format!("working {}%", (f.progress * 100.0) as u32),
+                    Color::srgb(0.55, 1.0, 0.65),
+                ),
+                MachineState::OutputBlocked => (
+                    Color::srgba(1.0, 0.35, 0.3, 0.7),
+                    "output blocked".to_string(),
+                    Color::srgb(1.0, 0.5, 0.4),
+                ),
+            }
         };
         for (v, mut sprite) in sprites.iter_mut() {
             if v.target == e && v.role == Role::FabRing {
@@ -724,13 +772,133 @@ fn sync_building_visuals_system(
         for (v, mut t, mut c) in labels.iter_mut() {
             if v.target == e && v.role == Role::FabLabel {
                 t.0 = text.clone();
-                c.0 = match state {
-                    MachineState::Working => Color::srgb(0.55, 1.0, 0.65),
-                    MachineState::OutputBlocked => Color::srgb(1.0, 0.55, 0.45),
-                    _ => Color::WHITE,
-                };
+                c.0 = text_color;
             }
         }
+    }
+    // Reactors: online / standby / unconnected.
+    for (e, role, status) in generators.iter() {
+        let PowerRole::Generator { output, on } = *role else {
+            continue;
+        };
+        let (ring, text) = if !status.ok() {
+            (
+                crate::power::PowerStatus::color(*status),
+                format!("REACTOR — {}", status.label()),
+            )
+        } else if on {
+            (
+                Color::srgba(0.35, 1.0, 0.55, 0.8),
+                format!("reactor {output} PU"),
+            )
+        } else {
+            (
+                Color::srgba(0.75, 0.75, 0.8, 0.6),
+                "reactor standby".to_string(),
+            )
+        };
+        for (v, mut sprite) in sprites.iter_mut() {
+            if v.target == e && v.role == Role::FabRing {
+                sprite.color = ring;
+            }
+        }
+        for (v, mut t, _) in labels.iter_mut() {
+            if v.target == e && v.role == Role::FabLabel {
+                t.0 = text.clone();
+            }
+        }
+    }
+}
+
+/// Power overlay: cable tiles colored per network, device rings by supply
+/// status, rebuilt when (grid version, network states, device statuses)
+/// change. Hidden entirely while the overlay is off.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn power_overlay_system(
+    mut commands: Commands,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    cables: Res<CableGrid>,
+    state: Res<PowerState>,
+    overlay: Res<PowerOverlay>,
+    mut vis: ResMut<PowerOverlayVis>,
+    devices: Query<(&Footprint, &PowerRole, &PowerStatus)>,
+    mut root_q: Query<&mut Visibility, With<PowerOverlayRoot>>,
+    children_q: Query<&Children>,
+) {
+    // Signature: anything that changes what the overlay should draw.
+    let mut sig = if overlay.0 { cables.version } else { 0 };
+    if overlay.0 {
+        for n in &state.networks {
+            sig = sig
+                .wrapping_mul(31)
+                .wrapping_add(n.generation as u64)
+                .wrapping_add((n.demand as u64) << 8)
+                .wrapping_add(n.generators as u64);
+        }
+        for (_, _, st) in devices.iter() {
+            sig = sig.wrapping_mul(7).wrapping_add(*st as u64 + 1);
+        }
+    }
+    if sig == vis.last_sig {
+        return;
+    }
+    vis.last_sig = sig;
+    if let Ok(children) = children_q.get(vis.root) {
+        for &c in children {
+            commands.entity(c).despawn();
+        }
+    }
+    if !overlay.0 {
+        if let Ok(mut v) = root_q.get_mut(vis.root) {
+            *v = Visibility::Hidden;
+        }
+        return;
+    }
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        *v = Visibility::Visible;
+    }
+    let region_of = crate::power::flood_regions(&cables);
+    // Distinct hue per network; dim red when the network has no generator.
+    let net_color = |net: usize| -> Color {
+        let powered = state.networks.get(net).is_some_and(|n| n.generators > 0);
+        if powered {
+            Color::hsl((net as f32 * 47.0) % 360.0, 0.75, 0.6)
+        } else {
+            Color::srgba(0.85, 0.3, 0.25, 0.85)
+        }
+    };
+    for tile in cables.iter_cables() {
+        let color = region_of
+            .get(&tile)
+            .map(|n| net_color(*n))
+            .unwrap_or_else(|| Color::WHITE);
+        commands
+            .spawn((
+                Sprite {
+                    image: art.dot.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * 0.55)),
+                    color,
+                    ..default()
+                },
+                Transform::from_translation(map.world_pos(tile).extend(0.72)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+    for (foot, _, status) in devices.iter() {
+        let p = foot_world_pos(foot);
+        commands
+            .spawn((
+                Sprite {
+                    image: art.ring.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * foot.w.max(foot.h) as f32 * 1.08)),
+                    color: PowerStatus::color(*status),
+                    ..default()
+                },
+                Transform::from_translation(p.extend(0.93)),
+            ))
+            .insert(ChildOf(vis.root));
     }
 }
 
@@ -870,6 +1038,7 @@ fn sync_selection_system(
 fn ghost_system(
     map: Res<ShipMap>,
     art: Res<Art>,
+    cables: Res<CableGrid>,
     build_mode: Res<BuildMode>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -925,7 +1094,7 @@ fn ghost_system(
             let mut feet: Vec<(building::Footprint, bool)> =
                 blueprints.iter().map(|(_, f)| (*f, true)).collect();
             feet.extend(buildings.iter().map(|(_, f)| (*f, false)));
-            let check = building::can_place(&map, kind, tile, &ground, &feet);
+            let check = building::can_place(&map, kind, tile, &ground, &feet, |p| cables.has(p));
             let (color, text) = match &check {
                 Ok(()) => {
                     let cost: u32 = d.cost.iter().sum();

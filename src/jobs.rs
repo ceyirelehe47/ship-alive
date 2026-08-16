@@ -17,6 +17,7 @@ use crate::crew::{
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::log::{EventLog, LogKind};
 use crate::map::{find_drop_tile, ShipMap, TilePos};
+use crate::power::{CableGrid, PowerRole, PowerStatus};
 use crate::production::Fabricator;
 use crate::storage::StorageCell;
 use bevy::prelude::*;
@@ -73,6 +74,14 @@ pub enum Action {
     },
     /// UI-only: select a build tool (consumed by the input plugin).
     SetTool { tool: Option<crate::input::Tool> },
+    // ---- Slice 2: power --------------------------------------------------
+    /// UI-only: show/hide the power overlay (consumed by the UI plugin).
+    TogglePowerView,
+    /// Turn a reactor on or off.
+    SetGeneratorOn { gen: Entity, on: bool },
+    /// Mark an underfloor cable tile for deconstruction (spawns the
+    /// transient tile entity the work system tears down).
+    MarkCableDeconstruct { pos: TilePos },
 }
 
 pub struct JobsPlugin;
@@ -83,7 +92,12 @@ impl Plugin for JobsPlugin {
         app.init_resource::<crate::stats::Stats>();
         app.add_systems(
             Update,
-            (actions_system, crew_task_system, crew_scan_system)
+            (
+                actions_system,
+                crate::power::power_network_system,
+                crew_task_system,
+                crew_scan_system,
+            )
                 .chain()
                 .in_set(crate::Set::Jobs),
         );
@@ -111,6 +125,9 @@ pub fn actions_system(
     buildings: Query<(Entity, &Footprint), (With<Building>, Without<Blueprint>)>,
     mut racks: Query<(Entity, &TilePos, &mut StorageCell), Without<Crew>>,
     mut fabs: Query<(Entity, &mut Fabricator), Without<Crew>>,
+    mut gens: Query<(Entity, &mut PowerRole)>,
+    cables: Res<CableGrid>,
+    cable_tiles: Query<(Entity, &TilePos), (With<Building>, With<MarkedForDeconstruct>)>,
 ) {
     let now = time.elapsed().as_secs_f64();
     let racks_list: Vec<(TilePos, Entity)> = rack_tiles
@@ -241,7 +258,7 @@ pub fn actions_system(
                 let mut feet: Vec<(Footprint, bool)> =
                     blueprints.iter().map(|(_, f, _)| (*f, true)).collect();
                 feet.extend(buildings.iter().map(|(_, f)| (*f, false)));
-                match building::can_place(&map, kind, pos, &ground, &feet) {
+                match building::can_place(&map, kind, pos, &ground, &feet, |p| cables.has(p)) {
                     Ok(()) => {
                         building::spawn_blueprint(&mut commands, kind, pos);
                         log.push(
@@ -375,6 +392,50 @@ pub fn actions_system(
                         );
                     }
                 }
+            }
+            Action::SetGeneratorOn { gen, on } => {
+                if let Ok((_, mut role)) = gens.get_mut(gen) {
+                    if let PowerRole::Generator {
+                        on: ref mut cur, ..
+                    } = *role
+                    {
+                        *cur = on;
+                        log.push(
+                            now,
+                            LogKind::Info,
+                            format!("Reactor {}", if on { "online" } else { "standby" }),
+                        );
+                    }
+                }
+            }
+            Action::MarkCableDeconstruct { pos } => {
+                if !cables.has(pos) {
+                    log.push(now, LogKind::Fail, "No cable there");
+                } else if cable_tiles.iter().any(|(_, p)| *p == pos) {
+                    // Already marked.
+                } else {
+                    let e = commands
+                        .spawn((
+                            TilePos::new(pos.x, pos.y),
+                            Footprint::new(pos.x, pos.y, 1, 1),
+                            Building {
+                                kind: BuildingKind::PowerCable,
+                                foot: Footprint::new(pos.x, pos.y, 1, 1),
+                                demo_progress: 0.0,
+                            },
+                            MarkedForDeconstruct,
+                        ))
+                        .id();
+                    let _ = e;
+                    log.push(
+                        now,
+                        LogKind::Info,
+                        format!("Cable at ({},{}) marked for removal", pos.x, pos.y),
+                    );
+                }
+            }
+            Action::TogglePowerView => {
+                // Consumed by the UI plugin.
             }
             Action::SetSpeed { .. } => {
                 // Consumed by time_ctrl::speed_action_system.
@@ -672,6 +733,7 @@ fn end_work(
 #[allow(clippy::too_many_arguments)]
 pub fn crew_task_system(
     mut map: ResMut<ShipMap>,
+    mut cables: ResMut<CableGrid>,
     time: Res<Time<Virtual>>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
@@ -708,7 +770,10 @@ pub fn crew_task_system(
         ),
         (Without<Crew>, Without<Blueprint>),
     >,
-    mut fabs: Query<(Entity, &Footprint, &mut Fabricator), (Without<Crew>, Without<Blueprint>)>,
+    mut fabs: Query<
+        (Entity, &Footprint, &mut Fabricator, &PowerStatus),
+        (Without<Crew>, Without<Blueprint>),
+    >,
 ) {
     let dt = time.delta().as_secs_f32();
     let now = time.elapsed().as_secs_f64();
@@ -735,8 +800,12 @@ pub fn crew_task_system(
                 continue;
             };
             // Player-marked storage hauls die when the mark is removed; auto
-            // hauls (blueprint/machine supply) have no mark to lose.
-            let needs_mark = matches!(job.dest, HaulDest::Storage);
+            // hauls (blueprint/machine supply) have no mark to lose. An item
+            // already in THIS crew's hands stays committed to its delivery
+            // even without a mark — otherwise mid-flight conversions
+            // (blueprint full → deliver to storage instead) would cancel
+            // without dropping and leak the item in "carried" limbo forever.
+            let needs_mark = matches!(job.dest, HaulDest::Storage) && carried.is_none();
             if needs_mark && marked.is_none() {
                 let name = crew.name.clone();
                 commands.entity(item_entity).remove::<ReservedBy>();
@@ -874,7 +943,7 @@ pub fn crew_task_system(
                                     }
                                 }
                                 HaulDest::Machine(fab_e) => {
-                                    let ok = fabs.get(*fab_e).ok().and_then(|(_, foot, _)| {
+                                    let ok = fabs.get(*fab_e).ok().and_then(|(_, foot, _, _)| {
                                         building::path_to_interaction(&map, *pos, foot)
                                     });
                                     match ok {
@@ -1040,7 +1109,7 @@ pub fn crew_task_system(
                         }
                     }
                     HaulDest::Machine(fab_e) => {
-                        let Ok((_, foot, _)) = fabs.get(fab_e) else {
+                        let Ok((_, foot, _, _)) = fabs.get(fab_e) else {
                             job.dest = HaulDest::Storage;
                             job.target_rack = None;
                             continue;
@@ -1127,7 +1196,7 @@ pub fn crew_task_system(
                                 }
                             }
                             HaulDest::Machine(fab_e) => {
-                                if let Ok((_, _, mut f)) = fabs.get_mut(fab_e) {
+                                if let Ok((_, _, mut f, _)) = fabs.get_mut(fab_e) {
                                     f.input[item.kind.index()] += 1;
                                     crew.delivered += 1;
                                     let name = crew.name.clone();
@@ -1204,6 +1273,7 @@ pub fn crew_task_system(
                         building::complete_building(
                             &mut commands,
                             &mut map,
+                            &mut cables,
                             job.target,
                             &bp,
                             &crew_positions,
@@ -1291,6 +1361,7 @@ pub fn crew_task_system(
                         building::complete_deconstruction(
                             &mut commands,
                             &mut map,
+                            &mut cables,
                             job.target,
                             &b,
                             rack_contents,
@@ -1310,7 +1381,7 @@ pub fn crew_task_system(
 
         // ---- operate ---------------------------------------------------------
         if let CrewTask::Operate(job) = &mut *task {
-            let Ok((_, foot, mut f)) = fabs.get_mut(job.target) else {
+            let Ok((_, foot, mut f, power)) = fabs.get_mut(job.target) else {
                 let name = crew.name.clone();
                 *task = CrewTask::Idle(IdleCause::JobCanceled {
                     detail: "machine gone".into(),
@@ -1324,8 +1395,8 @@ pub fn crew_task_system(
             let phase = job.phase;
             match phase {
                 WorkPhase::Going => {
-                    // The order may have been cleared while walking over.
-                    if !f.ready_to_work() {
+                    // The order may have been cleared or power lost on the way.
+                    if !f.ready_to_work() || !power.ok() {
                         let name = crew.name.clone();
                         let target = job.target;
                         end_work(
@@ -1368,6 +1439,24 @@ pub fn crew_task_system(
                     }
                 }
                 WorkPhase::Working => {
+                    if !power.ok() {
+                        // Power lost mid-cycle: abort without consuming ore.
+                        f.abort_cycle();
+                        let name = crew.name.clone();
+                        let target = job.target;
+                        end_work(
+                            &mut commands,
+                            &mut task,
+                            &mut mov,
+                            target,
+                            &mut log,
+                            now,
+                            &name,
+                            "power lost",
+                        );
+                        crew.next_scan = now + 0.3;
+                        continue;
+                    }
                     if !f.active || !at_interaction(&map, *pos, &foot) {
                         // Someone cleared the order or we got displaced.
                         f.abort_cycle();
@@ -1553,7 +1642,13 @@ pub fn crew_scan_system(
         (With<Building>, Without<Crew>),
     >,
     mut fabs: Query<
-        (Entity, &Footprint, &mut Fabricator, Option<&ReservedBy>),
+        (
+            Entity,
+            &Footprint,
+            &mut Fabricator,
+            Option<&ReservedBy>,
+            &PowerStatus,
+        ),
         (Without<Crew>, Without<Blueprint>),
     >,
 ) {
@@ -1663,7 +1758,7 @@ pub fn crew_scan_system(
                 }
             }
             // (c) fabricator input demands.
-            for (e, _, f, _) in fabs.iter() {
+            for (e, _, f, _, _) in fabs.iter() {
                 let in_kind = crate::production::RECIPE.in_kind;
                 let want = f.input_want(inbound.get(&(e, in_kind.index())).copied().unwrap_or(0));
                 if want > 0 {
@@ -1685,7 +1780,7 @@ pub fn crew_scan_system(
                 }
             }
             // (d) fabricator output → nearest accepting rack.
-            for (e, foot, f, _) in fabs.iter() {
+            for (e, foot, f, _, _) in fabs.iter() {
                 for kind in ItemKind::ALL {
                     if f.output[kind.index()] == 0 {
                         continue;
@@ -1726,8 +1821,8 @@ pub fn crew_scan_system(
 
         // ---- operate candidates ----------------------------------------------
         if operate_prio != Priority::Disabled {
-            for (e, foot, f, res) in fabs.iter() {
-                if f.ready_to_work() && res.is_none() && !local_claims.contains(&e) {
+            for (e, foot, f, res, power) in fabs.iter() {
+                if f.ready_to_work() && power.ok() && res.is_none() && !local_claims.contains(&e) {
                     candidates.push(Candidate {
                         prio: operate_prio,
                         dist: foot.distance_to(*pos),
@@ -1740,7 +1835,7 @@ pub fn crew_scan_system(
         if candidates.is_empty() && std::env::var("SLICE0_SCAN_DEBUG").is_ok() {
             let fab_info: Vec<String> = fabs
                 .iter()
-                .map(|(e, _, f, _)| format!("e={e:?} want={}", f.input_want(0)))
+                .map(|(e, _, f, _, _)| format!("e={e:?} want={}", f.input_want(0)))
                 .collect();
             let unmarked_ground: Vec<&TilePos> = items
                 .iter()
@@ -1791,6 +1886,11 @@ pub fn crew_scan_system(
                     let Ok((_, item_pos, it, _, _, _cooled, _)) = items.get(item) else {
                         continue;
                     };
+                    let bp_lookup = |e: Entity| blueprints.get(e).ok().map(|(_, f, _, _)| *f);
+                    let fab_lookup = |e: Entity| fabs.get(e).ok().map(|(_, f, ..)| *f);
+                    if !dest_reachable(&map, *item_pos, dest, bp_lookup, fab_lookup) {
+                        continue;
+                    }
                     match crate::path::find_path(&map, *pos, *item_pos, |_| false) {
                         Some(path) => {
                             commands.entity(item).insert(ReservedBy(crew_e));
@@ -1845,6 +1945,13 @@ pub fn crew_scan_system(
                         continue;
                     }
                     let rack_pos = *rack_pos;
+                    let bp_lookup = |e: Entity| blueprints.get(e).ok().map(|(_, f, _, _)| *f);
+                    let fab_lookup = |e: Entity| fabs.get(e).ok().map(|(_, f, ..)| *f);
+                    if !dest_reachable(&map, rack_pos, dest, bp_lookup, fab_lookup) {
+                        // Unreachable consumer: put the unit back, no claim.
+                        cell.counts[kind.index()] += 1;
+                        continue;
+                    }
                     match crate::path::find_path(&map, *pos, rack_pos, |_| false) {
                         Some(path) => {
                             let item = crate::items::spawn_item(&mut commands, rack_pos, kind);
@@ -1876,7 +1983,7 @@ pub fn crew_scan_system(
                     }
                 }
                 Cand::MachineOut { fab, kind } => {
-                    let Ok((_, foot, mut f, _)) = fabs.get_mut(fab) else {
+                    let Ok((_, foot, mut f, _, _)) = fabs.get_mut(fab) else {
                         continue;
                     };
                     if f.output[kind.index()] == 0 {
@@ -1970,7 +2077,7 @@ pub fn crew_scan_system(
                     claimed = true;
                 }
                 Cand::Operate { fab } => {
-                    let Ok((_, foot, _, _)) = fabs.get(fab) else {
+                    let Ok((_, foot, _, _, _)) = fabs.get(fab) else {
                         continue;
                     };
                     let Some(path) = building::path_to_interaction(&map, *pos, foot) else {
@@ -2012,6 +2119,27 @@ pub fn crew_scan_system(
             *task = CrewTask::Idle(cause);
             crew.next_scan = now + 1.0;
         }
+    }
+}
+
+/// Can a hauler standing at `from` actually reach the destination's
+/// interaction tiles? Validated at claim time so an unreachable consumer
+/// (e.g. a blueprint sealed behind walls) never attracts pulls — otherwise
+/// supply hauls would fetch from a rack, fail at pickup, convert to storage
+/// and repeat forever (the "storage pump" loop observed in scenario F).
+fn dest_reachable(
+    map: &ShipMap,
+    from: TilePos,
+    dest: HaulDest,
+    bp_foot: impl Fn(Entity) -> Option<Footprint>,
+    machine_foot: impl Fn(Entity) -> Option<Footprint>,
+) -> bool {
+    match dest {
+        HaulDest::Storage => true, // validated at pickup via choose_rack
+        HaulDest::Blueprint(bp_e) => bp_foot(bp_e)
+            .is_some_and(|foot| crate::building::path_to_interaction(map, from, &foot).is_some()),
+        HaulDest::Machine(m) => machine_foot(m)
+            .is_some_and(|foot| crate::building::path_to_interaction(map, from, &foot).is_some()),
     }
 }
 

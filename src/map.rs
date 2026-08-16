@@ -14,12 +14,18 @@ use bevy::prelude::*;
 ///  `S` storage rack    `C` crew spawn
 ///  `P` parts rack (4 machinery parts)   `O` ore rack (4 asteroid ore)
 ///  `F` fabricator origin (2x2 machine — all four tiles carry the char)
+///  `R` reactor origin (2x2 machine — all four tiles carry the char)
+///  `c` underfloor power cable
 ///  `1` crate item      `2` ore item      `3` machinery part item
 ///  `X` item inside a sealed pocket (permanently unreachable — scenario C)
 ///
 /// Slice 1 layout notes: the ore bay (top right) and the storage racks
 /// (bottom right) are deliberately far from the fabricator (FABRICATION,
 /// bottom middle) so a bad supply layout is visible and worth optimizing.
+///
+/// Slice 2 notes: a Starter Reactor sits in FABRICATION's bottom-left corner
+/// feeding a short pre-wired cable run to the fabricator — a working ship on
+/// day one with plenty of room to rewire.
 pub const MAP_LAYOUT: [&str; 19] = [
     "####################################",
     "#.3..1.....#..........#...2...2....#",
@@ -35,10 +41,10 @@ pub const MAP_LAYOUT: [&str; 19] = [
     "#..........#..........#....SPS.....#",
     "#..........#...FF.....#............#",
     "#..3.......#...FF.....#....SO......#",
-    "#....3.3...#..........#....SO......#",
-    "#.###......#..........#............#",
-    "#.#X#......#.3........#............#",
-    "#.###......#..........#............#",
+    "#....3.3...#...c......#....SO......#",
+    "#.###......#3..c......#............#",
+    "#.#X#......#RRcc......#............#",
+    "#.###......#RR........#............#",
     "####################################",
 ];
 
@@ -106,6 +112,23 @@ impl ShipMap {
                             fab_origins.push((x as i32, y as i32));
                             spawns.push(SpawnReq::Fabricator { pos });
                         }
+                    }
+                    'R' => {
+                        tiles.push(Tile::Machine);
+                        let covered = fab_origins.iter().any(|&(ox, oy)| {
+                            x as i32 >= ox
+                                && x as i32 <= ox + 1
+                                && y as i32 >= oy
+                                && y as i32 <= oy + 1
+                        });
+                        if !covered {
+                            fab_origins.push((x as i32, y as i32));
+                            spawns.push(SpawnReq::Reactor { pos });
+                        }
+                    }
+                    'c' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Cable { pos });
                     }
                     '.' | 'C' | 'S' | 'P' | 'O' | 'X' => tiles.push(Tile::Floor),
                     d @ ('1' | '2' | '3') => {
@@ -212,6 +235,14 @@ pub enum SpawnReq {
     Fabricator {
         pos: TilePos,
     },
+    /// 2x2 starter reactor with its top-left tile at `pos`.
+    Reactor {
+        pos: TilePos,
+    },
+    /// Underfloor power cable on this tile.
+    Cable {
+        pos: TilePos,
+    },
     Item {
         pos: TilePos,
         kind: crate::items::ItemKind,
@@ -305,6 +336,20 @@ mod tests {
                 .filter(|s| matches!(s, SpawnReq::Fabricator { .. }))
                 .count(),
             1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Reactor { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Cable { .. }))
+                .count(),
+            4
         );
         assert_eq!(
             spawns

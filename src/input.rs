@@ -13,6 +13,7 @@
 use crate::building::{Blueprint, Building, BuildingKind, MarkedForDeconstruct};
 use crate::jobs::Action;
 use crate::map::{ShipMap, TilePos};
+use crate::power::CableGrid;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
@@ -155,12 +156,34 @@ fn select_and_box_system(
     >,
     mut selection: ResMut<Selection>,
     build_mode: Res<BuildMode>,
+    cables: Res<CableGrid>,
     mut box_select: ResMut<BoxSelect>,
     mut actions: EventWriter<Action>,
+    mut last_paint: Local<Option<TilePos>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
     };
+
+    // Cable drag-paint: hold the left button and sweep tiles to lay cable
+    // blueprints along the way (click also works: the press frame paints).
+    if let Some(Tool::Build(BuildingKind::PowerCable)) = build_mode.0 {
+        if !pointer_over_ui(&ui) && buttons.pressed(MouseButton::Left) {
+            if let Some(tile) = cursor_tile(window, &camera, &map) {
+                if *last_paint != Some(tile) {
+                    *last_paint = Some(tile);
+                    actions.write(Action::PlaceBlueprint {
+                        kind: BuildingKind::PowerCable,
+                        pos: tile,
+                    });
+                }
+            }
+        } else {
+            *last_paint = None;
+        }
+    } else {
+        *last_paint = None;
+    }
 
     if buttons.just_pressed(MouseButton::Left) {
         box_select.anchor = window.cursor_position();
@@ -178,6 +201,9 @@ fn select_and_box_system(
                 // Plain click: tool action, or select.
                 if let Some(tool) = build_mode.0 {
                     match tool {
+                        Tool::Build(BuildingKind::PowerCable) => {
+                            // Handled by drag-paint on the press frame.
+                        }
                         Tool::Build(kind) => {
                             if let Some(tile) = cursor_tile(window, &camera, &map) {
                                 actions.write(Action::PlaceBlueprint { kind, pos: tile });
@@ -202,6 +228,12 @@ fn select_and_box_system(
                                     actions.write(Action::UnmarkDeconstruct { building: e });
                                 } else {
                                     actions.write(Action::MarkDeconstruct { building: e });
+                                }
+                            } else if let Some(tile) = cursor_tile(window, &camera, &map) {
+                                // No floor-side building: mark the underfloor
+                                // cable instead (visible in the power overlay).
+                                if cables.has(tile) {
+                                    actions.write(Action::MarkCableDeconstruct { pos: tile });
                                 }
                             }
                         }
@@ -307,6 +339,9 @@ fn action_keys_system(
     if keys.just_pressed(KeyCode::KeyH) {
         actions.write(Action::MarkAll);
     }
+    if keys.just_pressed(KeyCode::KeyP) {
+        actions.write(Action::TogglePowerView);
+    }
     if keys.just_pressed(KeyCode::KeyC) {
         actions.write(Action::CancelAll);
     }
@@ -322,7 +357,11 @@ fn action_keys_system(
             Some(Tool::Build(BuildingKind::Wall)) => Some(Tool::Build(BuildingKind::Door)),
             Some(Tool::Build(BuildingKind::Door)) => Some(Tool::Build(BuildingKind::Rack)),
             Some(Tool::Build(BuildingKind::Rack)) => Some(Tool::Build(BuildingKind::Fabricator)),
-            Some(Tool::Build(BuildingKind::Fabricator)) => Some(Tool::Deconstruct),
+            Some(Tool::Build(BuildingKind::Fabricator)) => {
+                Some(Tool::Build(BuildingKind::PowerCable))
+            }
+            Some(Tool::Build(BuildingKind::PowerCable)) => Some(Tool::Build(BuildingKind::Reactor)),
+            Some(Tool::Build(BuildingKind::Reactor)) => Some(Tool::Deconstruct),
             Some(Tool::Deconstruct) => None,
         };
         actions.write(Action::SetTool { tool: next });

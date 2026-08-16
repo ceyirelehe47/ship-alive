@@ -111,11 +111,31 @@ SLICE0_SCENARIO=A cargo run   # …依次到 L；输出 SCENARIO_RESULT 摘要�
 SLICE0_SCENARIO=P1 cargo run  # 试玩1脚本：建 Rack/墙/门、取消蓝图、拆除重建
 SLICE0_SCENARIO=P2 cargo run  # 试玩2脚本：配置原料/成品架 + 生产订单
 SLICE0_SCENARIO=M cargo run   # 试玩3脚本：差布局 → 改造（近距矿架）→ 吞吐对比
+SLICE2_SCENARIO=A..J cargo run  # 电力验收：健康网/断线/分割/重接/停堆/过载/建/拆/倍速/回归
+SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全程
 ```
+
+## Slice 2 新玩法：电力（Power）
+
+- **开局即通电**：FABRICATION 左下角的 Starter Reactor（绿环、`reactor 100 PU`）
+  通过预铺电缆给初始 Fabricator 供电。
+- **`P` / 顶栏 Power 按钮**开关电力视图：电缆按网络着色（无源网络暗红）、
+  设备周围供电状态环（绿=有电 / 红=无源 / 黄=过载 / 灰=未接线）、
+  顶栏网络摘要 `POWER | NET 1: gen 100 dem 20 … headroom 80`。
+- **建造电力设施**：BUILD 栏 `Power Cable`（选中后**按住左键拖画**整条线，绿/红 ghost），
+  `Reactor`（2×2、8 零件）。电缆走地板下：不占地、可穿内墙/机器/门，只有船壳边框禁铺。
+- **拆除**：Deconstruct 工具点电缆格（电力视图下最直观）→ 黄框 → 船员 1 秒拆除。
+- **断电表现**：Fabricator 头顶 `NO POWER — no cable/no generator/power shortage` + 红环；
+  选中面板显示原因与所在网络状态；恢复供电后自动安全复产（材料不丢不复制）。
+- **过载**：同一网络需求 > 发电时**最新设备先被卸载**（先建先得，无随机抖动）。
+  一台 Reactor 带 5 台满载 Fabricator；第 6 台起需要分网或加堆。
+- **封门警告**：把 2×2 机器建在房间唯一门口会静默封死整个房间
+  （里面的蓝图将无人供料 — 这是真实拓扑行为，拆掉机器即恢复）。
 
 ## 开发者工具
 
 - 顶栏 **Debug** 开关（默认折叠）：+Crate / +Ore / +Part 生成、`X` 删除选中物品。
 - `SLICE0_TRACE=1 SLICE0_SCENARIO=... cargo run`：每 2 秒打印船员轨迹。
 - `SLICE0_SCAN_DEBUG=1 ...`：打印工作扫描/任务内部状态（诊断用）。
-- `cargo test`：44 个单元/集成测试。
+- `SLICE0_SHOT=<frame>[:<path>] cargo run`：引擎内截图（无窗口抓屏的可靠替代）。
+- `cargo test`：64 个单元/集成测试。

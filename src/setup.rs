@@ -1,15 +1,17 @@
 //! Bootstraps the world from the hand-authored ship layout: map resource,
-//! camera, crew, racks, fabricator and ground items.
+//! camera, crew, racks, fabricator, reactor, underfloor cables and ground
+//! items.
 //!
-//! Map-spawned racks and the starter fabricator carry the same `Building`
-//! component the construction system produces, so everything the player can
-//! see blocking a tile can also be torn down and moved.
+//! Map-spawned racks, the starter fabricator and the starter reactor carry
+//! the same components the construction system produces, so everything the
+//! player can see blocking a tile can also be torn down and moved.
 
 use crate::building::{Building, BuildingKind, Footprint};
 use crate::crew::{Crew, CrewTask, Movement};
 use crate::items;
 use crate::log::EventLog;
 use crate::map::{ShipMap, SpawnReq, TilePos, MAP_LAYOUT};
+use crate::power::{CableGrid, PowerRole, PowerStatus, FABRICATOR_DEMAND};
 use crate::storage::StorageCell;
 use bevy::prelude::*;
 
@@ -47,10 +49,13 @@ pub fn setup_world(
         ),
     ));
 
+    let width = map.width;
+    let height = map.height;
     commands.insert_resource(map);
     commands.insert_resource(EventLog::default());
     commands.insert_resource(crate::stats::Stats::default());
     commands.insert_resource(crate::render::Art::load(&server, &mut images));
+    let mut cables = CableGrid::new(width, height);
 
     let mut crew_index = 0;
     for req in spawns {
@@ -94,11 +99,30 @@ pub fn setup_world(
                         foot: Footprint::new(pos.x, pos.y, 2, 2),
                         demo_progress: 0.0,
                     },
+                    PowerRole::consumer(FABRICATOR_DEMAND),
+                    PowerStatus::default(),
                 ));
+            }
+            SpawnReq::Reactor { pos } => {
+                commands.spawn((
+                    TilePos::new(pos.x, pos.y),
+                    Footprint::new(pos.x, pos.y, 2, 2),
+                    Building {
+                        kind: BuildingKind::Reactor,
+                        foot: Footprint::new(pos.x, pos.y, 2, 2),
+                        demo_progress: 0.0,
+                    },
+                    PowerRole::generator(),
+                    PowerStatus::default(),
+                ));
+            }
+            SpawnReq::Cable { pos } => {
+                cables.set(pos, true);
             }
             SpawnReq::Item { pos, kind } => {
                 items::spawn_item(&mut commands, pos, kind);
             }
         }
     }
+    commands.insert_resource(cables);
 }

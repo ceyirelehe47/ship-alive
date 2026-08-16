@@ -104,6 +104,8 @@ pub struct DebugBarVisible(pub bool);
 /// Number of fixed text lines / button slots in the selection panel.
 const SEL_LINES: usize = 12;
 const SEL_BTNS: usize = 16;
+/// Fixed text lines in the sidebar environment view.
+const ENV_LINES: usize = 16;
 
 #[derive(Resource)]
 pub struct Hud {
@@ -124,6 +126,9 @@ pub struct Hud {
     pub build_cat_buttons: Vec<(BuildCatKind, Entity)>,
     pub flyout: Entity,
     pub flyout_rows: Vec<(BuildCatKind, Entity)>,
+    pub env_lines: Vec<Entity>,
+    pub env_section: Entity,
+    pub entity_section: Entity,
 }
 
 fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
@@ -173,6 +178,7 @@ impl Plugin for UiPlugin {
             (
                 button_system,
                 btn_label_system,
+                sidebar_system,
                 build_menu_system,
                 power_view_toggle_system,
                 debug_toggle_system,
@@ -202,11 +208,22 @@ fn build_hud(mut commands: Commands) {
     let mut flyout = Entity::PLACEHOLDER;
     let mut flyout_rows: Vec<(BuildCatKind, Entity)> = Vec::new();
     let mut pending_tool_btns: Vec<(Entity, Tool)> = Vec::new();
+    let mut env_lines: Vec<Entity> = Vec::new();
+    let mut env_section = Entity::PLACEHOLDER;
+    let mut entity_section = Entity::PLACEHOLDER;
 
     commands
         .spawn(Node {
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
+            flex_direction: FlexDirection::Row,
+            ..default()
+        })
+        .with_children(|shell| {
+        // ---- main column (top bar + bottom) ----
+        shell
+        .spawn(Node {
+            flex_grow: 1.0,
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::SpaceBetween,
             ..default()
@@ -478,65 +495,17 @@ fn build_hud(mut commands: Commands) {
                     });
 
                 bottom
-                    .spawn(Node {
-                        flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(6.0),
-                        align_items: AlignItems::FlexEnd,
-                        ..default()
-                    })
+                    .spawn((
+                        Interaction::default(),
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            align_items: AlignItems::FlexEnd,
+                            ..default()
+                        },
+                    ))
                     .with_children(|row| {
-                        // selection panel
-                        row.spawn((
-                            Interaction::default(),
-                            Node {
-                                width: Val::Px(470.0),
-                                padding: UiRect::all(Val::Px(8.0)),
-                                flex_direction: FlexDirection::Column,
-                                row_gap: Val::Px(2.0),
-                                ..default()
-                            },
-                            BackgroundColor(PANEL_BG),
-                        ))
-                        .with_children(|p| {
-                            for _ in 0..SEL_LINES {
-                                sel_lines.push(label(p, "", 13.0, Color::WHITE));
-                            }
-                            // Two rows of re-purposable buttons.
-                            for _row_idx in 0..2 {
-                                p.spawn(Node {
-                                    flex_direction: FlexDirection::Row,
-                                    flex_wrap: FlexWrap::Wrap,
-                                    column_gap: Val::Px(3.0),
-                                    ..default()
-                                })
-                                .with_children(|r| {
-                                    for _ in 0..(SEL_BTNS / 2) {
-                                        sel_btns.push(
-                                            r.spawn((
-                                                Button,
-                                                Interaction::default(),
-                                                Node {
-                                                    height: Val::Px(24.0),
-                                                    padding: UiRect::horizontal(Val::Px(8.0)),
-                                                    margin: UiRect::all(Val::Px(1.0)),
-                                                    align_items: AlignItems::Center,
-                                                    justify_content: JustifyContent::Center,
-                                                    ..default()
-                                                },
-                                                BackgroundColor(BUTTON_BG),
-                                                Visibility::Hidden,
-                                            ))
-                                            .with_children(|b| {
-                                                label(b, "", 12.0, Color::WHITE);
-                                            })
-                                            .id(),
-                                        );
-                                    }
-                                });
-                            }
-                        });
-
-                        // event log
+                        // event log (full width; selection moved to the sidebar)
                         row.spawn((
                             Interaction::default(),
                             Node {
@@ -558,6 +527,91 @@ fn build_hud(mut commands: Commands) {
             });
         });
 
+        // ---- right sidebar: environment by default, selection on click ----
+        shell
+            .spawn((
+                Interaction::default(),
+                Node {
+                    width: Val::Px(300.0),
+                    height: Val::Percent(100.0),
+                    padding: UiRect::all(Val::Px(8.0)),
+                    flex_direction: FlexDirection::Column,
+                    row_gap: Val::Px(2.0),
+                    ..default()
+                },
+                BackgroundColor(PANEL_BG),
+            ))
+            .with_children(|sb| {
+                label(sb, "SHIP STATUS", 12.0, Color::srgb(0.5, 0.55, 0.62));
+
+                // Environment mode (nothing selected).
+                env_section = sb
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(2.0),
+                            ..default()
+                        },
+                    ))
+                    .with_children(|sec| {
+                        for _ in 0..ENV_LINES {
+                            env_lines.push(label(sec, "", 12.0, Color::WHITE));
+                        }
+                    })
+                    .id();
+
+                // Entity mode (something selected): properties + operations.
+                entity_section = sb
+                    .spawn((
+                        Node {
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(2.0),
+                            ..default()
+                        },
+                        Visibility::Hidden,
+                    ))
+                    .with_children(|sec| {
+                        for _ in 0..SEL_LINES {
+                            sel_lines.push(label(sec, "", 13.0, Color::WHITE));
+                        }
+                        // Re-purposable operation buttons (wrap to sidebar width).
+                        for _row_idx in 0..2 {
+                            sec.spawn(Node {
+                                flex_direction: FlexDirection::Row,
+                                flex_wrap: FlexWrap::Wrap,
+                                column_gap: Val::Px(3.0),
+                                ..default()
+                            })
+                            .with_children(|r| {
+                                for _ in 0..(SEL_BTNS / 2) {
+                                    sel_btns.push(
+                                        r.spawn((
+                                            Button,
+                                            Interaction::default(),
+                                            Node {
+                                                height: Val::Px(24.0),
+                                                padding: UiRect::horizontal(Val::Px(8.0)),
+                                                margin: UiRect::all(Val::Px(1.0)),
+                                                align_items: AlignItems::Center,
+                                                justify_content: JustifyContent::Center,
+                                                ..default()
+                                            },
+                                            BackgroundColor(BUTTON_BG),
+                                            Visibility::Hidden,
+                                        ))
+                                        .with_children(|b| {
+                                            label(b, "", 12.0, Color::WHITE);
+                                        })
+                                        .id(),
+                                    );
+                                }
+                            });
+                        }
+                    })
+                    .id();
+            });
+        });
+
     commands.insert_resource(Hud {
         speed_buttons: speed_buttons.clone(),
         stats,
@@ -576,6 +630,9 @@ fn build_hud(mut commands: Commands) {
         build_cat_buttons,
         flyout,
         flyout_rows,
+        env_lines,
+        env_section,
+        entity_section,
     });
     for (i, b) in speed_buttons.iter().enumerate() {
         commands.entity(*b).insert(SpeedIndex(i));
@@ -607,6 +664,162 @@ fn button_system(
     for (interaction, on_press) in interactions.iter() {
         if *interaction == Interaction::Pressed {
             actions.write(on_press.0);
+        }
+    }
+}
+
+/// Right sidebar: environment overview by default, selection details +
+/// operation buttons while something is selected.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn sidebar_system(
+    hud: Res<Hud>,
+    selection: Res<Selection>,
+    time: Res<Time<Virtual>>,
+    speed: Res<GameSpeed>,
+    stats: Res<crate::stats::Stats>,
+    power_state: Res<PowerState>,
+    racks: Query<&StorageCell>,
+    items: Query<(&Item, Option<&MarkedForHaul>), With<Item>>,
+    fabs: Query<&PowerStatus, With<crate::production::Fabricator>>,
+    crews: Query<&CrewTask, With<Crew>>,
+    mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
+    mut vis_q: Query<&mut Visibility, (With<Node>, Without<Text>, Without<Button>)>,
+) {
+    // ---- mode switch ----
+    let entity_mode = selection.0.is_some();
+    if let Ok(mut v) = vis_q.get_mut(hud.env_section) {
+        *v = if entity_mode {
+            Visibility::Hidden
+        } else {
+            Visibility::Visible
+        };
+    }
+    if let Ok(mut v) = vis_q.get_mut(hud.entity_section) {
+        *v = if entity_mode {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !entity_mode {
+        // ---- environment content ----
+        let now = time.elapsed().as_secs_f64() as i64;
+        let clock = format!("{:02}:{:02}", now / 60, now % 60);
+
+        let stored: u32 = racks.iter().map(|c| c.stored()).sum();
+        let cap: u32 = racks.iter().map(|c| c.capacity).sum();
+        let mut rack_counts = [0u32; 3];
+        for c in racks.iter() {
+            for k in ItemKind::ALL {
+                rack_counts[k.index()] += c.counts[k.index()];
+            }
+        }
+        let mut ground = [0u32; 3];
+        let mut marked = 0u32;
+        for (it, m) in items.iter() {
+            ground[it.kind.index()] += 1;
+            if m.is_some() {
+                marked += 1;
+            }
+        }
+        let fabs_online = fabs.iter().filter(|p| p.ok()).count();
+        let fabs_total = fabs.iter().count();
+        let idle = crews
+            .iter()
+            .filter(|t| matches!(t, CrewTask::Idle(_)))
+            .count();
+
+        let dim = Color::srgb(0.55, 0.6, 0.66);
+        let mut lines: Vec<(String, Color)> = vec![
+            (format!("Time {clock} | {}", speed.label()), Color::WHITE),
+            (String::new(), Color::WHITE),
+            ("POWER".to_string(), dim),
+        ];
+        if power_state.networks.is_empty() {
+            lines.push(("no networks (lay cables)".into(), dim));
+        }
+        for (i, net) in power_state.networks.iter().enumerate().take(3) {
+            lines.push((format!("NET {}: {}", i + 1, net.summary()), {
+                if net.generation == 0 || net.demand > net.generation {
+                    Color::srgb(1.0, 0.6, 0.45)
+                } else {
+                    Color::srgb(0.7, 0.95, 0.75)
+                }
+            }));
+        }
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("STORAGE".to_string(), dim));
+        lines.push((
+            format!(
+                "Stored {stored}/{cap}{}",
+                if cap == stored { " FULL" } else { "" }
+            ),
+            if cap == stored {
+                Color::srgb(1.0, 0.45, 0.4)
+            } else {
+                Color::WHITE
+            },
+        ));
+        lines.push((
+            format!(
+                "Racks   Ore {} | Part {} | Crate {}",
+                rack_counts[ItemKind::Ore.index()],
+                rack_counts[ItemKind::Part.index()],
+                rack_counts[ItemKind::Crate.index()]
+            ),
+            Color::WHITE,
+        ));
+        lines.push((
+            format!(
+                "Ground  Ore {} | Part {} | Crate {}",
+                ground[ItemKind::Ore.index()],
+                ground[ItemKind::Part.index()],
+                ground[ItemKind::Crate.index()]
+            ),
+            Color::WHITE,
+        ));
+        lines.push((format!("Marked for haul: {marked}",), Color::WHITE));
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("PRODUCTION".to_string(), dim));
+        lines.push((
+            format!("Parts made {} | Built {}", stats.produced, stats.built),
+            Color::WHITE,
+        ));
+        lines.push((
+            format!("Fabricators {fabs_online}/{fabs_total} powered"),
+            if fabs_online < fabs_total {
+                Color::srgb(1.0, 0.6, 0.45)
+            } else {
+                Color::WHITE
+            },
+        ));
+        lines.push((
+            format!(
+                "Crew idle {}/{} | Hauled {}",
+                idle,
+                crews.iter().count(),
+                stats.hauls_done
+            ),
+            Color::WHITE,
+        ));
+        for (i, line) in hud.env_lines.iter().enumerate() {
+            if let Ok((mut text, mut color, mut vis)) = texts.get_mut(*line) {
+                if i < lines.len() {
+                    *vis = Visibility::Visible;
+                    text.0 = lines[i].0.clone();
+                    color.0 = lines[i].1;
+                } else {
+                    *vis = Visibility::Hidden;
+                }
+            }
+        }
+    } else {
+        // Selection content is written by selection_panel_system.
+        for line in hud.env_lines.iter() {
+            if let Ok((_, _, mut vis)) = texts.get_mut(*line) {
+                *vis = Visibility::Hidden;
+            }
         }
     }
 }

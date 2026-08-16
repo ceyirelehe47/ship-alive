@@ -133,6 +133,6 @@
 
 ## Git
 
-- 代码与文档提交：见仓库 main 分支最新提交（SHA 在下方回填）。
+- 代码与文档提交：**`e119624`**（main，直接提交，未 force-push）。
 - 门禁：`cargo fmt` ✅、`cargo clippy --all-targets --all-features -- -D warnings` ✅、
   `cargo test` **193/193** ✅。

@@ -93,7 +93,75 @@ const EPS_MOL: f32 = 1e-4;
 /// Ideal-gas-like with uniform effective volume: P = P_ref · (n/n_ref) · (T/T_ref).
 #[inline]
 pub fn pressure(total_mol: f32, temp_c: f32) -> f32 {
-    PRESSURE_REF * (total_mol / STANDARD_MOL) * ((temp_c + KELVIN_OFFSET) / TEMP_REF)
+    pressure_vol(total_mol, temp_c, STANDARD_MOL)
+}
+
+/// Pressure (kPa) of a gas amount in an arbitrary finite volume expressed in
+/// mol-units-at-standard (`volume_mol` = how many units would fill this
+/// container to the reference atmosphere). Ducts and tanks use this with
+/// their own volumes — same semantics, different container.
+#[inline]
+pub fn pressure_vol(total_mol: f32, temp_c: f32, volume_mol: f32) -> f32 {
+    PRESSURE_REF * (total_mol / volume_mol) * ((temp_c + KELVIN_OFFSET) / TEMP_REF)
+}
+
+/// Amount (mol) that exactly equalizes the *pressures* of two finite
+/// containers (positive = a → b), given amounts, temperatures and volumes.
+/// Derived from `(n_a − x)·T_a/V_a = (n_b + x)·T_b/V_b`.
+#[inline]
+pub fn eq_amount(n_a: f32, t_a: f32, vol_a: f32, n_b: f32, t_b: f32, vol_b: f32) -> f32 {
+    let ta = t_a + KELVIN_OFFSET;
+    let tb = t_b + KELVIN_OFFSET;
+    (n_a * ta / vol_a - n_b * tb / vol_b) / (ta / vol_a + tb / vol_b)
+}
+
+/// The single transfer primitive shared by atmosphere bulk flow and every
+/// ventilation move (vents, blowers, tanks): move `amount` mol of gas from
+/// `src` to `dst`, species proportionally to the source composition. The
+/// source keeps its temperature (removing gas does not cool it); the
+/// destination mixes energies over its new gas capacity plus any extra
+/// (device) mass sharing the node. Clamped non-negative, no-op on empty
+/// sources.
+pub fn move_gas(
+    src: &mut [f32; 4],
+    dst: &mut [f32; 4],
+    src_temp_c: f32,
+    dst_temp_c: &mut f32,
+    dst_extra_cap: f32,
+    amount: f32,
+) {
+    if amount <= 0.0 {
+        return;
+    }
+    let n_src: f32 = src.iter().sum();
+    if n_src <= EPS_MOL {
+        return;
+    }
+    let a = amount.min(n_src);
+    for s in 0..4 {
+        let mv = a * (src[s] / n_src);
+        src[s] -= mv;
+        dst[s] += mv;
+    }
+    let q = a * GAS_CAP_PER_MOL * (src_temp_c + KELVIN_OFFSET);
+    let n_dst_new: f32 = dst.iter().sum();
+    let cap_dst = n_dst_new * GAS_CAP_PER_MOL + dst_extra_cap;
+    if cap_dst > 0.0 {
+        let e_dst = (n_dst_new - a) * GAS_CAP_PER_MOL * (*dst_temp_c + KELVIN_OFFSET)
+            + dst_extra_cap * (*dst_temp_c + KELVIN_OFFSET);
+        *dst_temp_c = ((e_dst + q) / cap_dst) - KELVIN_OFFSET;
+    }
+}
+
+/// Tiles that carry room air volume (floor / machine / door). Public for the
+/// ventilation layer's release rules.
+pub fn is_air_tile(t: Option<crate::map::Tile>) -> bool {
+    matches!(
+        t,
+        Some(crate::map::Tile::Floor)
+            | Some(crate::map::Tile::Machine)
+            | Some(crate::map::Tile::Door)
+    )
 }
 
 /// Partial pressure of one species (kPa) from its amount, the cell total and
@@ -550,10 +618,15 @@ impl AtmosphereGrid {
         if na + nb <= 2.0 * EPS_MOL {
             return 0.0;
         }
-        let ta = thermal.amb[i] + KELVIN_OFFSET;
-        let tb = thermal.amb[j] + KELVIN_OFFSET;
         // Amount that equalizes pressures: (na - x)·ta = (nb + x)·tb.
-        let x_eq = (na * ta - nb * tb) / (ta + tb);
+        let x_eq = eq_amount(
+            na,
+            thermal.amb[i],
+            STANDARD_MOL,
+            nb,
+            thermal.amb[j],
+            STANDARD_MOL,
+        );
         if x_eq.abs() < EPS_MOL {
             return 0.0;
         }
@@ -566,27 +639,29 @@ impl AtmosphereGrid {
         } else {
             (j, i, -delta)
         };
-        let n_src = self.total_at(src);
-        if n_src <= EPS_MOL {
-            return 0.0;
-        }
-        // Species move proportionally to the source composition.
+        // One shared transfer primitive (species + sensible heat; the source
+        // keeps its temperature, the destination mixes energies over its new
+        // total capacity — gas + device mass share the node per Slice 3).
+        let mut src_mix = [0.0f32; 4];
+        let mut dst_mix = [0.0f32; 4];
         for s in 0..4 {
-            let mv = amount * (self.gas[s][src] / n_src);
-            self.gas[s][src] -= mv;
-            self.gas[s][dst] += mv;
+            src_mix[s] = self.gas[s][src];
+            dst_mix[s] = self.gas[s][dst];
         }
-        // Advective heat: the source keeps its temperature (removing gas
-        // does not cool it); the destination mixes energies over its new
-        // total capacity (gas + device mass share the node per Slice 3).
-        let t_src_c = thermal.amb[src];
-        let q = amount * GAS_CAP_PER_MOL * (t_src_c + KELVIN_OFFSET);
-        let n_dst_old = self.total_at(dst) - amount;
-        let dev_dst = devices.mass_at(dst);
-        let cap_dst_old = n_dst_old * GAS_CAP_PER_MOL + dev_dst;
-        let e_dst = cap_dst_old * (thermal.amb[dst] + KELVIN_OFFSET);
-        let cap_dst_new = self.total_at(dst) * GAS_CAP_PER_MOL + dev_dst;
-        thermal.amb[dst] = ((e_dst + q) / cap_dst_new) - KELVIN_OFFSET;
+        let mut dst_temp = thermal.amb[dst];
+        move_gas(
+            &mut src_mix,
+            &mut dst_mix,
+            thermal.amb[src],
+            &mut dst_temp,
+            devices.mass_at(dst),
+            amount,
+        );
+        for s in 0..4 {
+            self.gas[s][src] = src_mix[s];
+            self.gas[s][dst] = dst_mix[s];
+        }
+        thermal.amb[dst] = dst_temp;
         self.sync_gas_cap(thermal, src);
         self.sync_gas_cap(thermal, dst);
         // Capacities and the destination temperature changed — thermal must

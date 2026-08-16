@@ -21,6 +21,7 @@ fn main() {
             ship_alive::power::PowerPlugin,
             ship_alive::airtight::AirtightPlugin,
             ship_alive::atmosphere::AtmospherePlugin,
+            ship_alive::ventilation::VentilationPlugin,
             render::RenderPlugin,
             time_ctrl::TimeCtrlPlugin,
             input::InputPlugin,

@@ -157,7 +157,11 @@ fn select_and_box_system(
     mut selection: ResMut<Selection>,
     build_mode: Res<BuildMode>,
     // Nested tuple = one system param (the flat list would exceed 16).
-    (cables, pipes): (Res<CableGrid>, Res<crate::coolant::PipeGrid>),
+    (cables, pipes, ducts): (
+        Res<CableGrid>,
+        Res<crate::coolant::PipeGrid>,
+        Res<crate::ventilation::DuctGrid>,
+    ),
     mut box_select: ResMut<BoxSelect>,
     mut actions: EventWriter<Action>,
     mut last_paint: Local<Option<TilePos>>,
@@ -240,6 +244,8 @@ fn select_and_box_system(
                                     actions.write(Action::MarkCableDeconstruct { pos: tile });
                                 } else if pipes.has(tile) {
                                     actions.write(Action::MarkPipeDeconstruct { pos: tile });
+                                } else if ducts.has(tile) {
+                                    actions.write(Action::MarkDuctDeconstruct { pos: tile });
                                 }
                             }
                         }
@@ -378,7 +384,11 @@ fn action_keys_system(
                 Some(Tool::Build(BuildingKind::Radiator))
             }
             Some(Tool::Build(BuildingKind::Radiator)) => Some(Tool::Build(BuildingKind::Reservoir)),
-            Some(Tool::Build(BuildingKind::Reservoir)) => Some(Tool::Deconstruct),
+            Some(Tool::Build(BuildingKind::Reservoir)) => Some(Tool::Build(BuildingKind::GasDuct)),
+            Some(Tool::Build(BuildingKind::GasDuct)) => Some(Tool::Build(BuildingKind::Vent)),
+            Some(Tool::Build(BuildingKind::Vent)) => Some(Tool::Build(BuildingKind::Blower)),
+            Some(Tool::Build(BuildingKind::Blower)) => Some(Tool::Build(BuildingKind::GasTank)),
+            Some(Tool::Build(BuildingKind::GasTank)) => Some(Tool::Deconstruct),
             Some(Tool::Deconstruct) => None,
         };
         actions.write(Action::SetTool { tool: next });

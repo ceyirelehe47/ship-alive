@@ -39,7 +39,7 @@ pub fn setup_world(
     mut images: ResMut<Assets<Image>>,
     server: Res<AssetServer>,
 ) {
-    let (map, spawns) = ShipMap::from_layout(&MAP_LAYOUT);
+    let (mut map, spawns) = ShipMap::from_layout(&MAP_LAYOUT);
     let mut thermal_grid = ThermalGrid::new(&map);
 
     // Camera centered on the ship.
@@ -223,6 +223,24 @@ pub fn setup_world(
     for pos in &reservoir_tiles {
         water.fill(*pos, STARTER_RESERVOIR_FILL, crate::thermal::AMBIENT_START);
     }
+    // Power the starter blower: extend the reactor's cable run north from
+    // the existing (15,14) tile through the fabricator footprint and the
+    // row-9 wall into the corridor (cables may cross interior walls and run
+    // under ducts — independent layers).
+    for c in [
+        TilePos::new(15, 13),
+        TilePos::new(15, 12),
+        TilePos::new(15, 11),
+        TilePos::new(15, 10),
+        TilePos::new(15, 9),
+        TilePos::new(15, 8),
+        TilePos::new(15, 7),
+        TilePos::new(14, 7),
+        TilePos::new(13, 7),
+        TilePos::new(12, 7),
+    ] {
+        cables.set(c, true);
+    }
     commands.insert_resource(cables);
     commands.insert_resource(pipes);
     commands.insert_resource(water);
@@ -235,9 +253,86 @@ pub fn setup_world(
     // Standard atmosphere boot fill: every gas cell (floor / machine / door)
     // at ~101.3 kPa, 21 kPa O₂ partial, low CO₂, no pollutant. The gas heat
     // capacities replace the thermal grid's boot-time constants immediately.
-    let atmo = crate::atmosphere::AtmosphereGrid::new(&map);
+    let mut atmo = crate::atmosphere::AtmosphereGrid::new(&map);
     atmo.sync_all_gas_caps(&mut thermal_grid);
+    // Starter ventilation network (Slice 6): FABRICATION ↔ corridor ↔
+    // CREW QUARTERS. 19 duct tiles (passing under interior walls exactly as
+    // a player would lay them), two vents, a standby eastbound blower and a
+    // prefilled tank just west of it (so tank → blower → vent B supplies
+    // CREW, and vent A → tank charges with the blower reversed). Ducts boot
+    // empty and fill from the rooms (~190 mol, a <2% pressure dip); the
+    // tank's standard fill means the balanced system moves nothing at boot.
+    let mut ducts = crate::ventilation::DuctGrid::new(width, height);
+    let mut duct_tiles: Vec<TilePos> = Vec::new();
+    for y in 7..=13 {
+        duct_tiles.push(TilePos::new(10, y));
+    }
+    for x in 11..=18 {
+        duct_tiles.push(TilePos::new(x, 7));
+    }
+    for y in 3..=6 {
+        duct_tiles.push(TilePos::new(18, y));
+    }
+    for t in duct_tiles {
+        ducts.set(t, true);
+    }
+    let mut vent = |pos: TilePos| {
+        commands.spawn((
+            pos,
+            Footprint::new(pos.x, pos.y, 1, 1),
+            Building {
+                kind: BuildingKind::Vent,
+                foot: Footprint::new(pos.x, pos.y, 1, 1),
+                demo_progress: 0.0,
+            },
+            crate::ventilation::Vent::default(),
+        ));
+    };
+    vent(TilePos::new(10, 13)); // FABRICATION
+    vent(TilePos::new(18, 3)); // CREW QUARTERS
+    let blower_pos = TilePos::new(12, 7);
+    commands.spawn((
+        blower_pos,
+        Footprint::new(blower_pos.x, blower_pos.y, 1, 1),
+        Building {
+            kind: BuildingKind::Blower,
+            foot: Footprint::new(blower_pos.x, blower_pos.y, 1, 1),
+            demo_progress: 0.0,
+        },
+        // Boots in standby: an enabled blower would slowly pump FAB air
+        // into CREW at otherwise-uniform pressure (§77 — the starter
+        // system must not disturb the environment). The player runs it.
+        crate::ventilation::Blower {
+            dir: crate::ventilation::Dir4::East,
+            enabled: false,
+            last_flow: 0.0,
+        },
+        PowerRole::consumer(crate::ventilation::BLOWER_DEMAND),
+        PowerStatus::default(),
+        ThermalBody::passive(4.0),
+        ThermalState::default(),
+    ));
+    let tank_pos = TilePos::new(11, 7);
+    map.set_tile(tank_pos, crate::map::Tile::Machine);
+    thermal_grid.tile_changed(tank_pos, crate::map::Tile::Machine);
+    atmo.tile_changed(&map, tank_pos, crate::map::Tile::Machine);
+    commands.spawn((
+        tank_pos,
+        Footprint::new(tank_pos.x, tank_pos.y, 1, 1),
+        Building {
+            kind: BuildingKind::GasTank,
+            foot: Footprint::new(tank_pos.x, tank_pos.y, 1, 1),
+            demo_progress: 0.0,
+        },
+        crate::ventilation::GasTank::prefilled_standard(),
+        ThermalBody::passive(12.0),
+        ThermalState::default(),
+    ));
     commands.insert_resource(thermal_grid);
+    commands.insert_resource(ducts);
+    commands.insert_resource(crate::ventilation::DuctTopology::default());
+    commands.insert_resource(crate::ventilation::VentStats::default());
+    commands.insert_resource(crate::ventilation::VentSummary::default());
     commands.insert_resource(crate::atmosphere::AtmoStats::from_grid(&atmo));
     commands.insert_resource(crate::atmosphere::AtmoSummary::default());
     commands.insert_resource(atmo);

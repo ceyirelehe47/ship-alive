@@ -46,13 +46,21 @@ API 签名、crate 版本行为、框架迁移差异、报错原文等随时会�
    兜底（见 `jobs.rs` 的 `local_claims`）。
 7. **移动系统只认 4 向邻接**：任何动态改 `path` 的逻辑（侧步/绕路）必须
    保证插入的格与前后格 4 向相邻，否则会产生对角瞬移。
+8. **唤醒列表必须只装真实格索引**（Slice 6 幻影格事故）：`wake_around`
+   曾把非风管坐标也推进唤醒列表，遍历时守卫读（越界→0）+ 不守卫写
+   （直接覆盖）= 无声销毁 2200 mol 气体，守恒测试逐对全绿但总量掉。
+   教训：稀疏活跃集的写路径和读路径必须同一套成员校验；总量审计
+   （rooms+ducts+tanks）要作为常驻断言，不能只对单次转移做守恒。
+9. **UI 遥测色不能在刷新趟里被换掉**：覆盖层实体池的 spawn 颜色会被
+   周期刷新趟覆盖——改颜色要改刷新趟那一处（Slice 6 流向箭头一度
+   被 10 Hz 刷新写成近白色，截图里"看不见箭头"才暴露）。
 
 ## 工程约定
 
 - 质量门禁：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
   `cargo test` 全绿才算完成；不许删测试或大面积 `#[allow]` 压警告。
-- 验收场景：`SLICE0_SCENARIO=A..L,P1,P2,M`（0/0B/1 代）、`SLICE2_SCENARIO=A..J`（电力代）。
-  改动核心系统后全量回归。
+- 验收场景：`SLICE0_SCENARIO=A..L,P1,P2,M`（0/0B/1 代）、`SLICE2_SCENARIO=A..J`（电力代）、
+  `SLICE6_SCENARIO=A..U`（通风代，跳过与 S5 重叠的 J/K）。改动核心系统后全量回归。
 - 报告文化：每个 Slice 一份 `REPORT*.md`，含 Design assumptions / Temporary
   behaviors / 发现的问题；临时决定不许悄悄升级成永久设计。
 - 美术管线：`art_raw/`（Codex 生图，洋红底）→ `cargo run --bin prep_art` →

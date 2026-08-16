@@ -185,6 +185,9 @@ pub fn tooltip_system(
                             crate::building::BuildingKind::Fabricator => {
                                 "2x2 machine — select for orders".to_string()
                             }
+                            crate::building::BuildingKind::GasDuct => {
+                                "underfloor gas duct".to_string()
+                            }
                             _ => "player-built structure".to_string(),
                         },
                     }),

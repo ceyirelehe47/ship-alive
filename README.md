@@ -1,6 +1,9 @@
-# Ship Alive — Playable Slice 5 / Atmosphere & Pressure
+# Ship Alive — Playable Slice 6 / Ventilation & Gas Handling
 
-> **Slice 5 新增：空气成为真实、逐格、守恒、可以流动和流失的资源。**
+> **Slice 6 新增：玩家可以主动、空间化、守恒地搬运、储存和控制气体——
+> 风管层 + 通风口 + 鼓风机 + 储气罐。**
+
+> **Slice 5：空气成为真实、逐格、守恒、可以流动和流失的资源。**
 
 > **Slice 4：门成为真实动态设备；墙和门把船内空间分成气密舱室。**
 
@@ -56,15 +59,34 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
   气体热容量跟随真实气量（真空≈0，设备热质量保留）；睡眠/唤醒活动模型
   （稳定船近零开销）；Atmosphere 覆盖层（`P` 第 5 档：压强色带 + 成分危险
   警示 + 悬停逐格气体卡）；SHIP STATUS 大气块 + 常显 ATMOSPHERE LOSS 警告
+- **Slice 6 — 通风与气体搬运**：地下风管层（DuctGrid，与电缆/水管同级的
+  第三个稠密层，每格有限容积 DUCT_MOL=10、真实四组分混合 + 热能）；相邻格
+  局部平衡钳位输送（绝不做全网平均——压力波逐格传播）；通风口 Vent
+  （Supply 只供气 / Exhaust 只抽气 / Balanced 压差驱动，Open/Closed 阀，
+  只与自己头顶那格房间交换）；鼓风机 Blower（压头 15 kPa、上限 12 mol/s、
+  断电/停机退化为被动风管格，供电 4 PU）；储气罐 GasTank（400 mol 容积、
+  真实混合气、派生压强、阀门开关）；全部 species + 热能守恒——包括拆除
+  （风管拆除断链时气体挤回邻管/房间、兜底记入泄出账本；储气罐拆除优先
+  排入下方风管否则进房间）；通风绝不合并气密舱室（门关着就过不去人，
+  但风管可以绕过锁门送气）；破口可以抽干整张管网；玩家四重隔离手段
+  （关通风口/停鼓风机/关罐阀/锁门）；拓扑缓存（只在风管/设备集变化时
+  flood-fill，流量步零重建）；睡眠/唤醒（均衡管网静止休眠）；
+  Ventilation 覆盖层（`P` 第 6 档：管网压强着色 + 青色流向箭头 + 设备
+  状态标记）；SHIP STATUS 通风块；Vent/Blower/Tank 选中面板（模式/
+  方向/阀门按钮）；BUILD→Atmosphere 分类；开局预装 FABRICATION↔CREW
+  QUARTERS 起步管网（19 格风管 + 2 通风口 + 1 鼓风机 + 1 预充储气罐，
+  鼓风机待机不打扰开局环境）
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 169 个单元/集成测试
+cargo test                     # 187 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
 SLICE4_SCENARIO=A cargo run    # Slice 4 气密验收场景（A–F、H–L、N–P）
 SLICE5_SCENARIO=A cargo run    # Slice 5 大气验收场景（A–I、O/P/Q）
+SLICE6_SCENARIO=A cargo run    # Slice 6 通风验收场景（A B C D E F G H I L M N P Q R S T U）
+SLICE6_VIEW=ventilation cargo run  # 直接以 Ventilation 覆盖层启动
 SLICE5_TOOLS=1 cargo run       # 开发者大气工具：悬停 + F5 破口 / F6 降压 / F7 恢复标准 / F8 注 CO2 / F9 注污染物
 SLICE4_DOORPIN=6,6:0.5 cargo run  # 门美术检查：钉住 (x,y) 门的开启进度/模式（[:Auto|HoldOpen|LockClosed]）
 SLICE4_DEBUG_DOOR=11,10 cargo run # 门美术检查：绕过建造规则在该格生成一扇门（可放进竖墙验证 Ew 朝向）
@@ -94,7 +116,13 @@ src/
                  union-find、统一环境边界 boundary() 查询
   atmosphere.rs  Slice 5：逐格四气体网格（数量权威、SoA 布局）、压强/分压派生、
                  等压钳位 bulk flow（全组分+显热平流）、组分扩散、破口泄压
-                 （真空边界+泄出记账）、气体热容量同步、睡眠/唤醒活跃集
+                 （真空边界+泄出记账）、气体热容量同步、睡眠/唤醒活跃集、
+                 共享气体原语（pressure_vol/eq_amount/move_gas）
+  ventilation.rs Slice 6：地下风管层 DuctGrid（每格有限容积+真实混合气+热能）、
+                 相邻局部平衡输送（无全网平均）、Vent（Supply/Exhaust/
+                 Balanced+开关）、Blower（压头模型 15kPa/12mol/s、断电退化
+                 被动）、GasTank（400mol/阀门/派生压强）、拆除守恒释放规则、
+                 拓扑缓存（变化才 flood-fill）、睡眠/唤醒、流向遥测
   movement.rs    逐格移动 + 软避让（含对头死锁的按格累计穿越机制；
                  等门冻结避让时钟）
   simtime.rs     统一模拟时钟（i64 µs、T+HHH:MM:SS、固定步长泵/累加器/退避）
@@ -117,6 +145,10 @@ tests/
   fleet_ops.rs   多制造机建造+材料守恒+封死房间不泵料
   thermal.rs     热能集成测试：守恒/启动稳定/满载危机+恢复/滞迟/暂停不变性/
                  泵断电滞止/网络分合保水/散热上限/128×128 性能
+  atmosphere.rs  Slice 5 大气测试（守恒/分压/破口/门交换/热平流/睡眠/性能）
+  ventilation.rs Slice 6 通风测试（有限容积/局部性/模式语义/鼓风机压头与上限/
+                 罐混合与阀门/拆除守恒/破口抽管网/拓扑缓存/独立网络/暂停与
+                 倍速等价/睡眠/128×128 稳定与活跃性能）
 tools/           截图脚本（开发用）
 assets/art/      运行时加载的 PNG（缺失时自动退化为色块占位）
 art_raw/         Codex image generation 原图（洋红底）
@@ -128,7 +160,9 @@ art_raw/         Codex image generation 原图（洋红底）
 → `assets/art/`（透明背景 256×256）。游戏启动时若文件存在则加载，
 否则用程序化色块，保证仓库在任何状态下都能跑。
 
-状态：**Slice 3（Thermal & Cooling）完成，等待试玩反馈。**
+状态：**Slice 6（Ventilation & Gas Handling）完成，等待试玩反馈。**
 交付报告：`REPORT.md` / `REPORT_0B.md` / `REPORT_1.md` / `REPORT_2.md` /
-`REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md`；性能优化轮：`REPORT_PERF.md`（本轮）；
+`REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md` /
+`REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md`；
+性能优化轮：`REPORT_PERF.md`；
 试玩指南：`PLAYTEST.md`；代理经验：`AGENTS.md`。

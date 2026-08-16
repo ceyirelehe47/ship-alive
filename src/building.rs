@@ -35,10 +35,19 @@ pub enum BuildingKind {
     HeatExchanger,
     /// Water→space radiator (needs a pipe under it and a hull wall beside).
     Radiator,
+    // ---- Slice 6: ventilation -------------------------------------------
+    /// Underfloor gas duct (1 tile; lives in the DuctGrid).
+    GasDuct,
+    /// Room↔duct vent (needs a duct under it).
+    Vent,
+    /// Directed duct blower (needs a duct under it; power consumer).
+    Blower,
+    /// Gas storage tank (needs a duct under it).
+    GasTank,
 }
 
 impl BuildingKind {
-    pub const ALL: [BuildingKind; 11] = [
+    pub const ALL: [BuildingKind; 15] = [
         BuildingKind::Wall,
         BuildingKind::Door,
         BuildingKind::Rack,
@@ -50,6 +59,10 @@ impl BuildingKind {
         BuildingKind::Reservoir,
         BuildingKind::HeatExchanger,
         BuildingKind::Radiator,
+        BuildingKind::GasDuct,
+        BuildingKind::Vent,
+        BuildingKind::Blower,
+        BuildingKind::GasTank,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -64,6 +77,14 @@ impl BuildingKind {
                 | BuildingKind::Reservoir
                 | BuildingKind::HeatExchanger
                 | BuildingKind::Radiator
+        )
+    }
+
+    /// Ventilation hardware that must stand on an existing duct tile.
+    pub fn needs_duct(kind: BuildingKind) -> bool {
+        matches!(
+            kind,
+            BuildingKind::Vent | BuildingKind::Blower | BuildingKind::GasTank
         )
     }
 }
@@ -222,6 +243,54 @@ pub fn def(kind: BuildingKind) -> BuildingDef {
             needs_clear_tiles: false,
             tile: Tile::Floor,
         },
+        BuildingKind::GasDuct => BuildingDef {
+            kind,
+            label: "Gas Duct",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 1],
+            work_secs: 90.0,
+            demo_secs: 60.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Vent => BuildingDef {
+            kind,
+            label: "Vent",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 1],
+            work_secs: 180.0,
+            demo_secs: 90.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Blower => BuildingDef {
+            kind,
+            label: "Blower",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 2],
+            work_secs: 240.0,
+            demo_secs: 120.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::GasTank => BuildingDef {
+            kind,
+            label: "Gas Tank",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 3],
+            work_secs: 300.0,
+            demo_secs: 150.0,
+            blocks: true,
+            needs_clear_tiles: true,
+            tile: Tile::Machine,
+        },
     }
 }
 
@@ -358,7 +427,9 @@ pub enum PlacementError {
     OverlapsBlueprint,
     CableExists,
     PipeExists,
+    DuctExists,
     NoPipe,
+    NoDuct,
     NotAtHull,
     /// Doors must sit in a one-tile wall opening (walls flanking the leaf,
     /// open passage on both sides) — an unambiguous, airtight orientation.
@@ -375,7 +446,9 @@ impl PlacementError {
             PlacementError::OverlapsBlueprint => "overlaps another blueprint",
             PlacementError::CableExists => "a cable already runs here",
             PlacementError::PipeExists => "a pipe already runs here",
+            PlacementError::DuctExists => "a gas duct already runs here",
             PlacementError::NoPipe => "needs a coolant pipe under it",
+            PlacementError::NoDuct => "needs a gas duct under it",
             PlacementError::NotAtHull => "radiators must sit against the outer hull",
             PlacementError::BadDoorSpot => "doors need a one-tile wall opening",
         }
@@ -383,6 +456,7 @@ impl PlacementError {
 }
 
 /// Check whether a footprint can host a new blueprint.
+#[allow(clippy::too_many_arguments)]
 pub fn can_place(
     map: &ShipMap,
     kind: BuildingKind,
@@ -391,10 +465,14 @@ pub fn can_place(
     buildings: &[(Footprint, bool)], // (footprint, is_blueprint)
     has_cable: impl Fn(TilePos) -> bool,
     has_pipe: impl Fn(TilePos) -> bool,
+    has_duct: impl Fn(TilePos) -> bool,
 ) -> Result<(), PlacementError> {
     let d = def(kind);
     let foot = Footprint::new(origin.x, origin.y, d.w, d.h);
-    if kind == BuildingKind::PowerCable || kind == BuildingKind::CoolantPipe {
+    if matches!(
+        kind,
+        BuildingKind::PowerCable | BuildingKind::CoolantPipe | BuildingKind::GasDuct
+    ) {
         // Underfloor: any interior tile works (under room walls, machines,
         // doors), but never the hull shell — i.e. never the map border —
         // never twice, never under a pending plan of the same layer.
@@ -406,21 +484,32 @@ pub fn can_place(
             return Err(PlacementError::OutsideShip);
         }
         let dup_layer = |f: &Footprint| f.w == 1 && f.h == 1 && f.contains(origin);
-        if kind == BuildingKind::PowerCable {
-            if has_cable(origin) {
-                return Err(PlacementError::CableExists);
+        match kind {
+            BuildingKind::PowerCable => {
+                if has_cable(origin) {
+                    return Err(PlacementError::CableExists);
+                }
+                if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
+                    return Err(PlacementError::CableExists);
+                }
             }
-            if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
-                return Err(PlacementError::CableExists);
+            BuildingKind::CoolantPipe => {
+                if has_pipe(origin) {
+                    return Err(PlacementError::PipeExists);
+                }
+                // Same rule as cables: never plan a pipe under a pending 1x1
+                // plan (surface buildings go in first, utilities after).
+                if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
+                    return Err(PlacementError::PipeExists);
+                }
             }
-        } else {
-            if has_pipe(origin) {
-                return Err(PlacementError::PipeExists);
-            }
-            // Same rule as cables: never plan a pipe under a pending 1x1
-            // plan (surface buildings go in first, utilities after).
-            if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
-                return Err(PlacementError::PipeExists);
+            _ => {
+                if has_duct(origin) {
+                    return Err(PlacementError::DuctExists);
+                }
+                if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
+                    return Err(PlacementError::DuctExists);
+                }
             }
         }
         return Ok(());
@@ -445,6 +534,10 @@ pub fn can_place(
         if kind == BuildingKind::Radiator && !hull_adjacent(map, origin) {
             return Err(PlacementError::NotAtHull);
         }
+    }
+    // Ventilation hardware stands on an existing duct tile.
+    if BuildingKind::needs_duct(kind) && !has_duct(origin) {
+        return Err(PlacementError::NoDuct);
     }
     // A door must resolve to exactly one passage axis (walls flanking the
     // leaf, open interior on both passage sides). Ambiguous or open-hall
@@ -539,6 +632,7 @@ pub fn complete_building(
     thermal: &mut crate::thermal::ThermalGrid,
     // Optional: minimal test worlds build without an atmosphere grid.
     mut atmo: Option<&mut crate::atmosphere::AtmosphereGrid>,
+    ducts: Option<&mut crate::ventilation::DuctGrid>,
     blueprint: Entity,
     bp: &Blueprint,
     crew_positions: &[(Entity, TilePos)],
@@ -574,6 +668,23 @@ pub fn complete_building(
             now,
             crate::log::LogKind::Job,
             format!("Coolant pipe laid at ({},{})", bp.foot.x, bp.foot.y),
+        );
+        return;
+    }
+    if bp.kind == BuildingKind::GasDuct {
+        // Ducts rest in the dense underfloor ventilation layer; new segments
+        // boot as empty volume that gas must physically fill.
+        if let Some(ducts) = ducts {
+            for t in bp.foot.tiles() {
+                ducts.set(t, true);
+            }
+        }
+        commands.entity(blueprint).despawn();
+        stats.built += 1;
+        log.push(
+            now,
+            crate::log::LogKind::Job,
+            format!("Gas duct laid at ({},{})", bp.foot.x, bp.foot.y),
         );
         return;
     }
@@ -684,6 +795,29 @@ pub fn complete_building(
             ec.insert(crate::thermal::ThermalBody::passive(10.0));
             ec.insert(crate::thermal::ThermalState::default());
         }
+        BuildingKind::Vent => {
+            ec.insert(crate::ventilation::Vent::default());
+        }
+        BuildingKind::Blower => {
+            let origin = TilePos::new(bp.foot.x, bp.foot.y);
+            let dir = ducts
+                .as_ref()
+                .map(|d| crate::ventilation::infer_blower_dir(d, origin))
+                .unwrap_or(crate::ventilation::Dir4::East);
+            ec.insert(crate::ventilation::Blower::new(dir));
+            ec.insert(crate::power::PowerRole::consumer(
+                crate::ventilation::BLOWER_DEMAND,
+            ));
+            ec.insert(crate::power::PowerStatus::default());
+            ec.insert(crate::thermal::ThermalBody::passive(4.0));
+            ec.insert(crate::thermal::ThermalState::default());
+        }
+        BuildingKind::GasTank => {
+            // New tanks boot empty/vacuum — no free standard air.
+            ec.insert(crate::ventilation::GasTank::default());
+            ec.insert(crate::thermal::ThermalBody::passive(12.0));
+            ec.insert(crate::thermal::ThermalState::default());
+        }
         _ => {}
     }
     stats.built += 1;
@@ -726,6 +860,11 @@ pub fn complete_deconstruction(
     thermal: &mut crate::thermal::ThermalGrid,
     // Optional: minimal test worlds build without an atmosphere grid.
     mut atmo: Option<&mut crate::atmosphere::AtmosphereGrid>,
+    ducts: Option<&mut crate::ventilation::DuctGrid>,
+    vstats: Option<&mut crate::ventilation::VentStats>,
+    // Gas still inside a tank being torn down (conserved by the release
+    // rule below; `None` for every other kind).
+    tank_contents: Option<crate::ventilation::GasTank>,
     building: Entity,
     b: &Building,
     rack_contents: Option<[u32; 3]>,
@@ -775,6 +914,39 @@ pub fn complete_deconstruction(
             );
         }
         return;
+    }
+    if b.kind == BuildingKind::GasDuct {
+        // Duct gas is conserved: pushed into the connected neighbours,
+        // released into the local room, or (nowhere else) ledgered as
+        // vented to space. See `remove_duct_preserving_gas`.
+        if let (Some(ducts), Some(atmo), Some(vstats)) = (ducts, atmo.as_deref_mut(), vstats) {
+            for t in b.foot.tiles() {
+                crate::ventilation::remove_duct_preserving_gas(
+                    map, ducts, atmo, thermal, vstats, t,
+                );
+            }
+        }
+        commands.entity(building).despawn();
+        stats.deconstructed += 1;
+        log.push(
+            now,
+            crate::log::LogKind::Job,
+            format!("Gas duct removed at ({},{})", b.foot.x, b.foot.y),
+        );
+        return;
+    }
+    if b.kind == BuildingKind::GasTank {
+        if let Some(tank) = tank_contents {
+            crate::ventilation::release_tank_gas(
+                map,
+                ducts,
+                atmo.as_deref_mut(),
+                thermal,
+                vstats,
+                tank,
+                TilePos::new(b.foot.x, b.foot.y),
+            );
+        }
     }
     for t in b.foot.tiles() {
         let old = map.tile(t);

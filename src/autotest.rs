@@ -27,6 +27,7 @@ impl Plugin for AutotestPlugin {
                 slice3_driver,
                 slice4_driver,
                 slice5_driver,
+                slice6_driver,
                 slice5_dev_tools,
                 slice4_dev_pins,
             )
@@ -2057,6 +2058,7 @@ fn slice5_driver(
     mut doors: Query<(&TilePos, &mut crate::airtight::Door)>,
     mut demand: ResMut<crate::airtight::DoorDemand>,
     mut speed: ResMut<crate::time_ctrl::GameSpeed>,
+    ducts: Res<crate::ventilation::DuctGrid>,
     mut fired: Local<Vec<&'static str>>,
 ) {
     let Some(scenario) = std::env::var("SLICE5_SCENARIO").ok() else {
@@ -2074,7 +2076,13 @@ fn slice5_driver(
         }
     };
     let totals = |atmo: &crate::atmosphere::AtmosphereGrid| -> [f64; 4] {
-        crate::atmosphere::SPECIES.map(|s| atmo.onboard(s))
+        let mut out = crate::atmosphere::SPECIES.map(|s| atmo.onboard(s));
+        // Since Slice 6, gas also lives in ducts — count it or the audit
+        // would misread duct inventory as drift.
+        for (s, v) in out.iter_mut().enumerate() {
+            *v += ducts.stored(s);
+        }
+        out
     };
     let boot = astats.boot_mol;
 
@@ -2576,13 +2584,14 @@ fn slice5_dev_tools(
     // SLICE5_VIEW=power|thermal|coolant|compartments|atmosphere.
     if !*pinned {
         *pinned = true;
-        if let Ok(v) = std::env::var("SLICE5_VIEW") {
+        if let Ok(v) = std::env::var("SLICE6_VIEW").or_else(|_| std::env::var("SLICE5_VIEW")) {
             *overlay = match v.as_str() {
                 "power" => crate::OverlayMode::Power,
                 "thermal" => crate::OverlayMode::Thermal,
                 "coolant" => crate::OverlayMode::Coolant,
                 "compartments" => crate::OverlayMode::Compartments,
                 "atmosphere" => crate::OverlayMode::Atmosphere,
+                "ventilation" => crate::OverlayMode::Ventilation,
                 _ => crate::OverlayMode::Off,
             };
         }
@@ -2780,5 +2789,983 @@ fn slice4_dev_pins(
             crate::airtight::DoorPhase::Opening
         };
         door.hold_until = f64::MAX / 2.0;
+    }
+}
+
+// =====================================================================================
+// SLICE6_SCENARIO. Ventilation acceptance driver: A (stable starter network),
+// B (duct fill), C (exhaust room into tank), D (supply tank into low room),
+// E (closed-door bypass), F (blower power loss), G (reverse direction),
+// H (vent modes honor direction), I (tank valve), L (duct split),
+// M (reconnect), N (duct deconstruction with gas), P (breach drains the
+// network), Q (emergency isolation), R (independent networks), S (pause),
+// T (speed equivalence), U (sleep/wake). Mixed-gas, hot-gas and tank
+// teardown conservation live in tests/ventilation.rs.
+// =====================================================================================
+
+const S6_VENT_A: TilePos = TilePos::new(10, 13); // FABRICATION
+const S6_VENT_B: TilePos = TilePos::new(18, 3); // CREW QUARTERS
+const S6_BLOWER: TilePos = TilePos::new(12, 7);
+const S6_TANK: TilePos = TilePos::new(11, 7);
+
+fn s6_ship_gas(
+    atmo: &crate::atmosphere::AtmosphereGrid,
+    ducts: &crate::ventilation::DuctGrid,
+    tanks: &Query<(&TilePos, &mut crate::ventilation::GasTank)>,
+) -> [f64; 4] {
+    let mut out = crate::atmosphere::SPECIES.map(|s| atmo.onboard(s));
+    for (s, v) in out.iter_mut().enumerate() {
+        *v += ducts.stored(s);
+    }
+    for (_, t) in tanks.iter() {
+        for (v, m) in out.iter_mut().zip(t.mix.mol.iter()) {
+            *v += *m as f64;
+        }
+    }
+    out
+}
+
+fn s6_total_ship(
+    atmo: &crate::atmosphere::AtmosphereGrid,
+    ducts: &crate::ventilation::DuctGrid,
+    tanks: &Query<(&TilePos, &mut crate::ventilation::GasTank)>,
+) -> f64 {
+    s6_ship_gas(atmo, ducts, tanks).iter().sum()
+}
+
+fn s6_set_vent(
+    vents: &mut Query<(&TilePos, &mut crate::ventilation::Vent)>,
+    pos: TilePos,
+    mode: crate::ventilation::VentMode,
+    open: bool,
+) {
+    for (p, mut v) in vents.iter_mut() {
+        if *p == pos {
+            v.mode = mode;
+            v.open = open;
+        }
+    }
+}
+
+fn s6_set_blower(
+    blowers: &mut Query<(&TilePos, &mut crate::ventilation::Blower)>,
+    pos: TilePos,
+    dir: Option<crate::ventilation::Dir4>,
+    on: Option<bool>,
+) {
+    for (p, mut b) in blowers.iter_mut() {
+        if *p == pos {
+            if let Some(d) = dir {
+                b.dir = d;
+            }
+            if let Some(o) = on {
+                b.enabled = o;
+            }
+        }
+    }
+}
+
+fn s6_set_tank(
+    tanks: &mut Query<(&TilePos, &mut crate::ventilation::GasTank)>,
+    pos: TilePos,
+    valve_open: bool,
+) {
+    for (p, mut t) in tanks.iter_mut() {
+        if *p == pos {
+            t.valve_open = valve_open;
+        }
+    }
+}
+
+fn s6_tank_total(tanks: &Query<(&TilePos, &mut crate::ventilation::GasTank)>) -> f32 {
+    tanks
+        .iter()
+        .find(|(p, _)| **p == S6_TANK)
+        .map(|(_, t)| t.total())
+        .unwrap_or(0.0)
+}
+
+fn s6_tank_pressure(tanks: &Query<(&TilePos, &mut crate::ventilation::GasTank)>) -> f32 {
+    tanks
+        .iter()
+        .find(|(p, _)| **p == S6_TANK)
+        .map(|(_, t)| t.pressure())
+        .unwrap_or(0.0)
+}
+
+fn s6_vent_rate(vents: &Query<(&TilePos, &mut crate::ventilation::Vent)>, pos: TilePos) -> f32 {
+    vents
+        .iter()
+        .find(|(p, _)| **p == pos)
+        .map(|(_, v)| v.last_rate)
+        .unwrap_or(0.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::type_complexity)]
+fn slice6_driver(
+    (mut commands, mut exit, mut speed, mut actions, vsum): (
+        Commands,
+        EventWriter<AppExit>,
+        ResMut<crate::time_ctrl::GameSpeed>,
+        EventWriter<Action>,
+        Res<crate::ventilation::VentSummary>,
+    ),
+    clock: Res<crate::simtime::SimClock>,
+    mut map: ResMut<crate::map::ShipMap>,
+    mut thermal: ResMut<crate::thermal::ThermalGrid>,
+    mut atmo: ResMut<crate::atmosphere::AtmosphereGrid>,
+    mut astats: ResMut<crate::atmosphere::AtmoStats>,
+    mut ducts: ResMut<crate::ventilation::DuctGrid>,
+    mut vstats: ResMut<crate::ventilation::VentStats>,
+    comps: Res<crate::airtight::Compartments>,
+    (mut doors, mut vents, mut blowers, mut tanks, gens): (
+        Query<(&TilePos, &mut crate::airtight::Door)>,
+        Query<(&TilePos, &mut crate::ventilation::Vent)>,
+        Query<(&TilePos, &mut crate::ventilation::Blower)>,
+        Query<(&TilePos, &mut crate::ventilation::GasTank)>,
+        Query<(Entity, &crate::power::PowerRole)>,
+    ),
+    mut fired: Local<Vec<&'static str>>,
+    mut mol_baseline_c: Local<f64>,
+    mut tank_baseline_c: Local<f32>,
+) {
+    let Some(scenario) = std::env::var("SLICE6_SCENARIO").ok() else {
+        return;
+    };
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
+    let fab = s5_region_at(&comps, TilePos::new(10, 13));
+    let crew = s5_region_at(&comps, TilePos::new(18, 3));
+    #[allow(unused_variables)]
+    let corridor = s5_region_at(&comps, TilePos::new(10, 7));
+    let mut lock_door = |pos: TilePos, mode: crate::airtight::DoorMode| {
+        for (p, mut d) in doors.iter_mut() {
+            if *p == pos {
+                d.mode = mode;
+            }
+        }
+    };
+
+    match scenario.as_str() {
+        // A - stable starter network: nothing runs away, gas conserved,
+        // workload settles, blower powered.
+        "A" => {
+            if !fired.contains(&"speed") {
+                fired.push("speed");
+                speed.index = 3;
+            }
+            if !fired.contains(&"boot") && t >= 1.0 {
+                fired.push("boot");
+                println!(
+                    "S6_A_BOOT t={t:.1} duct_gas={:.0} tank={:.0} blowers={} active={} ship_total={:.0}",
+                    (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                    s6_tank_total(&tanks),
+                    blowers.iter().count(),
+                    ducts.awake_count(),
+                    s6_total_ship(&atmo, &ducts, &tanks),
+                );
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                let now = s6_ship_gas(&atmo, &ducts, &tanks);
+                println!(
+                    "S6_A_STABLE t={t:.1} ship_total={:.1} (rooms 48300 + tank 400) active={} duct_gas={:.0}",
+                    now.iter().sum::<f64>(),
+                    ducts.awake_count(),
+                    (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // B - new empty duct fills from the connected network.
+        "B" => {
+            if !fired.contains(&("dig")) && t >= 0.5 {
+                fired.push("dig");
+                ducts.set(TilePos::new(18, 2), true);
+            }
+            for (tag, at) in [("b1", 3.0), ("b2", 15.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S6_B_{tag} t={t:.1} new_tile={:.1} kPa neighbor={:.1} kPa conserved_total={:.1}",
+                        ducts.pressure_at(TilePos::new(18, 2)),
+                        ducts.pressure_at(TilePos::new(18, 3)),
+                        s6_total_ship(&atmo, &ducts, &tanks),
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 20.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // C - exhaust FABRICATION into the tank (a fresh vacuum tank pulls
+        // the room down through the exhaust vent; the blower charges it).
+        "C" => {
+            let fab_mol = |atmo: &crate::atmosphere::AtmosphereGrid, tiles: &[TilePos]| -> f64 {
+                tiles
+                    .iter()
+                    .map(|&p| atmo.mixture_at(p).total() as f64)
+                    .sum()
+            };
+            let tiles_fab = s5_region_tiles(&map, &comps, fab);
+            if !fired.contains(&"go") && t >= 0.5 {
+                fired.push("go");
+                // (baseline captured below in the same block)
+                for (_, tank) in tanks.iter() {
+                    astats.debug_removed(&tank.mix);
+                }
+                for (_, mut tank) in tanks.iter_mut() {
+                    tank.mix = crate::atmosphere::GasMixture::default();
+                }
+                *mol_baseline_c = fab_mol(&atmo, &tiles_fab);
+                *tank_baseline_c = s6_tank_total(&tanks);
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::West),
+                    Some(true),
+                );
+            }
+            let fab_mol = |atmo: &crate::atmosphere::AtmosphereGrid, tiles: &[TilePos]| -> f64 {
+                tiles
+                    .iter()
+                    .map(|&p| atmo.mixture_at(p).total() as f64)
+                    .sum()
+            };
+            let mol0v = *mol_baseline_c;
+            let tk0 = *tank_baseline_c;
+            // Ship audit: 48700 boot minus the ~400-unit tank drain at go.
+            for (tag, at) in [("c1", 15.0), ("c2", 60.0), ("c3", 150.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let moved_room = mol0v - fab_mol(&atmo, &tiles_fab);
+                    let gained_tank = s6_tank_total(&tanks) - tk0;
+                    println!(
+                        "S6_C_{tag} t={t:.1} fab_mol -{moved_room:.0} tank +{gained_tank:.0} units tank_p={:.0} kPa duct={:.0} ship={:.1} (48700)",
+                        s6_tank_pressure(&tanks),
+                        (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                        s6_total_ship(&atmo, &ducts, &tanks),
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 160.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // D - supply the tank into a lowered room.
+        "D" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                for p in s5_region_tiles(&map, &comps, crew) {
+                    let removed = atmo.remove_fraction(p, 0.4);
+                    astats.debug_removed(&removed);
+                }
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Supply,
+                    true,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            for (tag, at) in [("d0", 1.0), ("d1", 20.0), ("d2", 60.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let (cr, _, _) =
+                        s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                    println!(
+                        "S6_D_{tag} t={t:.1} crew_room={cr:.1} kPa tank={:.0} units ship={:.1}",
+                        s6_tank_total(&tanks),
+                        s6_total_ship(&atmo, &ducts, &tanks),
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // E - a locked door does not stop duct transport; a closed vent does.
+        "E" => {
+            let room_mol = |atmo: &crate::atmosphere::AtmosphereGrid, tiles: &[TilePos]| -> f64 {
+                tiles
+                    .iter()
+                    .map(|&p| atmo.mixture_at(p).total() as f64)
+                    .sum()
+            };
+            let tiles_crew = s5_region_tiles(&map, &comps, crew);
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                // A real gradient makes the bypass measurable: lower CREW by
+                // 30%, lock its door, then supply it through the duct.
+                for p in &tiles_crew {
+                    let removed = atmo.remove_fraction(*p, 0.3);
+                    astats.debug_removed(&removed);
+                }
+                *mol_baseline_c = room_mol(&atmo, &tiles_crew);
+                lock_door(TilePos::new(16, 6), crate::airtight::DoorMode::LockClosed);
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Supply,
+                    true,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            let crew0 = *mol_baseline_c;
+            for (tag, at) in [("e1", 30.0), ("e2", 60.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let gained = room_mol(&atmo, &tiles_crew) - crew0;
+                    println!(
+                        "S6_E_{tag} t={t:.1} door=LOCKED crew_mol {gained:+.0} since go | ventA={:.2} ventB={:.2} mol/s (duct bypass moves gas past the locked door)",
+                        s6_vent_rate(&vents, S6_VENT_A),
+                        s6_vent_rate(&vents, S6_VENT_B)
+                    );
+                }
+            }
+            if !fired.contains(&("stop")) && t >= 95.0 {
+                fired.push("stop");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Supply,
+                    false,
+                );
+            }
+            if !fired.contains(&"done") && t >= 110.0 {
+                fired.push("done");
+                let gained = room_mol(&atmo, &tiles_crew) - crew0;
+                println!(
+                    "S6_E_STOPPED t={t:.1} crew_mol {gained:+.0} total | ventA={:.2} ventB={:.2} (closed vent stops transport)",
+                    s6_vent_rate(&vents, S6_VENT_A),
+                    s6_vent_rate(&vents, S6_VENT_B)
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // F - blower power loss: reactor standby stops the active push.
+        "F" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                for p in s5_region_tiles(&map, &comps, crew) {
+                    let removed = atmo.remove_fraction(p, 0.4);
+                    astats.debug_removed(&removed);
+                }
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Supply,
+                    true,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            if !fired.contains(&("off")) && t >= 20.0 {
+                fired.push("off");
+                for (e, role) in gens.iter() {
+                    if let crate::power::PowerRole::Generator { on, .. } = *role {
+                        let _ = on;
+                        actions.write(Action::SetGeneratorOn { gen: e, on: false });
+                    }
+                }
+            }
+            for (tag, at) in [("f1", 18.0), ("f2", 40.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let (cr, _, _) =
+                        s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                    let flow = blowers
+                        .iter()
+                        .find(|(p, _)| **p == S6_BLOWER)
+                        .map(|(_, b)| b.last_flow)
+                        .unwrap_or(0.0);
+                    println!(
+                        "S6_F_{tag} t={t:.1} blower_flow={flow:.2} crew={cr:.1} kPa tank={:.0} ship={:.1}",
+                        s6_tank_total(&tanks),
+                        s6_total_ship(&atmo, &ducts, &tanks),
+                    );
+                }
+            }
+            if !fired.contains(&("on")) && t >= 45.0 {
+                fired.push("on");
+                for (e, role) in gens.iter() {
+                    if let crate::power::PowerRole::Generator { on, .. } = *role {
+                        let _ = on;
+                        actions.write(Action::SetGeneratorOn { gen: e, on: true });
+                    }
+                }
+            }
+            if !fired.contains(&"done") && t >= 60.0 {
+                fired.push("done");
+                let flow = blowers
+                    .iter()
+                    .find(|(p, _)| **p == S6_BLOWER)
+                    .map(|(_, b)| b.last_flow)
+                    .unwrap_or(0.0);
+                println!("S6_F_RECOVERED t={t:.1} blower_flow={flow:.2} (repowered)");
+                exit.write(AppExit::Success);
+            }
+        }
+        // G - direction: reversing the blower reverses the duct flow.
+        "G" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Supply,
+                    true,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            if !fired.contains(&("flip")) && t >= 30.0 {
+                fired.push("flip");
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::West),
+                    Some(true),
+                );
+            }
+            for (tag, at) in [("g1", 25.0), ("g2", 45.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    let i = ducts.idx(S6_BLOWER);
+                    println!(
+                        "S6_G_{tag} t={t:.1} flow_x_at_blower={:.2} (east=+ west=-)",
+                        ducts.flow_x[i]
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 50.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // H - vent modes honor their direction semantics.
+        "H" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                // Duct is at room pressure; a Supply vent with higher room
+                // pressure must NOT pull from the room.
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Supply,
+                    true,
+                );
+            }
+            for (tag, at, mode) in [
+                ("h1", 10.0, crate::ventilation::VentMode::Supply),
+                ("h2", 20.0, crate::ventilation::VentMode::Exhaust),
+                ("h3", 30.0, crate::ventilation::VentMode::Balanced),
+            ] {
+                if !fired.contains(&("set")) && t + 0.0 >= at - 10.0 && t < at {
+                    // no-op: mode already set at go; switch for the next tag
+                }
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S6_H_{tag} t={t:.1} ventA_mode={} rate={:.2}",
+                        match mode {
+                            crate::ventilation::VentMode::Supply => "Supply",
+                            crate::ventilation::VentMode::Exhaust => "Exhaust",
+                            crate::ventilation::VentMode::Balanced => "Balanced",
+                        },
+                        s6_vent_rate(&vents, S6_VENT_A)
+                    );
+                    // prepare the next mode
+                    let next = match tag {
+                        "h1" => crate::ventilation::VentMode::Exhaust,
+                        "h2" => crate::ventilation::VentMode::Balanced,
+                        _ => crate::ventilation::VentMode::Supply,
+                    };
+                    s6_set_vent(&mut vents, S6_VENT_A, next, true);
+                }
+            }
+            if !fired.contains(&("close")) && t >= 40.0 {
+                fired.push("close");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+            }
+            if !fired.contains(&"done") && t >= 50.0 {
+                fired.push("done");
+                println!(
+                    "S6_H_CLOSED t={t:.1} ventA_rate={:.2} (closed = zero transfer)",
+                    s6_vent_rate(&vents, S6_VENT_A)
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // I - tank valve isolates the stored gas.
+        "I" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_tank(&mut tanks, S6_TANK, false);
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            for (tag, at) in [("i1", 30.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S6_I_{tag} t={t:.1} tank={:.0} units (valve closed, unchanged) duct_gas={:.0}",
+                        s6_tank_total(&tanks),
+                        (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                    );
+                }
+            }
+            if !fired.contains(&("open")) && t >= 35.0 {
+                fired.push("open");
+                s6_set_tank(&mut tanks, S6_TANK, true);
+            }
+            if !fired.contains(&"done") && t >= 70.0 {
+                fired.push("done");
+                println!(
+                    "S6_I_REOPENED t={t:.1} tank={:.0} units (exchanges again)",
+                    s6_tank_total(&tanks)
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // L - cutting the duct splits the network, gas stays on its side.
+        "L" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            if !fired.contains(&("cut")) && t >= 30.0 {
+                fired.push("cut");
+                crate::ventilation::remove_duct_preserving_gas(
+                    &map,
+                    &mut ducts,
+                    &mut atmo,
+                    &mut thermal,
+                    &mut vstats,
+                    TilePos::new(13, 7),
+                );
+                println!(
+                    "S6_L_CUT t={t:.1} ducts_split nets={} ship={:.1}",
+                    vsum.networks,
+                    s6_total_ship(&atmo, &ducts, &tanks)
+                );
+            }
+            if !fired.contains(&"done") && t >= 50.0 {
+                fired.push("done");
+                let west: f64 = ducts
+                    .iter_ducts()
+                    .filter(|&p| p.x < 13)
+                    .map(|p| ducts.mixture_at(p).total() as f64)
+                    .sum();
+                let east: f64 = ducts
+                    .iter_ducts()
+                    .filter(|&p| p.x > 13)
+                    .map(|p| ducts.mixture_at(p).total() as f64)
+                    .sum();
+                println!(
+                    "S6_L_SPLIT t={t:.1} nets={} ship={:.1} west_gas={:.0} east_gas={:.0} (each side keeps its gas)",
+                    vsum.networks,
+                    s6_total_ship(&atmo, &ducts, &tanks),
+                    west,
+                    east,
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // M - reconnecting merges the topology and exchange resumes.
+        "M" => {
+            if !fired.contains(&("cut")) && t >= 0.5 {
+                fired.push("cut");
+                crate::ventilation::remove_duct_preserving_gas(
+                    &map,
+                    &mut ducts,
+                    &mut atmo,
+                    &mut thermal,
+                    &mut vstats,
+                    TilePos::new(13, 7),
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+            }
+            if !fired.contains(&("join")) && t >= 20.0 {
+                fired.push("join");
+                ducts.set(TilePos::new(13, 7), true);
+                println!("S6_M_JOIN t={t:.1} reconnected nets={}", vsum.networks);
+            }
+            if !fired.contains(&"done") && t >= 60.0 {
+                fired.push("done");
+                println!(
+                    "S6_M_MERGED t={t:.1} nets={} ship={:.1} duct_gas={:.0}",
+                    vsum.networks,
+                    s6_total_ship(&atmo, &ducts, &tanks),
+                    (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // N - duct deconstruction conserves gas.
+        "N" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+            }
+            if !fired.contains(&("rip")) && t >= 30.0 {
+                fired.push("rip");
+                let before = s6_total_ship(&atmo, &ducts, &tanks);
+                crate::ventilation::remove_duct_preserving_gas(
+                    &map,
+                    &mut ducts,
+                    &mut atmo,
+                    &mut thermal,
+                    &mut vstats,
+                    TilePos::new(11, 7),
+                );
+                let after = s6_total_ship(&atmo, &ducts, &tanks);
+                println!(
+                    "S6_N_RIP t={t:.1} before={before:.1} after={after:.1} vented={:.2}",
+                    vstats.vented_mol.iter().sum::<f64>(),
+                );
+            }
+            if !fired.contains(&"done") && t >= 40.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // P - a breach drains the connected network (the classic mistake).
+        "P" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                crate::atmosphere::carve_breach(
+                    &mut map,
+                    &mut thermal,
+                    &mut atmo,
+                    TilePos::new(0, 7),
+                );
+            }
+            for (tag, at) in [("p1", 20.0), ("p2", 60.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S6_P_{tag} t={t:.1} tank={:.0} duct_gas={:.0} atmo_vented={:.0} vent_vented={:.1}",
+                        s6_tank_total(&tanks),
+                        (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                        astats.vented_mol.iter().sum::<f64>(),
+                        vstats.vented_mol.iter().sum::<f64>(),
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                exit.write(AppExit::Success);
+            }
+        }
+        // Q - emergency isolation stops the loss.
+        "Q" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                crate::atmosphere::carve_breach(
+                    &mut map,
+                    &mut thermal,
+                    &mut atmo,
+                    TilePos::new(0, 7),
+                );
+            }
+            if !fired.contains(&("iso")) && t >= 40.0 {
+                fired.push("iso");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_tank(&mut tanks, S6_TANK, false);
+                s6_set_blower(&mut blowers, S6_BLOWER, None, Some(false));
+                lock_door(TilePos::new(6, 6), crate::airtight::DoorMode::LockClosed);
+                lock_door(TilePos::new(16, 6), crate::airtight::DoorMode::LockClosed);
+                println!(
+                    "S6_Q_ISO t={t:.1} tank={:.0} atmo_vented={:.0} (isolation applied)",
+                    s6_tank_total(&tanks),
+                    astats.vented_mol.iter().sum::<f64>(),
+                );
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                let (cr, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, crew));
+                println!(
+                    "S6_Q_STOPPED t={t:.1} tank={:.0} held | locked crew room {cr:.1} kPa | atmo_vented={:.0} (network isolated; the breached corridor vents on its own)",
+                    s6_tank_total(&tanks),
+                    astats.vented_mol.iter().sum::<f64>(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // R - two independent networks never cross-contaminate.
+        "R" => {
+            if !fired.contains(&("build")) && t >= 0.5 {
+                fired.push("build");
+                for p in [
+                    TilePos::new(4, 12),
+                    TilePos::new(4, 13),
+                    TilePos::new(5, 13),
+                ] {
+                    ducts.set(p, true);
+                }
+                commands.spawn((
+                    TilePos::new(5, 13),
+                    Footprint::new(5, 13, 1, 1),
+                    Building {
+                        kind: BuildingKind::Vent,
+                        foot: Footprint::new(5, 13, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    crate::ventilation::Vent::default(),
+                ));
+            }
+            if !fired.contains(&"done") && t >= 40.0 {
+                fired.push("done");
+                println!(
+                    "S6_R_NETS t={t:.1} networks={} starter_tank={:.0} second_duct_gas={:.1} ship={:.1} (independent: no cross-transfer)",
+                    vsum.networks,
+                    s6_tank_total(&tanks),
+                    ducts.mixture_at(TilePos::new(4, 12)).total()
+                        + ducts.mixture_at(TilePos::new(4, 13)).total()
+                        + ducts.mixture_at(TilePos::new(5, 13)).total(),
+                    s6_total_ship(&atmo, &ducts, &tanks),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // S - pause freezes ventilation progression.
+        "S" => {
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+            }
+            if !fired.contains(&("pause")) && t >= 10.0 {
+                fired.push("pause");
+                speed.index = 0;
+                println!(
+                    "S6_S_PAUSED t={t:.3} tank={:.2} duct_gas={:.2}",
+                    s6_tank_total(&tanks),
+                    (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                );
+            }
+            if fired.contains(&("pause")) {
+                let frames = fired.iter().filter(|&&f| f == "tick").count();
+                if frames < 90 {
+                    fired.push("tick");
+                } else if !fired.contains(&"done") {
+                    fired.push("done");
+                    println!(
+                        "S6_S_FROZEN t={t:.3} tank={:.2} duct_gas={:.2} sim_now={:.3} (unchanged)",
+                        s6_tank_total(&tanks),
+                        (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                        clock.now(),
+                    );
+                    exit.write(AppExit::Success);
+                }
+            }
+        }
+        // T - speed equivalence at a fixed simulation timestamp.
+        "T" => {
+            let idx: usize = std::env::var("SLICE0_SPEED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            if !fired.contains(&("setup")) {
+                fired.push("setup");
+                speed.index = idx;
+            }
+            if !fired.contains(&("go")) && t >= 0.5 {
+                fired.push("go");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Exhaust,
+                    true,
+                );
+                s6_set_blower(
+                    &mut blowers,
+                    S6_BLOWER,
+                    Some(crate::ventilation::Dir4::East),
+                    Some(true),
+                );
+            }
+            if !fired.contains(&"done") && clock.now() >= 3600.0 {
+                fired.push("done");
+                let now = s6_ship_gas(&atmo, &ducts, &tanks);
+                let (fa, _, _) =
+                    s5_region_pressure(&atmo, &thermal, &s5_region_tiles(&map, &comps, fab));
+                println!(
+                    "S6_T_EQ speed={idx} sim_t={:.0} fab={fa:.2} kPa tank={:.2} o2={:.2} inert={:.2} co2={:.2} active={}",
+                    clock.now(),
+                    s6_tank_total(&tanks),
+                    now[0],
+                    now[1],
+                    now[2],
+                    ducts.awake_count(),
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // U - sleep/wake: the settled network sleeps, a gradient wakes it.
+        "U" => {
+            for (tag, at) in [("u1", 1.0), ("u2", 60.0)] {
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!(
+                        "S6_U_{tag} t={t:.1} active_duct_cells={} duct_gas={:.0}",
+                        ducts.awake_count(),
+                        (0..4).map(|s| ducts.stored(s)).sum::<f64>(),
+                    );
+                }
+            }
+            if !fired.contains(&("wake")) && t >= 20.0 {
+                fired.push("wake");
+                for p in s5_region_tiles(&map, &comps, crew) {
+                    let removed = atmo.remove_fraction(p, 0.4);
+                    astats.debug_removed(&removed);
+                }
+            }
+            if !fired.contains(&("u3")) && t >= 25.0 {
+                fired.push("u3");
+                println!(
+                    "S6_U_WAKE t={t:.1} active_duct_cells={} (gradient arrives at vent B)",
+                    ducts.awake_count()
+                );
+            }
+            // Seal the network: with every interface closed the ducts have
+            // no gradients left and the workset goes to zero.
+            if !fired.contains(&("seal")) && t >= 60.0 {
+                fired.push("seal");
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_A,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_vent(
+                    &mut vents,
+                    S6_VENT_B,
+                    crate::ventilation::VentMode::Balanced,
+                    false,
+                );
+                s6_set_tank(&mut tanks, S6_TANK, false);
+                s6_set_blower(&mut blowers, S6_BLOWER, None, Some(false));
+            }
+            if !fired.contains(&"done") && t >= 90.0 {
+                fired.push("done");
+                println!(
+                    "S6_U_SETTLED t={t:.1} active_duct_cells={} (sealed network sleeps; open interfaces keep a bounded workset)",
+                    ducts.awake_count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        _ => {}
     }
 }

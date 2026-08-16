@@ -33,6 +33,7 @@ pub mod thermal;
 pub mod time_ctrl;
 pub mod ui;
 pub mod ui_overlay;
+pub mod ventilation;
 
 /// World-space size of one map tile.
 pub const TILE: f32 = 32.0;
@@ -62,6 +63,7 @@ pub enum OverlayMode {
     Coolant,
     Compartments,
     Atmosphere,
+    Ventilation,
 }
 
 impl OverlayMode {
@@ -73,6 +75,7 @@ impl OverlayMode {
             OverlayMode::Coolant => "Coolant",
             OverlayMode::Compartments => "Compartments",
             OverlayMode::Atmosphere => "Atmosphere",
+            OverlayMode::Ventilation => "Ventilation",
         }
     }
 
@@ -83,7 +86,8 @@ impl OverlayMode {
             OverlayMode::Thermal => OverlayMode::Coolant,
             OverlayMode::Coolant => OverlayMode::Compartments,
             OverlayMode::Compartments => OverlayMode::Atmosphere,
-            OverlayMode::Atmosphere => OverlayMode::Off,
+            OverlayMode::Atmosphere => OverlayMode::Ventilation,
+            OverlayMode::Ventilation => OverlayMode::Off,
         }
     }
 }

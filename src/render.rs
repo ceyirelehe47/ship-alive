@@ -115,6 +115,34 @@ pub struct CompTile;
 #[derive(Component)]
 pub struct AtmosphereOverlayRoot;
 
+/// Tags the ventilation overlay root entity (Slice 6).
+#[derive(Component)]
+pub struct VentOverlayRoot;
+
+/// Pooled duct tile sprite (one per duct cell).
+#[derive(Component)]
+pub struct DuctTile;
+
+/// Pooled flow arrow (one per duct cell, visible only when flowing).
+#[derive(Component)]
+pub struct DuctFlow;
+
+#[derive(Resource)]
+pub struct VentOverlayVis {
+    pub root: Entity,
+    /// Membership signature: duct layout version + device counts.
+    pub last_sig: u64,
+    /// One sprite per duct cell, in `iter_ducts()` order.
+    pub tiles: Vec<Entity>,
+    /// One arrow per duct cell (same order).
+    pub arrows: Vec<Entity>,
+    /// Last color bucket per duct slot (quantized pressure | network).
+    pub bucket: Vec<u32>,
+    pub refresh_acc: f32,
+    pub rebuilds: u32,
+    pub color_writes: u64,
+}
+
 /// Pooled atmosphere tile sprite (one per gas tile incl. doors).
 #[derive(Component)]
 pub struct AtmoTile;
@@ -249,6 +277,10 @@ impl Art {
             BuildingKind::Reservoir => &self.reservoir,
             BuildingKind::HeatExchanger => &self.heat_exchanger,
             BuildingKind::Radiator => &self.radiator,
+            BuildingKind::GasDuct => &self.dot,
+            BuildingKind::Vent => &self.ring,
+            BuildingKind::Blower => &self.pump,
+            BuildingKind::GasTank => &self.reservoir,
         }
     }
 
@@ -342,6 +374,7 @@ impl Plugin for RenderPlugin {
                 coolant_overlay_system,
                 compartment_overlay_system,
                 atmosphere_overlay_system,
+                ventilation_overlay_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -512,6 +545,9 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
             Visibility::Hidden,
         ))
         .id();
+    let vent_root = commands
+        .spawn((VentOverlayRoot, Transform::default(), Visibility::Hidden))
+        .id();
     commands.insert_resource(Markers {
         selection,
         hover,
@@ -563,6 +599,16 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
         tiles: Vec::new(),
         bucket: Vec::new(),
         labels: Vec::new(),
+        refresh_acc: 0.0,
+        rebuilds: 0,
+        color_writes: 0,
+    });
+    commands.insert_resource(VentOverlayVis {
+        root: vent_root,
+        last_sig: u64::MAX,
+        tiles: Vec::new(),
+        arrows: Vec::new(),
+        bucket: Vec::new(),
         refresh_acc: 0.0,
         rebuilds: 0,
         color_writes: 0,
@@ -1948,6 +1994,191 @@ fn brighten(c: Color, f: f32) -> Color {
     })
 }
 
+/// Ventilation overlay (Slice 6): one pooled sprite per duct cell tinted by
+/// derived duct pressure (reuse of the atmosphere pressure ramp), plus a
+/// small flow arrow on cells with current flow, blower direction markers
+/// (red = unpowered), vent mode dots and tank fill rings. Refresh is a
+/// bucket compare on a wall-clock cadence; membership rebuilds only on duct
+/// or device-set changes.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn ventilation_overlay_system(
+    mut commands: Commands,
+    real: Res<Time<Real>>,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    ducts: Res<crate::ventilation::DuctGrid>,
+    overlay: Res<crate::OverlayMode>,
+    vents: Query<(&TilePos, &crate::ventilation::Vent)>,
+    blowers: Query<(
+        &TilePos,
+        &crate::ventilation::Blower,
+        &crate::power::PowerStatus,
+    )>,
+    tanks: Query<(&TilePos, &crate::ventilation::GasTank)>,
+    mut vis: ResMut<VentOverlayVis>,
+    mut root_q: Query<&mut Visibility, With<VentOverlayRoot>>,
+    children_q: Query<&Children>,
+    mut tile_q: Query<&mut Sprite, With<DuctTile>>,
+    mut flow_q: Query<(&mut Sprite, &mut Transform), (With<DuctFlow>, Without<DuctTile>)>,
+) {
+    let active = *overlay == crate::OverlayMode::Ventilation;
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        let want = if active {
+            Visibility::Visible
+        } else {
+            Visibility::Hidden
+        };
+        if *v != want {
+            *v = want;
+        }
+    }
+    if !active {
+        return;
+    }
+
+    // Membership: duct version + device counts.
+    let device_sig = (vents.iter().count() as u64)
+        .wrapping_mul(1_000_003)
+        .wrapping_add(blowers.iter().count() as u64)
+        .wrapping_mul(1_000_033)
+        .wrapping_add(tanks.iter().count() as u64);
+    let sig = ducts.version ^ device_sig.rotate_left(17);
+    if sig != vis.last_sig {
+        vis.last_sig = sig;
+        vis.rebuilds += 1;
+        if let Ok(children) = children_q.get(vis.root) {
+            for &c in children {
+                commands.entity(c).despawn();
+            }
+        }
+        vis.tiles.clear();
+        vis.arrows.clear();
+        vis.bucket.clear();
+        for pos in ducts.iter_ducts() {
+            let tile = commands
+                .spawn((
+                    DuctTile,
+                    Sprite {
+                        image: art.floor.clone(),
+                        custom_size: Some(Vec2::splat(crate::TILE * 0.55)),
+                        color: Color::WHITE,
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(pos).extend(0.72)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            let arrow = commands
+                .spawn((
+                    DuctFlow,
+                    Sprite {
+                        image: art.dot.clone(),
+                        custom_size: Some(Vec2::new(crate::TILE * 0.34, crate::TILE * 0.16)),
+                        color: Color::srgba(0.2, 1.0, 1.0, 1.0),
+                        ..default()
+                    },
+                    Transform::from_translation(map.world_pos(pos).extend(0.73)),
+                ))
+                .insert(ChildOf(vis.root))
+                .id();
+            vis.tiles.push(tile);
+            vis.arrows.push(arrow);
+            vis.bucket.push(u32::MAX);
+        }
+    }
+
+    vis.refresh_acc += real.delta_secs();
+    if vis.refresh_acc < OVERLAY_REFRESH_SECS {
+        return;
+    }
+    vis.refresh_acc = 0.0;
+
+    let duct_list: Vec<TilePos> = ducts.iter_ducts().collect();
+    for (ti, &pos) in duct_list.iter().enumerate() {
+        let i = ducts.idx(pos);
+        let p = ducts.pressure_at(pos);
+        // 0.5 kPa quantization.
+        let p_bucket = (p * 2.0).clamp(0.0, u32::MAX as f32) as u32;
+        if p_bucket != vis.bucket[ti] {
+            vis.bucket[ti] = p_bucket;
+            if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+                sprite.color = crate::atmosphere::pressure_color(p);
+                vis.color_writes += 1;
+            }
+        }
+        // Flow arrow: direction from telemetry, rotated to match.
+        let (fx, fy) = (ducts.flow_x[i], ducts.flow_y[i]);
+        let mag = (fx * fx + fy * fy).sqrt();
+        if let Ok((mut sprite, mut tr)) = flow_q.get_mut(vis.arrows[ti]) {
+            if mag > 0.05 {
+                let angle = fy.atan2(fx);
+                tr.rotation = Quat::from_rotation_z(angle);
+                tr.translation = map.world_pos(pos).extend(0.73);
+                sprite.color = Color::srgba(0.2, 1.0, 1.0, 1.0);
+            } else {
+                sprite.color = Color::srgba(0.0, 0.0, 0.0, 0.0);
+            }
+        }
+    }
+    // Blower markers: bright arrow ring, red when unpowered.
+    for (pos, blower, power) in blowers.iter() {
+        let Some(ti) = duct_list.iter().position(|&p| p == *pos) else {
+            continue;
+        };
+        if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+            sprite.color = if !blower.enabled {
+                Color::srgb(0.45, 0.45, 0.5)
+            } else if power.ok() {
+                Color::srgb(0.35, 0.95, 1.0)
+            } else {
+                Color::srgb(1.0, 0.35, 0.3)
+            };
+            vis.color_writes += 1;
+        }
+        if let Ok((mut sprite, mut tr)) = flow_q.get_mut(vis.arrows[ti]) {
+            let d = blower.dir.delta();
+            let angle = (d.y as f32).atan2(d.x as f32);
+            tr.rotation = Quat::from_rotation_z(angle);
+            tr.translation = map.world_pos(*pos).extend(0.73);
+            sprite.color = if blower.enabled && power.ok() {
+                Color::srgba(0.4, 1.0, 1.0, 1.0)
+            } else {
+                Color::srgba(0.4, 0.4, 0.45, 0.6)
+            };
+        }
+    }
+    // Vent markers: mode color on the duct tile under them (dark = closed).
+    for (pos, vent) in vents.iter() {
+        let Some(ti) = duct_list.iter().position(|&p| p == *pos) else {
+            continue;
+        };
+        if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+            sprite.color = if !vent.open {
+                Color::srgb(0.55, 0.25, 0.25)
+            } else {
+                match vent.mode {
+                    crate::ventilation::VentMode::Supply => Color::srgb(0.4, 0.95, 0.5),
+                    crate::ventilation::VentMode::Exhaust => Color::srgb(0.98, 0.7, 0.25),
+                    crate::ventilation::VentMode::Balanced => Color::srgb(0.45, 0.85, 0.95),
+                }
+            };
+            vis.color_writes += 1;
+        }
+    }
+    // Tank markers: fill tint on the duct tile under them.
+    for (pos, tank) in tanks.iter() {
+        let Some(ti) = duct_list.iter().position(|&p| p == *pos) else {
+            continue;
+        };
+        if let Ok(mut sprite) = tile_q.get_mut(vis.tiles[ti]) {
+            let fill = (tank.total() / crate::ventilation::TANK_MOL).clamp(0.0, 1.0);
+            sprite.color = Color::srgb(0.5 + fill * 0.4, 0.7 - fill * 0.3, 0.4);
+            vis.color_writes += 1;
+        }
+    }
+}
+
 /// Selection ring, path preview dots, job target marker, hover ring and the
 /// build-tool ghost.
 #[allow(clippy::type_complexity)]
@@ -2086,6 +2317,7 @@ fn ghost_system(
     art: Res<Art>,
     cables: Res<CableGrid>,
     pipes: Res<crate::coolant::PipeGrid>,
+    ducts: Res<crate::ventilation::DuctGrid>,
     build_mode: Res<BuildMode>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -2149,6 +2381,7 @@ fn ghost_system(
                 &feet,
                 |p| cables.has(p),
                 |p| pipes.has(p),
+                |p| ducts.has(p),
             );
             let (color, text) = match &check {
                 Ok(()) => {

@@ -56,15 +56,17 @@ pub enum BuildCatKind {
     Machines,
     Power,
     Thermal,
+    Atmosphere,
 }
 
 impl BuildCatKind {
-    pub const ALL: [BuildCatKind; 5] = [
+    pub const ALL: [BuildCatKind; 6] = [
         BuildCatKind::Structure,
         BuildCatKind::Storage,
         BuildCatKind::Machines,
         BuildCatKind::Power,
         BuildCatKind::Thermal,
+        BuildCatKind::Atmosphere,
     ];
 
     pub fn label(self) -> &'static str {
@@ -74,6 +76,7 @@ impl BuildCatKind {
             BuildCatKind::Machines => "Machines",
             BuildCatKind::Power => "Power",
             BuildCatKind::Thermal => "Thermal",
+            BuildCatKind::Atmosphere => "Atmosphere",
         }
     }
 
@@ -89,6 +92,12 @@ impl BuildCatKind {
                 BuildingKind::HeatExchanger,
                 BuildingKind::Radiator,
                 BuildingKind::Reservoir,
+            ],
+            BuildCatKind::Atmosphere => &[
+                BuildingKind::GasDuct,
+                BuildingKind::Vent,
+                BuildingKind::Blower,
+                BuildingKind::GasTank,
             ],
         }
     }
@@ -145,7 +154,7 @@ const SEL_LINES: usize = 12;
 const SEL_BTNS: usize = 16;
 /// Fixed text lines in the inspect pane's environment view (room for the
 /// full power / thermal / compartments / storage / production blocks).
-const ENV_LINES: usize = 32;
+const ENV_LINES: usize = 36;
 
 #[derive(Resource)]
 pub struct Hud {
@@ -213,6 +222,8 @@ pub struct ThermalView<'w, 's> {
     pub atmo: Res<'w, crate::atmosphere::AtmosphereGrid>,
     pub atmo_summary: Res<'w, crate::atmosphere::AtmoSummary>,
     pub atmo_stats: Res<'w, crate::atmosphere::AtmoStats>,
+    pub vent: Res<'w, crate::ventilation::VentSummary>,
+    pub power: Res<'w, PowerState>,
 }
 
 fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, width: f32) -> Entity {
@@ -529,6 +540,7 @@ fn build_hud(mut commands: Commands) {
                                             BuildCatKind::Machines => "Machines:",
                                             BuildCatKind::Power => "Power:",
                                             BuildCatKind::Thermal => "Thermal:",
+                                            BuildCatKind::Atmosphere => "Atmosphere:",
                                         };
                                         label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
                                         for kind in cat.kinds() {
@@ -549,6 +561,10 @@ fn build_hud(mut commands: Commands) {
                                                     BuildingKind::Reservoir => 110.0,
                                                     BuildingKind::HeatExchanger => 118.0,
                                                     BuildingKind::Radiator => 76.0,
+                                                    BuildingKind::GasDuct => 86.0,
+                                                    BuildingKind::Vent => 60.0,
+                                                    BuildingKind::Blower => 72.0,
+                                                    BuildingKind::GasTank => 82.0,
                                                 },
                                             );
                                             pending_tool_btns.push((e, tool));
@@ -1026,6 +1042,36 @@ fn sidebar_system(
                 Color::WHITE
             },
         ));
+        // Ventilation block (Slice 6) — cached summary only.
+        let v = &thermal.vent;
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("VENTILATION".to_string(), dim));
+        lines.push((
+            format!(
+                "Networks {} | active {} | gas {:.0} units",
+                v.networks, v.active_cells, v.stored_mol
+            ),
+            Color::WHITE,
+        ));
+        lines.push((
+            format!(
+                "Blowers {}/{} powered{}",
+                v.blowers_on,
+                v.blowers_total,
+                if v.max_tank_p > 0.0 {
+                    format!(" | tanks {:.0} kPa", v.max_tank_p)
+                } else {
+                    String::new()
+                }
+            ),
+            match v.alert() {
+                Some(_) => Color::srgb(1.0, 0.55, 0.45),
+                None => Color::WHITE,
+            },
+        ));
+        if let Some(a) = v.alert() {
+            lines.push((a.to_string(), Color::srgb(1.0, 0.55, 0.45)));
+        }
         lines.push((String::new(), Color::WHITE));
         lines.push(("STORAGE".to_string(), dim));
         lines.push((
@@ -1299,6 +1345,24 @@ fn overlay_summary_system(
                     comps.doors_open,
                 );
             }
+            OverlayMode::Ventilation => {
+                let v = &thermal.vent;
+                summary = format!(
+                    "VENTILATION | {} network{} | duct gas {:.0} | active {} | blowers {}/{} powered{} | tanks {:.0} kPa max",
+                    v.networks,
+                    if v.networks == 1 { "" } else { "s" },
+                    v.stored_mol,
+                    v.active_cells,
+                    v.blowers_on,
+                    v.blowers_total,
+                    if v.alert().is_some() {
+                        format!(" | {}", v.alert().unwrap())
+                    } else {
+                        String::new()
+                    },
+                    v.max_tank_p,
+                );
+            }
             OverlayMode::Atmosphere => {
                 let a = &thermal.atmo_summary;
                 let exposed = thermal.comps.exposed_count();
@@ -1325,6 +1389,7 @@ fn overlay_summary_system(
     // Atmosphere loss outranks thermal warnings: air going out the hull is
     // the most time-critical thing on the ship.
     let atmo_alert = thermal.atmo_summary.alert();
+    let vent_alert = thermal.vent.alert();
 
     // ---- thermal alert (always visible when something is wrong) ----
     let mut alert = String::new();
@@ -1332,6 +1397,8 @@ fn overlay_summary_system(
     if let Some(a) = atmo_alert {
         alert = a.to_string();
         any_critical = alert.starts_with("ATMOSPHERE LOSS");
+    } else if let Some(v) = vent_alert {
+        alert = v.to_string();
     }
     for (_, state) in reactors.iter() {
         match state {
@@ -1585,6 +1652,25 @@ enum SelSig {
         mode: u8,
         demo: bool,
     },
+    Vent {
+        e: Entity,
+        /// VentMode index (0 Supply, 1 Exhaust, 2 Balanced).
+        mode: u8,
+        open: bool,
+        demo: bool,
+    },
+    Blower {
+        e: Entity,
+        /// Dir4 index (0 E, 1 W, 2 S, 3 N).
+        dir: u8,
+        on: bool,
+        demo: bool,
+    },
+    Tank {
+        e: Entity,
+        valve: bool,
+        demo: bool,
+    },
 }
 
 fn prio_code(p: &crate::crew::WorkPriorities) -> [u8; 3] {
@@ -1652,7 +1738,6 @@ fn selection_panel_system(
         Option<&MarkedForDeconstruct>,
         Option<&crate::thermal::ThermalState>,
     )>,
-    power_state: Res<PowerState>,
     thermal: ThermalView,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
     mut btn_q: Query<
@@ -1664,6 +1749,12 @@ fn selection_panel_system(
             Without<BuildCat>,
         ),
     >,
+    (vents_q, blowers_q, tanks_q, ducts): (
+        Query<(Entity, &TilePos, &crate::ventilation::Vent)>,
+        Query<(Entity, &TilePos, &crate::ventilation::Blower)>,
+        Query<(Entity, &TilePos, &crate::ventilation::GasTank)>,
+        Res<crate::ventilation::DuctGrid>,
+    ),
     mut last_sig: Local<SelSig>,
 ) {
     let now = clock.now();
@@ -1726,6 +1817,44 @@ fn selection_panel_system(
                         crate::airtight::DoorMode::HoldOpen => 1,
                         crate::airtight::DoorMode::LockClosed => 2,
                     },
+                    demo: buildings
+                        .get(e)
+                        .ok()
+                        .is_some_and(|(_, _, _, d)| d.is_some()),
+                }
+            } else if let Ok((_, _, vent)) = vents_q.get(e) {
+                SelSig::Vent {
+                    e,
+                    mode: match vent.mode {
+                        crate::ventilation::VentMode::Supply => 0,
+                        crate::ventilation::VentMode::Exhaust => 1,
+                        crate::ventilation::VentMode::Balanced => 2,
+                    },
+                    open: vent.open,
+                    demo: buildings
+                        .get(e)
+                        .ok()
+                        .is_some_and(|(_, _, _, d)| d.is_some()),
+                }
+            } else if let Ok((_, _, blower)) = blowers_q.get(e) {
+                SelSig::Blower {
+                    e,
+                    dir: match blower.dir {
+                        crate::ventilation::Dir4::East => 0,
+                        crate::ventilation::Dir4::West => 1,
+                        crate::ventilation::Dir4::South => 2,
+                        crate::ventilation::Dir4::North => 3,
+                    },
+                    on: blower.enabled,
+                    demo: buildings
+                        .get(e)
+                        .ok()
+                        .is_some_and(|(_, _, _, d)| d.is_some()),
+                }
+            } else if let Ok((_, _, tank)) = tanks_q.get(e) {
+                SelSig::Tank {
+                    e,
+                    valve: tank.valve_open,
                     demo: buildings
                         .get(e)
                         .ok()
@@ -1962,8 +2091,8 @@ fn selection_panel_system(
                         Color::srgb(1.0, 0.6, 0.45),
                     ));
                 }
-                if let Some(net) = power_state.device_net.get(&e) {
-                    if let Some(info) = power_state.networks.get(*net) {
+                if let Some(net) = thermal.power.device_net.get(&e) {
+                    if let Some(info) = thermal.power.networks.get(*net) {
                         lines.push((
                             format!("Network {}: {}", net + 1, info.summary()),
                             Color::WHITE,
@@ -2071,6 +2200,123 @@ fn selection_panel_system(
                     "Set the door mode below; View [P] → Compartments.".to_string(),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
+            } else if let (Ok((_, _, vent)), Ok((_, pos, _, _))) =
+                (vents_q.get(e), buildings.get(e))
+            {
+                lines.push((
+                    format!("Vent ({},{})", pos.x, pos.y),
+                    Color::srgb(0.65, 0.9, 1.0),
+                ));
+                let p_room = thermal.atmo.pressure_at(*pos, &thermal.grid);
+                let p_duct = ducts.pressure_at(*pos);
+                lines.push((
+                    format!(
+                        "Mode: {} | {}",
+                        vent.mode.label(),
+                        if vent.open { "open" } else { "closed" }
+                    ),
+                    if vent.open {
+                        Color::WHITE
+                    } else {
+                        Color::srgb(1.0, 0.55, 0.45)
+                    },
+                ));
+                lines.push((
+                    format!(
+                        "Room {:.0} kPa | duct {:.0} kPa | rate {:.1} mol/s",
+                        p_room, p_duct, vent.last_rate
+                    ),
+                    Color::WHITE,
+                ));
+                if !ducts.has(*pos) {
+                    lines.push((
+                        "NO DUCT UNDER THIS VENT".into(),
+                        Color::srgb(1.0, 0.55, 0.45),
+                    ));
+                }
+                lines.push((
+                    "Vents exchange only with their own tile; doors stay airtight.".to_string(),
+                    Color::srgb(0.6, 0.66, 0.72),
+                ));
+            } else if let (Ok((_, _, blower)), Ok((_, pos, _, _))) =
+                (blowers_q.get(e), buildings.get(e))
+            {
+                lines.push((
+                    format!("Blower ({},{})", pos.x, pos.y),
+                    Color::srgb(0.65, 0.9, 1.0),
+                ));
+                let dd = blower.dir.delta();
+                let out_p = TilePos::new(pos.x + dd.x, pos.y + dd.y);
+                lines.push((
+                    format!(
+                        "Push: {} | {} | flow {:.1} mol/s",
+                        blower.dir.label(),
+                        if blower.enabled { "on" } else { "off" },
+                        blower.last_flow
+                    ),
+                    if blower.enabled {
+                        Color::WHITE
+                    } else {
+                        Color::srgb(1.0, 0.55, 0.45)
+                    },
+                ));
+                lines.push((
+                    format!(
+                        "Inlet {:.0} kPa | outlet {:.0} kPa",
+                        ducts.pressure_at(*pos),
+                        ducts.pressure_at(out_p)
+                    ),
+                    Color::WHITE,
+                ));
+                if !ducts.has(*pos) {
+                    lines.push((
+                        "NO DUCT UNDER THIS BLOWER".into(),
+                        Color::srgb(1.0, 0.55, 0.45),
+                    ));
+                }
+            } else if let (Ok((_, _, tank)), Ok((_, pos, _, _))) =
+                (tanks_q.get(e), buildings.get(e))
+            {
+                lines.push((
+                    format!("Gas Tank ({},{})", pos.x, pos.y),
+                    Color::srgb(0.65, 0.9, 1.0),
+                ));
+                let p = tank.pressure();
+                lines.push((
+                    format!(
+                        "Valve: {} | {:.0} kPa | {:.0}/{} units",
+                        if tank.valve_open { "open" } else { "closed" },
+                        p,
+                        tank.total(),
+                        crate::ventilation::TANK_MOL as u32
+                    ),
+                    if p > crate::ventilation::TANK_HIGH_KPA {
+                        Color::srgb(1.0, 0.55, 0.45)
+                    } else if tank.valve_open {
+                        Color::WHITE
+                    } else {
+                        Color::srgb(1.0, 0.7, 0.4)
+                    },
+                ));
+                let m = &tank.mix;
+                let t = m.total();
+                lines.push((
+                    format!(
+                        "O2 {:.0}% | inert {:.0}% | CO2 {:.1}% | pollutant {:.1}% | {:.0}°C",
+                        if t > 0.0 { m.mol[0] / t * 100.0 } else { 0.0 },
+                        if t > 0.0 { m.mol[1] / t * 100.0 } else { 0.0 },
+                        if t > 0.0 { m.mol[2] / t * 100.0 } else { 0.0 },
+                        if t > 0.0 { m.mol[3] / t * 100.0 } else { 0.0 },
+                        tank.temp
+                    ),
+                    Color::WHITE,
+                ));
+                if !ducts.has(*pos) {
+                    lines.push((
+                        "NO DUCT UNDER THIS TANK".into(),
+                        Color::srgb(1.0, 0.55, 0.45),
+                    ));
+                }
             } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 lines.push((
                     format!("{} ({},{})", b.kind.label(), pos.x, pos.y),
@@ -2339,6 +2585,103 @@ fn selection_panel_system(
                             .active(m == current)
                     })
                     .collect();
+                if *demo {
+                    v.push(BtnCfg::new(
+                        "Cancel deconstruction",
+                        Action::UnmarkDeconstruct { building: *e },
+                    ));
+                } else {
+                    v.push(BtnCfg::new(
+                        "Deconstruct",
+                        Action::MarkDeconstruct { building: *e },
+                    ));
+                }
+                v
+            }
+            SelSig::Vent {
+                e,
+                mode,
+                open,
+                demo,
+            } => {
+                let current = match mode {
+                    0 => crate::ventilation::VentMode::Supply,
+                    1 => crate::ventilation::VentMode::Exhaust,
+                    _ => crate::ventilation::VentMode::Balanced,
+                };
+                let mut v: Vec<BtnCfg> = crate::ventilation::VentMode::ALL
+                    .iter()
+                    .map(|&m| {
+                        BtnCfg::new(m.label(), Action::SetVentMode { vent: *e, mode: m })
+                            .active(m == current)
+                    })
+                    .collect();
+                v.push(BtnCfg::new(
+                    if *open { "Close vent" } else { "Open vent" },
+                    Action::SetVentOpen {
+                        vent: *e,
+                        open: !*open,
+                    },
+                ));
+                if *demo {
+                    v.push(BtnCfg::new(
+                        "Cancel deconstruction",
+                        Action::UnmarkDeconstruct { building: *e },
+                    ));
+                } else {
+                    v.push(BtnCfg::new(
+                        "Deconstruct",
+                        Action::MarkDeconstruct { building: *e },
+                    ));
+                }
+                v
+            }
+            SelSig::Blower { e, dir, on, demo } => {
+                let current = match dir {
+                    0 => crate::ventilation::Dir4::East,
+                    1 => crate::ventilation::Dir4::West,
+                    2 => crate::ventilation::Dir4::South,
+                    _ => crate::ventilation::Dir4::North,
+                };
+                let mut v: Vec<BtnCfg> = crate::ventilation::Dir4::ALL
+                    .iter()
+                    .map(|&d| {
+                        BtnCfg::new(d.label(), Action::SetBlowerDir { blower: *e, dir: d })
+                            .active(d == current)
+                    })
+                    .collect();
+                v.push(BtnCfg::new(
+                    if *on { "Stop" } else { "Run" },
+                    Action::SetBlowerOn {
+                        blower: *e,
+                        on: !*on,
+                    },
+                ));
+                if *demo {
+                    v.push(BtnCfg::new(
+                        "Cancel deconstruction",
+                        Action::UnmarkDeconstruct { building: *e },
+                    ));
+                } else {
+                    v.push(BtnCfg::new(
+                        "Deconstruct",
+                        Action::MarkDeconstruct { building: *e },
+                    ));
+                }
+                v
+            }
+            SelSig::Tank { e, valve, demo } => {
+                let mut v = vec![BtnCfg::new(
+                    if *valve {
+                        "Valve: close"
+                    } else {
+                        "Valve: open"
+                    },
+                    Action::SetTankValve {
+                        tank: *e,
+                        open: !*valve,
+                    },
+                )];
                 if *demo {
                     v.push(BtnCfg::new(
                         "Cancel deconstruction",

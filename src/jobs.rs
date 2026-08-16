@@ -44,33 +44,53 @@ use std::collections::{HashMap, HashSet};
 #[derive(Event, Clone, Copy, Debug)]
 pub enum Action {
     /// Toggle the haul mark of the selected item.
-    ToggleMark { item: Entity },
+    ToggleMark {
+        item: Entity,
+    },
     /// Mark every ground item for hauling.
     MarkAll,
     /// Box-select: mark every (uncarried) ground item whose world position is
     /// inside the rectangle spanned by the two world-space corners.
-    MarkArea { from: Vec2, to: Vec2 },
+    MarkArea {
+        from: Vec2,
+        to: Vec2,
+    },
     /// Unmark everything and cancel all running haul jobs (drop carried items).
     CancelAll,
     /// Debug: remove the selected item entity from the world.
-    DeleteItem { item: Entity },
+    DeleteItem {
+        item: Entity,
+    },
     /// Debug: spawn one item of `kind` on a random free tile of the cargo hold.
-    SpawnItem { kind: ItemKind },
+    SpawnItem {
+        kind: ItemKind,
+    },
     /// UI-only: show/hide the developer toolbar (consumed by the UI plugin).
     ToggleDebug,
     /// Set simulation speed by index into [`crate::simtime::SPEED_SCALES`].
-    SetSpeed { index: usize },
+    SetSpeed {
+        index: usize,
+    },
     /// Toggle between Pause and the last non-paused speed (Space).
     TogglePause,
     // ---- Slice 1: construction -----------------------------------------
     /// Place a construction blueprint (origin = top-left footprint tile).
-    PlaceBlueprint { kind: BuildingKind, pos: TilePos },
+    PlaceBlueprint {
+        kind: BuildingKind,
+        pos: TilePos,
+    },
     /// Cancel a blueprint; refunds any materials already on site.
-    CancelBlueprint { blueprint: Entity },
+    CancelBlueprint {
+        blueprint: Entity,
+    },
     /// Mark a building for deconstruction.
-    MarkDeconstruct { building: Entity },
+    MarkDeconstruct {
+        building: Entity,
+    },
     /// Undo a deconstruction mark.
-    UnmarkDeconstruct { building: Entity },
+    UnmarkDeconstruct {
+        building: Entity,
+    },
     // ---- Slice 1: storage ----------------------------------------------
     /// Allow or deny one item kind on a rack.
     SetRackFilter {
@@ -80,11 +100,18 @@ pub enum Action {
     },
     // ---- Slice 1: production -------------------------------------------
     /// Add `batches` to a fabricator's order.
-    FabAddOrder { fab: Entity, batches: u32 },
+    FabAddOrder {
+        fab: Entity,
+        batches: u32,
+    },
     /// Toggle endless repeat on a fabricator's order.
-    FabRepeat { fab: Entity },
+    FabRepeat {
+        fab: Entity,
+    },
     /// Clear a fabricator's order (buffered input is kept).
-    FabClearOrder { fab: Entity },
+    FabClearOrder {
+        fab: Entity,
+    },
     // ---- Slice 1: work priorities --------------------------------------
     SetPriority {
         crew: Entity,
@@ -92,24 +119,59 @@ pub enum Action {
         level: Priority,
     },
     /// UI-only: select a build tool (consumed by the input plugin).
-    SetTool { tool: Option<crate::input::Tool> },
+    SetTool {
+        tool: Option<crate::input::Tool>,
+    },
     // ---- Slice 2: power --------------------------------------------------
     /// UI-only: cycle the map overlay view (off → power → thermal → coolant).
     CycleOverlay,
     /// Turn a reactor on or off.
-    SetGeneratorOn { gen: Entity, on: bool },
+    SetGeneratorOn {
+        gen: Entity,
+        on: bool,
+    },
     /// Mark an underfloor cable tile for deconstruction (spawns the
     /// transient tile entity the work system tears down).
-    MarkCableDeconstruct { pos: TilePos },
+    MarkCableDeconstruct {
+        pos: TilePos,
+    },
     /// Mark an underfloor coolant pipe tile for deconstruction (spawns the
     /// transient tile entity the work system tears down; water is preserved
     /// into the network where possible).
-    MarkPipeDeconstruct { pos: TilePos },
-    // ---- Slice 4: doors -------------------------------------------------
+    MarkPipeDeconstruct {
+        pos: TilePos,
+    },
+    // ---- Slice 4: doors ---------------------------------------------------
     /// Set a door's player mode (Auto / Hold Open / Lock Closed).
     SetDoorMode {
         door: Entity,
         mode: crate::airtight::DoorMode,
+    },
+    // ---- Slice 6: ventilation ---------------------------------------------
+    /// Mark an underfloor gas duct tile for deconstruction (gas is preserved
+    /// into the network / released to the room).
+    MarkDuctDeconstruct {
+        pos: TilePos,
+    },
+    SetVentMode {
+        vent: Entity,
+        mode: crate::ventilation::VentMode,
+    },
+    SetVentOpen {
+        vent: Entity,
+        open: bool,
+    },
+    SetBlowerDir {
+        blower: Entity,
+        dir: crate::ventilation::Dir4,
+    },
+    SetBlowerOn {
+        blower: Entity,
+        on: bool,
+    },
+    SetTankValve {
+        tank: Entity,
+        open: bool,
     },
 }
 
@@ -160,8 +222,11 @@ pub fn actions_system(
     mut racks: Query<(Entity, &TilePos, &mut StorageCell), Without<Crew>>,
     mut fabs: Query<(Entity, &mut Fabricator), Without<Crew>>,
     mut gens: Query<(Entity, &mut PowerRole)>,
-    cables: Res<CableGrid>,
-    pipes: Res<crate::coolant::PipeGrid>,
+    (cables, pipes, ducts): (
+        Res<CableGrid>,
+        Res<crate::coolant::PipeGrid>,
+        Option<Res<crate::ventilation::DuctGrid>>,
+    ),
     cable_tiles: Query<(Entity, &TilePos), (With<Building>, With<MarkedForDeconstruct>)>,
 ) {
     let now = clock.now();
@@ -301,6 +366,7 @@ pub fn actions_system(
                     &feet,
                     |p| cables.has(p),
                     |p| pipes.has(p),
+                    |p| ducts.as_ref().is_some_and(|d| d.has(p)),
                 ) {
                     Ok(()) => {
                         building::spawn_blueprint(&mut commands, kind, pos);
@@ -515,6 +581,40 @@ pub fn actions_system(
             }
             Action::SetDoorMode { .. } => {
                 // Consumed by airtight::door_action_system.
+            }
+            Action::SetVentMode { .. }
+            | Action::SetVentOpen { .. }
+            | Action::SetBlowerDir { .. }
+            | Action::SetBlowerOn { .. }
+            | Action::SetTankValve { .. } => {
+                // Consumed by ventilation::vent_action_system.
+            }
+            Action::MarkDuctDeconstruct { pos } => {
+                let Some(ducts) = ducts.as_ref() else {
+                    return;
+                };
+                if !ducts.has(pos) {
+                    log.push(now, LogKind::Fail, "No gas duct there");
+                } else if cable_tiles.iter().any(|(_, p)| *p == pos) {
+                    // Already marked (the transient-tile query covers duct
+                    // tiles: they are Building entities too).
+                } else {
+                    commands.spawn((
+                        TilePos::new(pos.x, pos.y),
+                        Footprint::new(pos.x, pos.y, 1, 1),
+                        Building {
+                            kind: BuildingKind::GasDuct,
+                            foot: Footprint::new(pos.x, pos.y, 1, 1),
+                            demo_progress: 0.0,
+                        },
+                        MarkedForDeconstruct,
+                    ));
+                    log.push(
+                        now,
+                        LogKind::Info,
+                        format!("Gas duct at ({},{}) marked for removal", pos.x, pos.y),
+                    );
+                }
             }
         }
     }
@@ -808,14 +908,27 @@ fn end_work(
 pub fn crew_task_system(
     // Dense world grids the job effects write to, nested into one system
     // param (Bevy caps flat params at 16).
-    (mut map, mut cables, mut pipes, mut water, mut thermal, mut atmo, mut cstats): (
+    (
+        mut map,
+        mut cables,
+        mut pipes,
+        mut water,
+        mut thermal,
+        mut atmo,
+        mut ducts,
+        mut vstats,
+        mut cstats,
+    ): (
         ResMut<ShipMap>,
         ResMut<CableGrid>,
         ResMut<crate::coolant::PipeGrid>,
         ResMut<crate::coolant::WaterGrid>,
         ResMut<crate::thermal::ThermalGrid>,
-        // Optional: minimal test worlds run the job loop without atmosphere.
+        // Optional: minimal test worlds run the job loop without atmosphere
+        // or ventilation.
         Option<ResMut<crate::atmosphere::AtmosphereGrid>>,
+        Option<ResMut<crate::ventilation::DuctGrid>>,
+        Option<ResMut<crate::ventilation::VentStats>>,
         ResMut<crate::coolant::CoolantStats>,
     ),
     clock: Res<SimClock>,
@@ -862,6 +975,10 @@ pub fn crew_task_system(
             &PowerStatus,
             Option<&crate::thermal::ThermalState>,
         ),
+        (Without<Crew>, Without<Blueprint>),
+    >,
+    tanks: Query<
+        (Entity, &TilePos, &crate::ventilation::GasTank),
         (Without<Crew>, Without<Blueprint>),
     >,
 ) {
@@ -1368,6 +1485,7 @@ pub fn crew_task_system(
                             &mut pipes,
                             &mut thermal,
                             atmo.as_deref_mut(),
+                            ducts.as_deref_mut(),
                             job.target,
                             &bp,
                             &crew_positions,
@@ -1452,6 +1570,7 @@ pub fn crew_task_system(
                     if job.timer <= 0.0 {
                         let rack_contents: Option<[u32; 3]> =
                             racks.get(job.target).ok().map(|(_, _, cell)| cell.counts);
+                        let tank_contents = tanks.get(job.target).ok().map(|(_, _, t)| *t);
                         building::complete_deconstruction(
                             &mut commands,
                             &mut map,
@@ -1461,6 +1580,9 @@ pub fn crew_task_system(
                             &mut cstats,
                             &mut thermal,
                             atmo.as_deref_mut(),
+                            ducts.as_deref_mut(),
+                            vstats.as_deref_mut(),
+                            tank_contents,
                             job.target,
                             &b,
                             rack_contents,

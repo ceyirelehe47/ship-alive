@@ -24,20 +24,47 @@ pub enum BuildingKind {
     PowerCable,
     /// Starter Reactor: a 2x2 generator device.
     Reactor,
+    // ---- Slice 3: thermal / coolant --------------------------------------
+    /// Underfloor coolant pipe (1 tile; lives in the PipeGrid).
+    CoolantPipe,
+    /// Coolant circulation pump (needs a pipe under it; power consumer).
+    Pump,
+    /// Coolant reservoir / water tank (needs a pipe under it).
+    Reservoir,
+    /// Passive air→water heat exchanger (needs a pipe under it).
+    HeatExchanger,
+    /// Water→space radiator (needs a pipe under it and a hull wall beside).
+    Radiator,
 }
 
 impl BuildingKind {
-    pub const ALL: [BuildingKind; 6] = [
+    pub const ALL: [BuildingKind; 11] = [
         BuildingKind::Wall,
         BuildingKind::Door,
         BuildingKind::Rack,
         BuildingKind::Fabricator,
         BuildingKind::PowerCable,
         BuildingKind::Reactor,
+        BuildingKind::CoolantPipe,
+        BuildingKind::Pump,
+        BuildingKind::Reservoir,
+        BuildingKind::HeatExchanger,
+        BuildingKind::Radiator,
     ];
 
     pub fn label(&self) -> &'static str {
         def(*self).label
+    }
+
+    /// Coolant hardware that must stand on an existing pipe tile.
+    pub fn needs_pipe(kind: BuildingKind) -> bool {
+        matches!(
+            kind,
+            BuildingKind::Pump
+                | BuildingKind::Reservoir
+                | BuildingKind::HeatExchanger
+                | BuildingKind::Radiator
+        )
     }
 }
 
@@ -135,7 +162,79 @@ pub fn def(kind: BuildingKind) -> BuildingDef {
             needs_clear_tiles: true,
             tile: Tile::Machine,
         },
+        BuildingKind::CoolantPipe => BuildingDef {
+            kind,
+            label: "Coolant Pipe",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 1],
+            work_secs: 90.0,
+            demo_secs: 60.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Pump => BuildingDef {
+            kind,
+            label: "Coolant Pump",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 2],
+            work_secs: 240.0,
+            demo_secs: 120.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Reservoir => BuildingDef {
+            kind,
+            label: "Coolant Reservoir",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 2],
+            work_secs: 240.0,
+            demo_secs: 120.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::HeatExchanger => BuildingDef {
+            kind,
+            label: "Heat Exchanger",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 2],
+            work_secs: 300.0,
+            demo_secs: 120.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
+        BuildingKind::Radiator => BuildingDef {
+            kind,
+            label: "Radiator",
+            w: 1,
+            h: 1,
+            cost: [0, 0, 3],
+            work_secs: 300.0,
+            demo_secs: 150.0,
+            blocks: false,
+            needs_clear_tiles: false,
+            tile: Tile::Floor,
+        },
     }
+}
+
+/// True when `p` is 4-adjacent to a hull wall tile (radiator placement rule).
+pub fn hull_adjacent(map: &ShipMap, p: TilePos) -> bool {
+    [
+        TilePos::new(p.x + 1, p.y),
+        TilePos::new(p.x - 1, p.y),
+        TilePos::new(p.x, p.y + 1),
+        TilePos::new(p.x, p.y - 1),
+    ]
+    .iter()
+    .any(|&n| map.tile(n) == Some(Tile::Wall))
 }
 
 /// Rectangular grid footprint. `x`/`y` is the top-left tile.
@@ -258,6 +357,9 @@ pub enum PlacementError {
     OverlapsBuilding,
     OverlapsBlueprint,
     CableExists,
+    PipeExists,
+    NoPipe,
+    NotAtHull,
 }
 
 impl PlacementError {
@@ -269,6 +371,9 @@ impl PlacementError {
             PlacementError::OverlapsBuilding => "overlaps an existing building",
             PlacementError::OverlapsBlueprint => "overlaps another blueprint",
             PlacementError::CableExists => "a cable already runs here",
+            PlacementError::PipeExists => "a pipe already runs here",
+            PlacementError::NoPipe => "needs a coolant pipe under it",
+            PlacementError::NotAtHull => "radiators must sit against the outer hull",
         }
     }
 }
@@ -281,34 +386,40 @@ pub fn can_place(
     ground_items: &[TilePos],
     buildings: &[(Footprint, bool)], // (footprint, is_blueprint)
     has_cable: impl Fn(TilePos) -> bool,
+    has_pipe: impl Fn(TilePos) -> bool,
 ) -> Result<(), PlacementError> {
     let d = def(kind);
     let foot = Footprint::new(origin.x, origin.y, d.w, d.h);
-    if kind == BuildingKind::PowerCable {
+    if kind == BuildingKind::PowerCable || kind == BuildingKind::CoolantPipe {
         // Underfloor: any interior tile works (under room walls, machines,
         // doors), but never the hull shell — i.e. never the map border —
-        // never twice, never under a pending cable plan.
+        // never twice, never under a pending plan of the same layer.
         let on_border = origin.x == 0
             || origin.y == 0
             || origin.x == map.width - 1
             || origin.y == map.height - 1;
-        return if on_border || !map.in_bounds(origin) {
-            Err(PlacementError::OutsideShip)
-        } else {
-            match map.tile(origin) {
-                _ if has_cable(origin) => Err(PlacementError::CableExists),
-                _ => {
-                    let dup_bp = buildings
-                        .iter()
-                        .any(|(f, is_bp)| *is_bp && f.w == 1 && f.h == 1 && f.contains(origin));
-                    if dup_bp {
-                        Err(PlacementError::CableExists)
-                    } else {
-                        Ok(())
-                    }
-                }
+        if on_border || !map.in_bounds(origin) {
+            return Err(PlacementError::OutsideShip);
+        }
+        let dup_layer = |f: &Footprint| f.w == 1 && f.h == 1 && f.contains(origin);
+        if kind == BuildingKind::PowerCable {
+            if has_cable(origin) {
+                return Err(PlacementError::CableExists);
             }
-        };
+            if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
+                return Err(PlacementError::CableExists);
+            }
+        } else {
+            if has_pipe(origin) {
+                return Err(PlacementError::PipeExists);
+            }
+            // Same rule as cables: never plan a pipe under a pending 1x1
+            // plan (surface buildings go in first, utilities after).
+            if buildings.iter().any(|(f, is_bp)| *is_bp && dup_layer(f)) {
+                return Err(PlacementError::PipeExists);
+            }
+        }
+        return Ok(());
     }
     for t in foot.tiles() {
         match map.tile(t) {
@@ -320,6 +431,15 @@ pub fn can_place(
         }
         if d.needs_clear_tiles && ground_items.contains(&t) {
             return Err(PlacementError::ItemInWay);
+        }
+    }
+    // Coolant hardware stands on an existing pipe tile.
+    if BuildingKind::needs_pipe(kind) {
+        if !has_pipe(origin) {
+            return Err(PlacementError::NoPipe);
+        }
+        if kind == BuildingKind::Radiator && !hull_adjacent(map, origin) {
+            return Err(PlacementError::NotAtHull);
         }
     }
     for (other, is_bp) in buildings {
@@ -404,6 +524,8 @@ pub fn complete_building(
     commands: &mut Commands,
     map: &mut ShipMap,
     cables: &mut crate::power::CableGrid,
+    pipes: &mut crate::coolant::PipeGrid,
+    thermal: &mut crate::thermal::ThermalGrid,
     blueprint: Entity,
     bp: &Blueprint,
     crew_positions: &[(Entity, TilePos)],
@@ -427,8 +549,29 @@ pub fn complete_building(
         );
         return;
     }
+    if bp.kind == BuildingKind::CoolantPipe {
+        // Pipes rest in the dense underfloor layer; new tiles start empty and
+        // fill from the network's circulation.
+        for t in bp.foot.tiles() {
+            pipes.set(t, true);
+        }
+        commands.entity(blueprint).despawn();
+        stats.built += 1;
+        log.push(
+            now,
+            crate::log::LogKind::Job,
+            format!("Coolant pipe laid at ({},{})", bp.foot.x, bp.foot.y),
+        );
+        return;
+    }
     for t in bp.foot.tiles() {
+        let old = map.tile(t);
         map.set_tile(t, d.tile);
+        // Keep the thermal grid's solid/open classification in sync (the
+        // conversion preserves temperature; see ThermalGrid::tile_changed).
+        if old != Some(d.tile) {
+            thermal.tile_changed(t, d.tile);
+        }
     }
     // Displace crews standing on tiles that just became blocked.
     if d.blocks {
@@ -474,10 +617,45 @@ pub fn complete_building(
                 crate::power::FABRICATOR_DEMAND,
             ));
             ec.insert(crate::power::PowerStatus::default());
+            ec.insert(crate::thermal::ThermalBody::fabricator());
+            ec.insert(crate::thermal::ThermalState::default());
         }
         BuildingKind::Reactor => {
             ec.insert(crate::power::PowerRole::generator());
             ec.insert(crate::power::PowerStatus::default());
+            ec.insert(crate::thermal::ThermalBody::reactor());
+            ec.insert(crate::thermal::ThermalState::default());
+        }
+        BuildingKind::Pump => {
+            ec.insert(crate::coolant::Pump);
+            ec.insert(crate::power::PowerRole::consumer(
+                crate::coolant::PUMP_DEMAND,
+            ));
+            ec.insert(crate::power::PowerStatus::default());
+            ec.insert(crate::thermal::ThermalBody::pump());
+            ec.insert(crate::thermal::ThermalState::default());
+        }
+        BuildingKind::Reservoir => {
+            ec.insert(crate::coolant::Reservoir);
+            ec.insert(crate::thermal::ThermalBody::passive(20.0));
+            ec.insert(crate::thermal::ThermalState::default());
+        }
+        BuildingKind::HeatExchanger => {
+            ec.insert(crate::coolant::HeatExchanger);
+            ec.insert(crate::thermal::ThermalBody::passive(8.0));
+            ec.insert(crate::thermal::ThermalState::default());
+        }
+        BuildingKind::Radiator => {
+            let hull_ok = hull_adjacent(
+                map,
+                bp.foot
+                    .tiles()
+                    .next()
+                    .unwrap_or(TilePos::new(bp.foot.x, bp.foot.y)),
+            );
+            ec.insert(crate::coolant::Radiator { hull_ok });
+            ec.insert(crate::thermal::ThermalBody::passive(10.0));
+            ec.insert(crate::thermal::ThermalState::default());
         }
         _ => {}
     }
@@ -515,6 +693,10 @@ pub fn complete_deconstruction(
     commands: &mut Commands,
     map: &mut ShipMap,
     cables: &mut crate::power::CableGrid,
+    pipes: &mut crate::coolant::PipeGrid,
+    water: &mut crate::coolant::WaterGrid,
+    cstats: &mut crate::coolant::CoolantStats,
+    thermal: &mut crate::thermal::ThermalGrid,
     building: Entity,
     b: &Building,
     rack_contents: Option<[u32; 3]>,
@@ -538,8 +720,39 @@ pub fn complete_deconstruction(
         );
         return;
     }
+    if b.kind == BuildingKind::CoolantPipe {
+        // Water is pushed into the neighbouring pipe tiles first; only a
+        // genuinely full network spills (and says so).
+        let mut spilled = 0.0f32;
+        for t in b.foot.tiles() {
+            spilled += crate::coolant::remove_pipe_preserving_water(pipes, water, cstats, t);
+        }
+        commands.entity(building).despawn();
+        stats.deconstructed += 1;
+        if spilled > 1e-4 {
+            log.push(
+                now,
+                crate::log::LogKind::Fail,
+                format!(
+                    "Coolant pipe removed at ({},{}) — {spilled:.1} water spilled (network full)",
+                    b.foot.x, b.foot.y
+                ),
+            );
+        } else {
+            log.push(
+                now,
+                crate::log::LogKind::Job,
+                format!("Coolant pipe removed at ({},{})", b.foot.x, b.foot.y),
+            );
+        }
+        return;
+    }
     for t in b.foot.tiles() {
+        let old = map.tile(t);
         map.set_tile(t, Tile::Floor);
+        if old != Some(Tile::Floor) {
+            thermal.tile_changed(t, Tile::Floor);
+        }
     }
     // Full refund of the build cost, plus everything a rack had stored.
     let mut occupied: Vec<TilePos> = ground_now.to_vec();

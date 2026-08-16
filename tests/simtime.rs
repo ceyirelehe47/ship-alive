@@ -29,6 +29,14 @@ fn frames() -> Frames {
     world.insert_resource(EventLog::default());
     world.insert_resource(ship_alive::stats::Stats::default());
     world.insert_resource(ship_alive::power::CableGrid::new(w, h));
+    world.insert_resource(ship_alive::coolant::PipeGrid::new(w, h));
+    world.insert_resource(ship_alive::coolant::WaterGrid::new(w, h));
+    let thermal_grid = {
+        let map = world.resource::<ship_alive::map::ShipMap>();
+        ship_alive::thermal::ThermalGrid::new(map)
+    };
+    world.insert_resource(thermal_grid);
+    world.insert_resource(ship_alive::coolant::CoolantStats::default());
     world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(SimClock::default());
     world.init_resource::<Events<Action>>();

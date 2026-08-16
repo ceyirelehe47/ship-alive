@@ -13,7 +13,7 @@ use crate::crew::{Crew, CrewTask, HaulDest, HaulPhase, Movement};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::map::{ShipMap, TilePos};
-use crate::power::{CableGrid, PowerOverlay, PowerRole, PowerState, PowerStatus};
+use crate::power::{CableGrid, PowerRole, PowerState, PowerStatus};
 use crate::production::{MachineState, RECIPE};
 use crate::storage::StorageCell;
 use bevy::prelude::*;
@@ -63,6 +63,26 @@ pub struct PowerOverlayVis {
     pub last_sig: u64,
 }
 
+/// Tags the thermal heat-map overlay root entity.
+#[derive(Component)]
+pub struct ThermalOverlayRoot;
+
+#[derive(Resource)]
+pub struct ThermalOverlayVis {
+    pub root: Entity,
+    pub last_sig: u64,
+}
+
+/// Tags the coolant overlay root entity.
+#[derive(Component)]
+pub struct CoolantOverlayRoot;
+
+#[derive(Resource)]
+pub struct CoolantOverlayVis {
+    pub root: Entity,
+    pub last_sig: u64,
+}
+
 /// Persistent selection/path marker entities (pooled, hidden when unused).
 #[derive(Resource)]
 pub struct Markers {
@@ -85,6 +105,10 @@ pub struct Art {
     pub rack: Handle<Image>,
     pub fabricator: Handle<Image>,
     pub reactor: Handle<Image>,
+    pub pump: Handle<Image>,
+    pub reservoir: Handle<Image>,
+    pub heat_exchanger: Handle<Image>,
+    pub radiator: Handle<Image>,
     pub crate_: Handle<Image>,
     pub ore: Handle<Image>,
     pub part: Handle<Image>,
@@ -110,6 +134,11 @@ impl Art {
             BuildingKind::Fabricator => &self.fabricator,
             BuildingKind::Reactor => &self.reactor,
             BuildingKind::PowerCable => &self.dot,
+            BuildingKind::CoolantPipe => &self.dot,
+            BuildingKind::Pump => &self.pump,
+            BuildingKind::Reservoir => &self.reservoir,
+            BuildingKind::HeatExchanger => &self.heat_exchanger,
+            BuildingKind::Radiator => &self.radiator,
         }
     }
 
@@ -142,6 +171,10 @@ impl Art {
             rack: fill("art/rack.png", [58, 118, 118, 255]),
             fabricator: fill("art/fabricator.png", [112, 122, 146, 255]),
             reactor: fill("art/reactor.png", [92, 168, 110, 255]),
+            pump: fill("art/pump.png", [64, 168, 178, 255]),
+            reservoir: fill("art/reservoir.png", [62, 104, 168, 255]),
+            heat_exchanger: fill("art/heat_exchanger.png", [186, 142, 78, 255]),
+            radiator: fill("art/radiator.png", [126, 134, 178, 255]),
             crate_: fill("art/crate.png", [198, 166, 112, 255]),
             ore: fill("art/ore.png", [150, 92, 62, 255]),
             part: fill("art/part.png", [134, 134, 172, 255]),
@@ -176,6 +209,7 @@ pub struct RenderPlugin;
 
 impl Plugin for RenderPlugin {
     fn build(&self, app: &mut App) {
+        app.init_resource::<crate::OverlayMode>();
         app.add_systems(
             Startup,
             (spawn_tile_visuals, spawn_room_labels, spawn_markers),
@@ -191,6 +225,8 @@ impl Plugin for RenderPlugin {
                 sync_selection_system,
                 ghost_system,
                 power_overlay_system,
+                thermal_overlay_system,
+                coolant_overlay_system,
                 cleanup_visuals_system,
             )
                 .chain()
@@ -341,6 +377,12 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
     let power_root = commands
         .spawn((PowerOverlayRoot, Transform::default(), Visibility::Hidden))
         .id();
+    let thermal_root = commands
+        .spawn((ThermalOverlayRoot, Transform::default(), Visibility::Hidden))
+        .id();
+    let coolant_root = commands
+        .spawn((CoolantOverlayRoot, Transform::default(), Visibility::Hidden))
+        .id();
     commands.insert_resource(Markers {
         selection,
         hover,
@@ -351,6 +393,14 @@ pub fn spawn_markers(mut commands: Commands, art: Res<Art>) {
     });
     commands.insert_resource(PowerOverlayVis {
         root: power_root,
+        last_sig: 0,
+    });
+    commands.insert_resource(ThermalOverlayVis {
+        root: thermal_root,
+        last_sig: 0,
+    });
+    commands.insert_resource(CoolantOverlayVis {
+        root: coolant_root,
         last_sig: 0,
     });
 }
@@ -826,15 +876,19 @@ fn power_overlay_system(
     art: Res<Art>,
     cables: Res<CableGrid>,
     state: Res<PowerState>,
-    overlay: Res<PowerOverlay>,
+    overlay: Res<crate::OverlayMode>,
     mut vis: ResMut<PowerOverlayVis>,
     devices: Query<(&Footprint, &PowerRole, &PowerStatus)>,
     mut root_q: Query<&mut Visibility, With<PowerOverlayRoot>>,
     children_q: Query<&Children>,
 ) {
     // Signature: anything that changes what the overlay should draw.
-    let mut sig = if overlay.0 { cables.version } else { 0 };
-    if overlay.0 {
+    let mut sig = if *overlay == crate::OverlayMode::Power {
+        cables.version
+    } else {
+        0
+    };
+    if *overlay == crate::OverlayMode::Power {
         for n in &state.networks {
             sig = sig
                 .wrapping_mul(31)
@@ -855,7 +909,7 @@ fn power_overlay_system(
             commands.entity(c).despawn();
         }
     }
-    if !overlay.0 {
+    if *overlay != crate::OverlayMode::Power {
         if let Ok(mut v) = root_q.get_mut(vis.root) {
             *v = Visibility::Hidden;
         }
@@ -902,6 +956,209 @@ fn power_overlay_system(
                     ..default()
                 },
                 Transform::from_translation(p.extend(0.93)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+}
+
+/// Thermal heat map: every open tile tinted by ambient temperature, device
+/// footprints ringed by thermal state. Rebuilt when a tile crosses a whole
+/// degree or a state flips (temps are quantized into the signature).
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn thermal_overlay_system(
+    mut commands: Commands,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    grid: Res<crate::thermal::ThermalGrid>,
+    overlay: Res<crate::OverlayMode>,
+    mut vis: ResMut<ThermalOverlayVis>,
+    devices: Query<(&Footprint, &Building, &crate::thermal::ThermalState)>,
+    mut root_q: Query<&mut Visibility, With<ThermalOverlayRoot>>,
+    children_q: Query<&Children>,
+) {
+    let active = *overlay == crate::OverlayMode::Thermal;
+    let mut sig: u64 = if active { 1 } else { 0 };
+    if active {
+        for &t in &grid.amb {
+            // Quantize to whole degrees so slow drift does not rebuild 60x/s.
+            sig = sig.wrapping_mul(31).wrapping_add(t.round() as i64 as u64);
+        }
+        for (_, _, s) in devices.iter() {
+            sig = sig.wrapping_mul(7).wrapping_add(*s as u64 + 1);
+        }
+    }
+    if sig == vis.last_sig {
+        return;
+    }
+    vis.last_sig = sig;
+    if let Ok(children) = children_q.get(vis.root) {
+        for &c in children {
+            commands.entity(c).despawn();
+        }
+    }
+    if !active {
+        if let Ok(mut v) = root_q.get_mut(vis.root) {
+            *v = Visibility::Hidden;
+        }
+        return;
+    }
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        *v = Visibility::Visible;
+    }
+    for (pos, tile) in map.iter_tiles() {
+        let solid = matches!(tile, crate::map::Tile::Wall | crate::map::Tile::BuiltWall);
+        if solid {
+            continue;
+        }
+        let t = grid.amb_at(pos);
+        let mut color = crate::thermal::heat_color(t);
+        let Color::Srgba(ref mut c) = color else {
+            continue;
+        };
+        c.alpha = 0.40;
+        commands
+            .spawn((
+                Sprite {
+                    image: art.floor.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE)),
+                    color,
+                    ..default()
+                },
+                Transform::from_translation(map.world_pos(pos).extend(0.70)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+    for (foot, _, state) in devices.iter() {
+        let p = foot_world_pos(foot);
+        commands
+            .spawn((
+                Sprite {
+                    image: art.ring.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * foot.w.max(foot.h) as f32 * 1.08)),
+                    color: state.color(),
+                    ..default()
+                },
+                Transform::from_translation(p.extend(0.93)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+}
+
+/// Coolant overlay: pipe tiles tinted by water temperature (alpha tracks how
+/// full the tile is), rings on pump / exchanger / radiator devices.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn coolant_overlay_system(
+    mut commands: Commands,
+    map: Res<ShipMap>,
+    art: Res<Art>,
+    pipes: Res<crate::coolant::PipeGrid>,
+    water: Res<crate::coolant::WaterGrid>,
+    overlay: Res<crate::OverlayMode>,
+    mut vis: ResMut<CoolantOverlayVis>,
+    devices: Query<(&Footprint, &Building, Option<&crate::power::PowerStatus>)>,
+    pumps: Query<(&Footprint, &crate::power::PowerStatus), With<crate::coolant::Pump>>,
+    mut root_q: Query<&mut Visibility, With<CoolantOverlayRoot>>,
+    children_q: Query<&Children>,
+) {
+    let active = *overlay == crate::OverlayMode::Coolant;
+    let mut sig: u64 = if active { pipes.version } else { 0 };
+    if active {
+        for i in 0..water.amount.len() {
+            sig = sig
+                .wrapping_mul(31)
+                .wrapping_add((water.temp[i].round() as i64 as u64) << 8)
+                .wrapping_add((water.amount[i] * 4.0) as u64);
+        }
+        for (_, st) in pumps.iter() {
+            sig = sig.wrapping_mul(7).wrapping_add(*st as u64 + 1);
+        }
+    }
+    if sig == vis.last_sig {
+        return;
+    }
+    vis.last_sig = sig;
+    if let Ok(children) = children_q.get(vis.root) {
+        for &c in children {
+            commands.entity(c).despawn();
+        }
+    }
+    if !active {
+        if let Ok(mut v) = root_q.get_mut(vis.root) {
+            *v = Visibility::Hidden;
+        }
+        return;
+    }
+    if let Ok(mut v) = root_q.get_mut(vis.root) {
+        *v = Visibility::Visible;
+    }
+    let temp_color = |t: f32| {
+        // 15..70 °C → blue..red through the shared heat ramp.
+        crate::thermal::heat_color(t.clamp(0.0, 75.0))
+    };
+    for tile in pipes.iter_pipes() {
+        let i = pipes.idx(tile);
+        let (amount, temp) = (water.amount[i], water.temp[i]);
+        let mut color = temp_color(temp);
+        let Color::Srgba(ref mut c) = color else {
+            continue;
+        };
+        c.alpha = if amount <= 0.0 {
+            0.12
+        } else {
+            (0.25 + 0.55 * (amount / crate::coolant::PIPE_TILE_CAP).min(1.0)).min(0.85)
+        };
+        commands
+            .spawn((
+                Sprite {
+                    image: art.dot.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * 0.6)),
+                    color,
+                    ..default()
+                },
+                Transform::from_translation(map.world_pos(tile).extend(0.72)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+    for (foot, building, status) in devices.iter() {
+        let is_coolant = matches!(
+            building.kind,
+            BuildingKind::Pump
+                | BuildingKind::Reservoir
+                | BuildingKind::HeatExchanger
+                | BuildingKind::Radiator
+        );
+        if !is_coolant {
+            continue;
+        }
+        let p = foot_world_pos(foot);
+        let color = status
+            .map(|s| s.color())
+            .unwrap_or(Color::srgba(0.6, 0.8, 0.9, 0.9));
+        commands
+            .spawn((
+                Sprite {
+                    image: art.ring.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * 1.08)),
+                    color,
+                    ..default()
+                },
+                Transform::from_translation(p.extend(0.93)),
+            ))
+            .insert(ChildOf(vis.root));
+    }
+    for (foot, status) in pumps.iter() {
+        let p = foot_world_pos(foot);
+        commands
+            .spawn((
+                Sprite {
+                    image: art.ring.clone(),
+                    custom_size: Some(Vec2::splat(crate::TILE * 1.18)),
+                    color: status.color(),
+                    ..default()
+                },
+                Transform::from_translation(p.extend(0.94)),
             ))
             .insert(ChildOf(vis.root));
     }
@@ -1044,6 +1301,7 @@ fn ghost_system(
     map: Res<ShipMap>,
     art: Res<Art>,
     cables: Res<CableGrid>,
+    pipes: Res<crate::coolant::PipeGrid>,
     build_mode: Res<BuildMode>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
@@ -1099,7 +1357,15 @@ fn ghost_system(
             let mut feet: Vec<(building::Footprint, bool)> =
                 blueprints.iter().map(|(_, f)| (*f, true)).collect();
             feet.extend(buildings.iter().map(|(_, f)| (*f, false)));
-            let check = building::can_place(&map, kind, tile, &ground, &feet, |p| cables.has(p));
+            let check = building::can_place(
+                &map,
+                kind,
+                tile,
+                &ground,
+                &feet,
+                |p| cables.has(p),
+                |p| pipes.has(p),
+            );
             let (color, text) = match &check {
                 Ok(()) => {
                     let cost: u32 = d.cost.iter().sum();

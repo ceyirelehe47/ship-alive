@@ -94,13 +94,17 @@ pub enum Action {
     /// UI-only: select a build tool (consumed by the input plugin).
     SetTool { tool: Option<crate::input::Tool> },
     // ---- Slice 2: power --------------------------------------------------
-    /// UI-only: show/hide the power overlay (consumed by the UI plugin).
-    TogglePowerView,
+    /// UI-only: cycle the map overlay view (off → power → thermal → coolant).
+    CycleOverlay,
     /// Turn a reactor on or off.
     SetGeneratorOn { gen: Entity, on: bool },
     /// Mark an underfloor cable tile for deconstruction (spawns the
     /// transient tile entity the work system tears down).
     MarkCableDeconstruct { pos: TilePos },
+    /// Mark an underfloor coolant pipe tile for deconstruction (spawns the
+    /// transient tile entity the work system tears down; water is preserved
+    /// into the network where possible).
+    MarkPipeDeconstruct { pos: TilePos },
 }
 
 pub struct JobsPlugin;
@@ -116,6 +120,9 @@ impl Plugin for JobsPlugin {
             FixedUpdate,
             (
                 crate::power::power_network_system,
+                crate::thermal::thermal_air_system,
+                crate::coolant::coolant_system,
+                crate::thermal::thermal_state_system,
                 crew_task_system,
                 crew_scan_system,
             )
@@ -148,6 +155,7 @@ pub fn actions_system(
     mut fabs: Query<(Entity, &mut Fabricator), Without<Crew>>,
     mut gens: Query<(Entity, &mut PowerRole)>,
     cables: Res<CableGrid>,
+    pipes: Res<crate::coolant::PipeGrid>,
     cable_tiles: Query<(Entity, &TilePos), (With<Building>, With<MarkedForDeconstruct>)>,
 ) {
     let now = clock.now();
@@ -279,7 +287,15 @@ pub fn actions_system(
                 let mut feet: Vec<(Footprint, bool)> =
                     blueprints.iter().map(|(_, f, _)| (*f, true)).collect();
                 feet.extend(buildings.iter().map(|(_, f)| (*f, false)));
-                match building::can_place(&map, kind, pos, &ground, &feet, |p| cables.has(p)) {
+                match building::can_place(
+                    &map,
+                    kind,
+                    pos,
+                    &ground,
+                    &feet,
+                    |p| cables.has(p),
+                    |p| pipes.has(p),
+                ) {
                     Ok(()) => {
                         building::spawn_blueprint(&mut commands, kind, pos);
                         log.push(
@@ -455,7 +471,31 @@ pub fn actions_system(
                     );
                 }
             }
-            Action::TogglePowerView => {
+            Action::MarkPipeDeconstruct { pos } => {
+                if !pipes.has(pos) {
+                    log.push(now, LogKind::Fail, "No coolant pipe there");
+                } else if cable_tiles.iter().any(|(_, p)| *p == pos) {
+                    // Already marked (the same transient-tile query covers
+                    // pipe tiles: they are Building entities too).
+                } else {
+                    commands.spawn((
+                        TilePos::new(pos.x, pos.y),
+                        Footprint::new(pos.x, pos.y, 1, 1),
+                        Building {
+                            kind: BuildingKind::CoolantPipe,
+                            foot: Footprint::new(pos.x, pos.y, 1, 1),
+                            demo_progress: 0.0,
+                        },
+                        MarkedForDeconstruct,
+                    ));
+                    log.push(
+                        now,
+                        LogKind::Info,
+                        format!("Coolant pipe at ({},{}) marked for removal", pos.x, pos.y),
+                    );
+                }
+            }
+            Action::CycleOverlay => {
                 // Consumed by the UI plugin.
             }
             Action::SetSpeed { .. } | Action::TogglePause => {
@@ -759,6 +799,10 @@ fn end_work(
 pub fn crew_task_system(
     mut map: ResMut<ShipMap>,
     mut cables: ResMut<CableGrid>,
+    mut pipes: ResMut<crate::coolant::PipeGrid>,
+    mut water: ResMut<crate::coolant::WaterGrid>,
+    mut thermal: ResMut<crate::thermal::ThermalGrid>,
+    mut cstats: ResMut<crate::coolant::CoolantStats>,
     clock: Res<SimClock>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
@@ -796,7 +840,13 @@ pub fn crew_task_system(
         (Without<Crew>, Without<Blueprint>),
     >,
     mut fabs: Query<
-        (Entity, &Footprint, &mut Fabricator, &PowerStatus),
+        (
+            Entity,
+            &Footprint,
+            &mut Fabricator,
+            &PowerStatus,
+            Option<&crate::thermal::ThermalState>,
+        ),
         (Without<Crew>, Without<Blueprint>),
     >,
 ) {
@@ -968,9 +1018,10 @@ pub fn crew_task_system(
                                     }
                                 }
                                 HaulDest::Machine(fab_e) => {
-                                    let ok = fabs.get(*fab_e).ok().and_then(|(_, foot, _, _)| {
-                                        building::path_to_interaction(&map, *pos, foot)
-                                    });
+                                    let ok =
+                                        fabs.get(*fab_e).ok().and_then(|(_, foot, _, _, _)| {
+                                            building::path_to_interaction(&map, *pos, foot)
+                                        });
                                     match ok {
                                         Some(path) => {
                                             job.phase = HaulPhase::ToDest;
@@ -1134,7 +1185,7 @@ pub fn crew_task_system(
                         }
                     }
                     HaulDest::Machine(fab_e) => {
-                        let Ok((_, foot, _, _)) = fabs.get(fab_e) else {
+                        let Ok((_, foot, _, _, _)) = fabs.get(fab_e) else {
                             job.dest = HaulDest::Storage;
                             job.target_rack = None;
                             continue;
@@ -1221,7 +1272,7 @@ pub fn crew_task_system(
                                 }
                             }
                             HaulDest::Machine(fab_e) => {
-                                if let Ok((_, _, mut f, _)) = fabs.get_mut(fab_e) {
+                                if let Ok((_, _, mut f, _, _)) = fabs.get_mut(fab_e) {
                                     f.input[item.kind.index()] += 1;
                                     crew.delivered += 1;
                                     let name = crew.name.clone();
@@ -1299,6 +1350,8 @@ pub fn crew_task_system(
                             &mut commands,
                             &mut map,
                             &mut cables,
+                            &mut pipes,
+                            &mut thermal,
                             job.target,
                             &bp,
                             &crew_positions,
@@ -1387,6 +1440,10 @@ pub fn crew_task_system(
                             &mut commands,
                             &mut map,
                             &mut cables,
+                            &mut pipes,
+                            &mut water,
+                            &mut cstats,
+                            &mut thermal,
                             job.target,
                             &b,
                             rack_contents,
@@ -1406,7 +1463,7 @@ pub fn crew_task_system(
 
         // ---- operate ---------------------------------------------------------
         if let CrewTask::Operate(job) = &mut *task {
-            let Ok((_, foot, mut f, power)) = fabs.get_mut(job.target) else {
+            let Ok((_, foot, mut f, power, thermal_state)) = fabs.get_mut(job.target) else {
                 let name = crew.name.clone();
                 *task = CrewTask::Idle(IdleCause::JobCanceled {
                     detail: "machine gone".into(),
@@ -1500,7 +1557,11 @@ pub fn crew_task_system(
                         crew.next_scan = now + RESCAN_FAILED as f64;
                         continue;
                     }
-                    job.timer -= dt;
+                    // Thermal derating: an overheated machine works slower, a
+                    // critical one stalls (the operator stays, progress
+                    // freezes — visible in the machine panel).
+                    let thermal_scale = thermal_state.map(|s| s.work_factor()).unwrap_or(1.0);
+                    job.timer -= dt * thermal_scale;
                     f.progress = 1.0 - (job.timer / job.total).clamp(0.0, 1.0);
                     if job.timer <= 0.0 {
                         let out_kind = f.finish_cycle();

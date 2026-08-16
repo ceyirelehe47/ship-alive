@@ -16,6 +16,11 @@ use bevy::prelude::*;
 ///  `F` fabricator origin (2x2 machine — all four tiles carry the char)
 ///  `R` reactor origin (2x2 machine — all four tiles carry the char)
 ///  `c` underfloor power cable
+///  `p` underfloor coolant pipe
+///  `K` coolant pump (implies a pipe underneath)
+///  `W` coolant reservoir (implies a pipe underneath)
+///  `H` heat exchanger (implies a pipe underneath)
+///  `Z` radiator (implies a pipe underneath; must be hull-adjacent)
 ///  `1` crate item      `2` ore item      `3` machinery part item
 ///  `X` item inside a sealed pocket (permanently unreachable — scenario C)
 ///
@@ -26,6 +31,11 @@ use bevy::prelude::*;
 /// Slice 2 notes: a Starter Reactor sits in FABRICATION's bottom-left corner
 /// feeding a short pre-wired cable run to the fabricator — a working ship on
 /// day one with plenty of room to rewire.
+///
+/// Slice 3 notes: a pre-installed coolant loop shares the reactor corner:
+/// heat exchanger `H` beside the reactor core, pump `K`, two hull-mounted
+/// radiators `Z` along the bottom wall, and a reservoir `W`, all connected
+/// by a pipe ring — the ship boots thermally stable.
 pub const MAP_LAYOUT: [&str; 19] = [
     "####################################",
     "#.3..1.....#..........#...2...2....#",
@@ -43,8 +53,8 @@ pub const MAP_LAYOUT: [&str; 19] = [
     "#..3.......#...FF.....#....SO......#",
     "#....3.3...#...c......#....SO......#",
     "#.###......#3..c......#............#",
-    "#.#X#......#RRcc......#............#",
-    "#.###......#RR........#............#",
+    "#.#X#......#RRccpppppp#............#",
+    "#.###......#RRHKpZpZpW#............#",
     "####################################",
 ];
 
@@ -129,6 +139,30 @@ impl ShipMap {
                     'c' => {
                         tiles.push(Tile::Floor);
                         spawns.push(SpawnReq::Cable { pos });
+                    }
+                    'p' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Pipe { pos });
+                    }
+                    'K' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Pipe { pos });
+                        spawns.push(SpawnReq::Pump { pos });
+                    }
+                    'W' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Pipe { pos });
+                        spawns.push(SpawnReq::Reservoir { pos });
+                    }
+                    'H' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Pipe { pos });
+                        spawns.push(SpawnReq::HeatExchanger { pos });
+                    }
+                    'Z' => {
+                        tiles.push(Tile::Floor);
+                        spawns.push(SpawnReq::Pipe { pos });
+                        spawns.push(SpawnReq::Radiator { pos });
                     }
                     '.' | 'C' | 'S' | 'P' | 'O' | 'X' => tiles.push(Tile::Floor),
                     d @ ('1' | '2' | '3') => {
@@ -243,6 +277,23 @@ pub enum SpawnReq {
     Cable {
         pos: TilePos,
     },
+    /// Underfloor coolant pipe on this tile.
+    Pipe {
+        pos: TilePos,
+    },
+    /// Coolant hardware standing on the pipe at `pos`.
+    Pump {
+        pos: TilePos,
+    },
+    Reservoir {
+        pos: TilePos,
+    },
+    HeatExchanger {
+        pos: TilePos,
+    },
+    Radiator {
+        pos: TilePos,
+    },
     Item {
         pos: TilePos,
         kind: crate::items::ItemKind,
@@ -350,6 +401,42 @@ mod tests {
                 .filter(|s| matches!(s, SpawnReq::Cable { .. }))
                 .count(),
             4
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Pipe { .. }))
+                .count(),
+            14,
+            "9 plain pipes + 5 device tiles"
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Pump { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Reservoir { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::HeatExchanger { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            spawns
+                .iter()
+                .filter(|s| matches!(s, SpawnReq::Radiator { .. }))
+                .count(),
+            2
         );
         assert_eq!(
             spawns

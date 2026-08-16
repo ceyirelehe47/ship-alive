@@ -21,7 +21,7 @@ impl Plugin for AutotestPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (scenario_driver, slice2_driver).in_set(crate::Set::Input),
+            (scenario_driver, slice2_driver, slice3_driver).in_set(crate::Set::Input),
         );
     }
 }
@@ -1097,7 +1097,7 @@ fn slice2_driver(
         // blackout and recovery, dump the world for the report.
         "PW" => {
             fire("pw_view", 0.5, t, &mut fired, &mut actions, |a| {
-                let _ = a.write(Action::TogglePowerView);
+                let _ = a.write(Action::CycleOverlay);
             });
             fire("pw_cut", 1.0, t, &mut fired, &mut actions, |a| {
                 let _ = a.write(Action::MarkCableDeconstruct {
@@ -1139,4 +1139,223 @@ fn fab_power_at(
     _y: i32,
 ) -> Option<crate::power::PowerStatus> {
     fabs.iter().next().map(|(p, _)| *p)
+}
+
+// =====================================================================================
+// Slice 3 acceptance scenarios (Thermal & Cooling), driven by SLICE3_SCENARIO=A..H,R.
+// The starter coolant loop: H(14,17) K(15,17) p(16,17) Z(17,17) p(18,17) Z(19,17)
+// p(20,17) W(21,17) p(21,16) p(20,16) p(19,16) p(18,16) p(17,16) p(16,16).
+// Heavy numeric verification (conservation, hysteresis, equivalence) lives in
+// tests/thermal.rs; these scenarios drive the *full app* wiring end to end.
+// =====================================================================================
+
+#[allow(clippy::too_many_arguments)]
+fn slice3_driver(
+    clock: Res<crate::simtime::SimClock>,
+    mut actions: EventWriter<Action>,
+    mut exit: EventWriter<AppExit>,
+    thermal_grid: Res<crate::thermal::ThermalGrid>,
+    tstats: Res<crate::thermal::ThermalStats>,
+    coolant: Res<crate::coolant::CoolantState>,
+    water: Res<crate::coolant::WaterGrid>,
+    cstats: Res<crate::coolant::CoolantStats>,
+    power_state: Res<crate::power::PowerState>,
+    overlay: Res<crate::OverlayMode>,
+    reactors: Query<(
+        &crate::building::Footprint,
+        &crate::thermal::ThermalState,
+        &crate::power::PowerRole,
+    )>,
+    pumps: Query<
+        (&crate::building::Footprint, &crate::power::PowerStatus),
+        With<crate::coolant::Pump>,
+    >,
+    stats: Res<crate::stats::Stats>,
+    log: Res<EventLog>,
+    mut fired: Local<Vec<&'static str>>,
+) {
+    let Some(scenario) = std::env::var("SLICE3_SCENARIO").ok() else {
+        return;
+    };
+    // Ship seconds — thermal pacing is in sim time.
+    let t = clock.now();
+
+    let core = || {
+        reactors
+            .iter()
+            .next()
+            .map(|(foot, state, role)| (thermal_grid.max_footprint_temp(foot), *state, *role))
+    };
+    let mut dump = |ctx: &str| {
+        let (temp, state, role) = core().unwrap_or((
+            f32::NAN,
+            crate::thermal::ThermalState::Normal,
+            crate::power::PowerRole::consumer(0),
+        ));
+        let pump = pumps
+            .iter()
+            .next()
+            .map(|(f, p)| ((f.x, f.y), *p, water.amount_at(TilePos::new(f.x, f.y))));
+        println!(
+            "S3_RESULT scenario={ctx} t={t:.0}s core={temp:.1}C state={state:?} role={role:?} pump={pump:?} coolants={:?} spilled={:.2} injected={:.0} radiated={:.0} overlay={:?} nets={:?} stats=[{}]",
+            coolant.networks,
+            cstats.spilled_water,
+            tstats.injected_total,
+            tstats.radiated_total,
+            *overlay,
+            power_state.networks,
+            stats.summary(),
+        );
+        println!("S3_LOG_BEGIN");
+        for e in log
+            .entries
+            .iter()
+            .rev()
+            .take(12)
+            .collect::<Vec<_>>()
+            .iter()
+            .rev()
+        {
+            println!("  [{:.0}s] {:?} {}", e.time, e.kind, e.text);
+        }
+        println!("S3_LOG_END");
+        exit.write(AppExit::Success);
+    };
+
+    match scenario.as_str() {
+        // A: boot stability — 90 ship minutes at 4x with the stock load: the
+        // reactor must stay cool, the loop must radiate, water must hold.
+        "A" => {
+            fire("s3a_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"done") && t >= 5400.0 {
+                fired.push("done");
+                dump("A");
+            }
+        }
+        // B: cooling failure cascade — cut the ring, let the crisis develop,
+        // repair, and confirm recovery. The deadlock guarantee (emergency
+        // power keeps the pump) shows in the dump.
+        "B" => {
+            fire("s3b_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            fire("s3b_cut", 30.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkPipeDeconstruct {
+                    pos: TilePos::new(16, 17),
+                });
+            });
+            fire("s3b_fix", 2600.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::CoolantPipe,
+                    pos: TilePos::new(16, 17),
+                });
+            });
+            // Healed = the ring is whole again (one network carrying both
+            // the pump and the radiators) AND the core is back to Normal.
+            let healed = core().is_some_and(|(_, s, _)| s == crate::thermal::ThermalState::Normal)
+                && coolant.networks.len() == 1
+                && coolant
+                    .networks
+                    .iter()
+                    .any(|n| n.powered_pumps > 0 && n.radiators > 0 && n.flow > 0.0);
+            if !fired.contains(&"done") && ((healed && t >= 3400.0) || t >= 5400.0) {
+                fired.push("done");
+                dump("B");
+            }
+        }
+        // C: pump power dependency — cut the cable that feeds the loop's
+        // pump; circulation stops (stagnant), restore it, flow returns.
+        "C" => {
+            fire("s3c_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            fire("s3c_cut", 30.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkCableDeconstruct {
+                    pos: TilePos::new(15, 16),
+                });
+            });
+            fire("s3c_fix", 700.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::PowerCable,
+                    pos: TilePos::new(15, 16),
+                });
+            });
+            if !fired.contains(&"done") && t >= 1600.0 {
+                fired.push("done");
+                dump("C");
+            }
+        }
+        // E: water preservation — tear a pipe down next to the reservoir and
+        // confirm the water moved into the network instead of vanishing.
+        "E" => {
+            fire("s3e_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"water0") && t >= 1.0 {
+                fired.push("water0");
+                println!("S3_E_WATER0 total={:.1}", water.total_water());
+            }
+            fire("s3e_cut", 30.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::MarkPipeDeconstruct {
+                    pos: TilePos::new(20, 17),
+                });
+            });
+            if !fired.contains(&"done") && t >= 1000.0 {
+                fired.push("done");
+                println!(
+                    "S3_E_WATER1 total={:.1} spilled={:.2}",
+                    water.total_water(),
+                    cstats.spilled_water
+                );
+                dump("E");
+            }
+        }
+        // F: overlay modes cycle through Off → Power → Thermal → Coolant.
+        "F" => {
+            fire("s3f_1", 1.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::CycleOverlay);
+            });
+            fire("s3f_2", 2.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::CycleOverlay);
+            });
+            fire("s3f_3", 3.0, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::CycleOverlay);
+            });
+            if !fired.contains(&"done") && t >= 4.0 {
+                fired.push("done");
+                dump("F");
+            }
+        }
+        // V: visual smoke — cycle the overlay SLICE3_VIEW_N times and stay
+        // alive (paired with SLICE0_SHOT / SLICE0_SMOKE).
+        "V" => {
+            let n: usize = std::env::var("SLICE3_VIEW_N")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            fire("s3v_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            for i in 0..n.min(8) {
+                let tag: &'static str = Box::leak(format!("s3v_c{i}").into_boxed_str());
+                let at = 1.0 + i as f64;
+                fire(tag, at, t, &mut fired, &mut actions, |a| {
+                    let _ = a.write(Action::CycleOverlay);
+                });
+            }
+        }
+        // R: full-stack regression snapshot at 4x with thermal running.
+        "R" => {
+            fire("s3r_speed", 0.2, t, &mut fired, &mut actions, |a| {
+                let _ = a.write(Action::SetSpeed { index: 3 });
+            });
+            if !fired.contains(&"done") && t >= 600.0 {
+                fired.push("done");
+                dump("R");
+            }
+        }
+        _ => {}
+    }
 }

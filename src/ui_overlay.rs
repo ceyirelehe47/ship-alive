@@ -4,6 +4,7 @@
 //! hovers (crew / item / rack); the box-select rect is drawn while the left
 //! button is dragged on the map. Both are plain UI nodes updated per frame.
 
+use crate::building::MarkedForDeconstruct;
 use crate::building::{Blueprint, Building};
 use crate::crew::{Crew, CrewTask, Movement};
 use crate::input::{BoxSelect, Hovered, Selected};
@@ -108,7 +109,13 @@ pub fn tooltip_system(
         ),
         With<Item>,
     >,
-    racks: Query<(&TilePos, &StorageCell), With<StorageCell>>,
+    racks: Query<(
+        Entity,
+        &TilePos,
+        &StorageCell,
+        Option<&Building>,
+        Option<&MarkedForDeconstruct>,
+    )>,
     blueprints: Query<(&TilePos, &Blueprint)>,
     buildings: Query<(&TilePos, &Building), Without<Blueprint>>,
     mut node_q: Query<&mut Node, With<ZIndex>>,
@@ -132,7 +139,7 @@ pub fn tooltip_system(
             Err(_) => (None, None),
         },
         Some(Selected::Rack(e)) => match racks.get(e) {
-            Ok((p, cell)) => (
+            Ok((_, p, cell, _, _)) => (
                 Some(format!("Storage rack ({},{})", p.x, p.y)),
                 Some(if cell.free() == 0 {
                     format!("{} — FULL", cell.label())

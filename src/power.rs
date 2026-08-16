@@ -130,10 +130,6 @@ impl CableGrid {
     }
 }
 
-/// Player-facing toggle for the power overlay view.
-#[derive(Resource, Default, Debug)]
-pub struct PowerOverlay(pub bool);
-
 /// Derived per-network summary for UI/diagnostics.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct NetworkInfo {
@@ -399,7 +395,6 @@ pub struct PowerPlugin;
 impl Plugin for PowerPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PowerState>();
-        app.init_resource::<PowerOverlay>();
     }
 }
 

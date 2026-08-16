@@ -11,6 +11,7 @@ use bevy::prelude::*;
 
 pub mod autotest;
 pub mod building;
+pub mod coolant;
 pub mod crew;
 pub mod input;
 pub mod items;
@@ -26,6 +27,7 @@ pub mod setup;
 pub mod simtime;
 pub mod stats;
 pub mod storage;
+pub mod thermal;
 pub mod time_ctrl;
 pub mod ui;
 pub mod ui_overlay;
@@ -44,4 +46,35 @@ pub enum Set {
     Jobs,
     Move,
     Sync,
+}
+
+/// Exclusive full-map overlay view (power / thermal / coolant). Mutually
+/// exclusive by construction — one resource, one active mode.
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum OverlayMode {
+    #[default]
+    Off,
+    Power,
+    Thermal,
+    Coolant,
+}
+
+impl OverlayMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            OverlayMode::Off => "Off",
+            OverlayMode::Power => "Power",
+            OverlayMode::Thermal => "Thermal",
+            OverlayMode::Coolant => "Coolant",
+        }
+    }
+
+    pub fn cycle(self) -> Self {
+        match self {
+            OverlayMode::Off => OverlayMode::Power,
+            OverlayMode::Power => OverlayMode::Thermal,
+            OverlayMode::Thermal => OverlayMode::Coolant,
+            OverlayMode::Coolant => OverlayMode::Off,
+        }
+    }
 }

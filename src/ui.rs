@@ -12,15 +12,19 @@
 //! discrete state changes, so interactions never break on rebuilds.
 
 use crate::building::{Building, BuildingKind, MarkedForDeconstruct};
+use crate::coolant::{CoolantState, WaterGrid};
 use crate::crew::{Crew, CrewTask, HaulPhase, Priority, WorkKind};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::jobs::Action;
 use crate::log::{EventLog, LogKind};
 use crate::map::TilePos;
-use crate::power::{PowerOverlay, PowerRole, PowerState, PowerStatus};
+use crate::power::{PowerRole, PowerState, PowerStatus};
 use crate::storage::StorageCell;
+use crate::thermal::ThermalGrid;
 use crate::time_ctrl::GameSpeed;
+use crate::OverlayMode;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
 const PANEL_BG: Color = Color::srgba(0.06, 0.08, 0.11, 0.88);
@@ -48,14 +52,16 @@ pub enum BuildCatKind {
     Storage,
     Machines,
     Power,
+    Thermal,
 }
 
 impl BuildCatKind {
-    pub const ALL: [BuildCatKind; 4] = [
+    pub const ALL: [BuildCatKind; 5] = [
         BuildCatKind::Structure,
         BuildCatKind::Storage,
         BuildCatKind::Machines,
         BuildCatKind::Power,
+        BuildCatKind::Thermal,
     ];
 
     pub fn label(self) -> &'static str {
@@ -64,6 +70,7 @@ impl BuildCatKind {
             BuildCatKind::Storage => "Storage",
             BuildCatKind::Machines => "Machines",
             BuildCatKind::Power => "Power",
+            BuildCatKind::Thermal => "Thermal",
         }
     }
 
@@ -73,6 +80,13 @@ impl BuildCatKind {
             BuildCatKind::Storage => &[BuildingKind::Rack],
             BuildCatKind::Machines => &[BuildingKind::Fabricator, BuildingKind::Reactor],
             BuildCatKind::Power => &[BuildingKind::PowerCable],
+            BuildCatKind::Thermal => &[
+                BuildingKind::CoolantPipe,
+                BuildingKind::Pump,
+                BuildingKind::HeatExchanger,
+                BuildingKind::Radiator,
+                BuildingKind::Reservoir,
+            ],
         }
     }
 }
@@ -125,6 +139,7 @@ pub struct Hud {
     pub tool_buttons: Vec<Entity>,
     pub power_button_label: Entity,
     pub power_line: Entity,
+    pub alert_line: Entity,
     pub build_cat_buttons: Vec<(BuildCatKind, Entity)>,
     pub flyout: Entity,
     pub flyout_rows: Vec<(BuildCatKind, Entity)>,
@@ -144,6 +159,15 @@ fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color)
             TextColor(color),
         ))
         .id()
+}
+
+/// Read-only thermal/coolant world view bundled into one system param
+/// (keeps the selection panel under the 16-parameter limit).
+#[derive(SystemParam)]
+pub struct ThermalView<'w> {
+    pub grid: Res<'w, ThermalGrid>,
+    pub coolant: Res<'w, CoolantState>,
+    pub water: Res<'w, WaterGrid>,
 }
 
 fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, width: f32) -> Entity {
@@ -182,7 +206,8 @@ impl Plugin for UiPlugin {
                 btn_label_system,
                 sidebar_system,
                 build_menu_system,
-                power_view_toggle_system,
+                overlay_cycle_system,
+                overlay_summary_system,
                 debug_toggle_system,
                 (hud_update_system, selection_panel_system).chain(),
                 crate::ui_overlay::tooltip_system,
@@ -197,6 +222,7 @@ fn build_hud(mut commands: Commands) {
     let mut speed_buttons = Vec::new();
     let mut stats = Entity::PLACEHOLDER;
     let mut ship_time_label = Entity::PLACEHOLDER;
+    let mut alert_line = Entity::PLACEHOLDER;
     let mut chips = Vec::new();
     let mut sel_lines = Vec::new();
     let mut sel_btns = Vec::new();
@@ -262,6 +288,7 @@ fn build_hud(mut commands: Commands) {
 
                     stats = label(row, "", 14.0, Color::WHITE);
                     ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
+                    alert_line = label(row, "", 13.0, Color::srgb(1.0, 0.4, 0.3));
 
                     button(row, "Haul All [H]", Action::MarkAll, 96.0);
                     button(row, "Cancel All [C]", Action::CancelAll, 104.0);
@@ -270,9 +297,9 @@ fn build_hud(mut commands: Commands) {
                         .spawn((
                             Button,
                             Interaction::default(),
-                            OnPress(Action::TogglePowerView),
+                            OnPress(Action::CycleOverlay),
                             Node {
-                                width: Val::Px(74.0),
+                                width: Val::Px(96.0),
                                 height: Val::Px(26.0),
                                 margin: UiRect::all(Val::Px(2.0)),
                                 align_items: AlignItems::Center,
@@ -282,7 +309,7 @@ fn build_hud(mut commands: Commands) {
                             BackgroundColor(BUTTON_BG),
                         ))
                         .with_children(|b| {
-                            power_button_label = label(b, "Power [P]", 13.0, Color::WHITE);
+                            power_button_label = label(b, "View [P]", 13.0, Color::WHITE);
                         })
                         .id();
                     let _ = power_btn;
@@ -394,6 +421,7 @@ fn build_hud(mut commands: Commands) {
                                         BuildCatKind::Storage => "Storage:",
                                         BuildCatKind::Machines => "Machines:",
                                         BuildCatKind::Power => "Power:",
+                                        BuildCatKind::Thermal => "Thermal:",
                                     };
                                     label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
                                     for kind in cat.kinds() {
@@ -409,6 +437,11 @@ fn build_hud(mut commands: Commands) {
                                                 BuildingKind::Rack => 96.0,
                                                 BuildingKind::PowerCable => 96.0,
                                                 BuildingKind::Reactor => 72.0,
+                                                BuildingKind::CoolantPipe => 96.0,
+                                                BuildingKind::Pump => 96.0,
+                                                BuildingKind::Reservoir => 110.0,
+                                                BuildingKind::HeatExchanger => 118.0,
+                                                BuildingKind::Radiator => 76.0,
                                             },
                                         );
                                         pending_tool_btns.push((e, tool));
@@ -635,6 +668,7 @@ fn build_hud(mut commands: Commands) {
         tool_buttons,
         power_button_label,
         power_line,
+        alert_line,
         build_cat_buttons,
         flyout,
         flyout_rows,
@@ -687,6 +721,8 @@ fn sidebar_system(
     speed: Res<GameSpeed>,
     stats: Res<crate::stats::Stats>,
     power_state: Res<PowerState>,
+    thermal: ThermalView,
+    reactors: Query<(&crate::building::Footprint, &crate::thermal::ThermalState)>,
     racks: Query<&StorageCell>,
     items: Query<(&Item, Option<&MarkedForHaul>), With<Item>>,
     fabs: Query<&PowerStatus, With<crate::production::Fabricator>>,
@@ -757,6 +793,48 @@ fn sidebar_system(
                     Color::srgb(0.7, 0.95, 0.75)
                 }
             }));
+        }
+        // Thermal block: cores + hottest room + coolant loops.
+        let mut hottest_core = f32::NEG_INFINITY;
+        let mut worst_state = crate::thermal::ThermalState::Normal;
+        for (foot, state) in reactors.iter() {
+            let t = thermal.grid.max_footprint_temp(foot);
+            hottest_core = hottest_core.max(t);
+            worst_state = worst_state.max(*state);
+        }
+        let mut ship_max = f32::NEG_INFINITY;
+        for &t in &thermal.grid.amb {
+            ship_max = ship_max.max(t);
+        }
+        let total_water = thermal.water.total_water();
+        lines.push((String::new(), Color::WHITE));
+        lines.push(("THERMAL".to_string(), dim));
+        if reactors.is_empty() {
+            lines.push(("no reactor installed".into(), dim));
+        } else {
+            lines.push((
+                format!("Core: {:.0}°C ({})", hottest_core, worst_state.label()),
+                match worst_state {
+                    crate::thermal::ThermalState::Normal => Color::srgb(0.7, 0.95, 0.75),
+                    crate::thermal::ThermalState::Overheat => Color::srgb(1.0, 0.7, 0.25),
+                    crate::thermal::ThermalState::Critical => Color::srgb(1.0, 0.4, 0.3),
+                },
+            ));
+            lines.push((format!("Hottest room: {:.0}°C", ship_max), Color::WHITE));
+        }
+        if thermal.coolant.networks.is_empty() {
+            lines.push(("Coolant: none (lay pipes)".into(), dim));
+        } else {
+            let dumping: f32 = thermal.coolant.networks.iter().map(|n| n.dump_rate).sum();
+            lines.push((
+                format!(
+                    "Coolant: {} net | water {:.0} | dumping {:.0}H/s",
+                    thermal.coolant.networks.len(),
+                    total_water,
+                    dumping
+                ),
+                Color::WHITE,
+            ));
         }
         lines.push((String::new(), Color::WHITE));
         lines.push(("STORAGE".to_string(), dim));
@@ -900,36 +978,134 @@ fn build_menu_system(
     }
 }
 
-/// Toggle the power overlay view (button + P hotkey).
-fn power_view_toggle_system(
+/// Cycle the map overlay view (button + P hotkey): off → power → thermal →
+/// coolant → off. Modes are mutually exclusive by construction.
+fn overlay_cycle_system(
     mut events: EventReader<Action>,
-    mut overlay: ResMut<PowerOverlay>,
+    mut overlay: ResMut<OverlayMode>,
     hud: Res<Hud>,
     mut log: ResMut<EventLog>,
     clock: Res<crate::simtime::SimClock>,
     mut text_q: Query<&mut Text>,
 ) {
-    let mut toggled = false;
+    let mut cycled = false;
     for action in events.read() {
-        if matches!(action, Action::TogglePowerView) {
-            overlay.0 = !overlay.0;
-            toggled = true;
+        if matches!(action, Action::CycleOverlay) {
+            *overlay = overlay.cycle();
+            cycled = true;
         }
     }
-    if !toggled {
+    if !cycled {
         return;
     }
     let now = clock.now();
     log.push(
         now,
         LogKind::Info,
-        format!("Power view {}", if overlay.0 { "on" } else { "off" }),
+        format!("Overlay view: {}", overlay.label()),
     );
     if let Ok(mut text) = text_q.get_mut(hud.power_button_label) {
-        text.0 = if overlay.0 {
-            "Power ON".to_string()
+        text.0 = format!("View: {} [P]", overlay.label());
+    }
+}
+
+/// Overlay summary line under the bar + the always-on thermal alert.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn overlay_summary_system(
+    hud: Res<Hud>,
+    overlay: Res<OverlayMode>,
+    power_state: Res<PowerState>,
+    thermal: ThermalView,
+    tstats: Res<crate::thermal::ThermalStats>,
+    reactors: Query<(&crate::building::Footprint, &crate::thermal::ThermalState)>,
+    fabs: Query<(&crate::thermal::ThermalState,), With<crate::production::Fabricator>>,
+    mut texts: Query<(&mut Text, &mut TextColor), Without<Button>>,
+) {
+    // ---- summary line (visible with the matching overlay mode) ----
+    if let Ok((mut text, mut color)) = texts.get_mut(hud.power_line) {
+        match *overlay {
+            OverlayMode::Power => {
+                if power_state.networks.is_empty() {
+                    text.0 = "POWER: no networks".to_string();
+                } else {
+                    let parts: Vec<String> = power_state
+                        .networks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, net)| format!("NET {}: {}", i + 1, net.summary()))
+                        .collect();
+                    text.0 = format!("POWER | {}", parts.join(" | "));
+                }
+            }
+            OverlayMode::Thermal => {
+                let mut hottest = f32::NEG_INFINITY;
+                for (foot, _) in reactors.iter() {
+                    hottest = hottest.max(thermal.grid.max_footprint_temp(foot));
+                }
+                text.0 = format!(
+                    "THERMAL | hottest core {:.0}°C | injected {:.0}H | radiated {:.0}H",
+                    hottest, tstats.injected_total, tstats.radiated_total,
+                );
+            }
+            OverlayMode::Coolant => {
+                if thermal.coolant.networks.is_empty() {
+                    text.0 = "COOLANT: no pipes laid".to_string();
+                } else {
+                    let parts: Vec<String> = thermal
+                        .coolant
+                        .networks
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| {
+                            format!(
+                                "NET {}: {} water {:.0} @ {:.0}°C flow {:.1} dump {:.0}H/s",
+                                i + 1,
+                                n.status_label(),
+                                n.water,
+                                n.avg_temp,
+                                n.flow,
+                                n.dump_rate
+                            )
+                        })
+                        .collect();
+                    text.0 = format!("COOLANT | {}", parts.join(" | "));
+                }
+            }
+            OverlayMode::Off => text.0 = String::new(),
+        }
+        color.0 = Color::srgb(0.62, 0.9, 0.8);
+    }
+
+    // ---- thermal alert (always visible when something is wrong) ----
+    let mut alert = String::new();
+    let mut any_critical = false;
+    for (_, state) in reactors.iter() {
+        match state {
+            crate::thermal::ThermalState::Critical => {
+                any_critical = true;
+                alert = "REACTOR THERMAL CRITICAL — emergency power only".into();
+            }
+            crate::thermal::ThermalState::Overheat if alert.is_empty() => {
+                alert = "REACTOR OVERHEAT — derated, check cooling".into()
+            }
+            crate::thermal::ThermalState::Overheat | crate::thermal::ThermalState::Normal => {}
+        }
+    }
+    for (state,) in fabs.iter() {
+        if let crate::thermal::ThermalState::Critical = state {
+            any_critical = true;
+            if alert.is_empty() {
+                alert = "FABRICATOR THERMAL CRITICAL — production stopped".into();
+            }
+        }
+    }
+    if let Ok((mut text, mut color)) = texts.get_mut(hud.alert_line) {
+        text.0 = alert;
+        color.0 = if any_critical {
+            Color::srgb(1.0, 0.3, 0.25)
         } else {
-            "Power [P]".to_string()
+            Color::srgb(1.0, 0.65, 0.25)
         };
     }
 }
@@ -981,7 +1157,13 @@ pub fn task_label(
         ),
         With<Item>,
     >,
-    racks: &Query<(&TilePos, &StorageCell), With<StorageCell>>,
+    racks: &Query<(
+        Entity,
+        &TilePos,
+        &StorageCell,
+        Option<&Building>,
+        Option<&MarkedForDeconstruct>,
+    )>,
 ) -> String {
     match task {
         CrewTask::Idle(cause) => cause.label(),
@@ -1003,7 +1185,7 @@ pub fn task_label(
                     let dest = match job.dest {
                         crate::crew::HaulDest::Storage => job
                             .target_rack
-                            .and_then(|r| racks.get(r).ok())
+                            .and_then(|r| racks.get(r).ok().map(|(_, p, s, _, _)| (p, s)))
                             .map(|(p, _)| format!("rack at ({},{})", p.x, p.y))
                             .unwrap_or_else(|| "storage".to_string()),
                         crate::crew::HaulDest::Blueprint(_) => "blueprint".to_string(),
@@ -1127,6 +1309,7 @@ enum SelSig {
         e: Entity,
         kind: BuildingKind,
         demo: bool,
+        temp_q: u16,
     },
     Fab {
         e: Entity,
@@ -1138,6 +1321,7 @@ enum SelSig {
         e: Entity,
         on: bool,
         demo: bool,
+        temp_q: u16,
     },
 }
 
@@ -1173,7 +1357,6 @@ fn selection_panel_system(
         ),
         With<Item>,
     >,
-    racks: Query<(&TilePos, &StorageCell), With<StorageCell>>,
     racks_full: Query<(
         Entity,
         &TilePos,
@@ -1199,8 +1382,10 @@ fn selection_panel_system(
         &PowerRole,
         &PowerStatus,
         Option<&MarkedForDeconstruct>,
+        Option<&crate::thermal::ThermalState>,
     )>,
     power_state: Res<PowerState>,
+    thermal: ThermalView,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
     mut btn_q: Query<
         (&Interaction, &mut BackgroundColor, &mut Visibility),
@@ -1245,17 +1430,19 @@ fn selection_panel_system(
             Err(_) => SelSig::None,
         },
         Some(Selected::Building(e)) => {
-            if let Ok((_, _, role, _, demo)) = generators.get(e) {
+            if let Ok((_, pos, role, _, demo, _)) = generators.get(e) {
                 SelSig::Generator {
                     e,
                     on: matches!(role, PowerRole::Generator { on: true, .. }),
                     demo: demo.is_some(),
+                    temp_q: thermal.grid.amb_at(*pos).max(0.0) as u16,
                 }
-            } else if let Ok((_, _, b, demo)) = buildings.get(e) {
+            } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 SelSig::Building {
                     e,
                     kind: b.kind,
                     demo: demo.is_some(),
+                    temp_q: thermal.grid.amb_at(*pos).max(0.0) as u16,
                 }
             } else if let Ok((_, _, cell, _, demo)) = racks_full.get(e) {
                 SelSig::Rack {
@@ -1283,7 +1470,7 @@ fn selection_panel_system(
                     format!("Crew {} ({},{})", crew.name, pos.x, pos.y),
                     crew.tint,
                 ));
-                lines.push((task_label(task, &items, &racks), Color::WHITE));
+                lines.push((task_label(task, &items, &racks_full), Color::WHITE));
                 match task {
                     CrewTask::Haul(job) => {
                         let detail = match job.phase {
@@ -1295,7 +1482,9 @@ fn selection_panel_system(
                             _ => match job.dest {
                                 crate::crew::HaulDest::Storage => job
                                     .target_rack
-                                    .and_then(|r| racks.get(r).ok())
+                                    .and_then(|r| {
+                                        racks_full.get(r).ok().map(|(_, p, s, _, _)| (p, s))
+                                    })
                                     .map(|(p, s)| {
                                         format!("Deliver to rack ({},{}) [{}]", p.x, p.y, s.label())
                                     })
@@ -1428,7 +1617,7 @@ fn selection_panel_system(
             }
         }
         Some(Selected::Building(e)) => {
-            if let Ok((_, pos, role, status, demo)) = generators.get(e) {
+            if let Ok((_, pos, role, status, demo, tstate)) = generators.get(e) {
                 let PowerRole::Generator { output, on } = *role else {
                     unreachable!("generators query filters by role")
                 };
@@ -1448,6 +1637,29 @@ fn selection_panel_system(
                         Color::srgb(1.0, 0.6, 0.45)
                     },
                 ));
+                // Thermal readout: core temperature, state, derate reason.
+                let temp = thermal.grid.amb_at(*pos);
+                let tstate = tstate.copied().unwrap_or_default();
+                lines.push((
+                    format!(
+                        "Core: {:.0}°C — {} | heat follows load",
+                        temp,
+                        tstate.label()
+                    ),
+                    match tstate {
+                        crate::thermal::ThermalState::Normal => Color::WHITE,
+                        crate::thermal::ThermalState::Overheat => Color::srgb(1.0, 0.7, 0.25),
+                        crate::thermal::ThermalState::Critical => Color::srgb(1.0, 0.4, 0.3),
+                    },
+                ));
+                if tstate == crate::thermal::ThermalState::Critical {
+                    lines.push((
+                        "CRITICAL: emergency power only (pumps stay online). \
+                         Restore cooling — View [P] → Coolant."
+                            .to_string(),
+                        Color::srgb(1.0, 0.6, 0.45),
+                    ));
+                }
                 if let Some(net) = power_state.device_net.get(&e) {
                     if let Some(info) = power_state.networks.get(*net) {
                         lines.push((
@@ -1479,6 +1691,70 @@ fn selection_panel_system(
                     format!("{} ({},{})", b.kind.label(), pos.x, pos.y),
                     Color::srgb(0.85, 0.85, 0.9),
                 ));
+                let net = thermal
+                    .coolant
+                    .device_net
+                    .get(&e)
+                    .and_then(|&n| thermal.coolant.networks.get(n).copied());
+                match b.kind {
+                    BuildingKind::Pump => {
+                        if let Some(n) = net {
+                            lines.push((
+                                format!(
+                                    "Loop: {} | flow {:.1} ({} pump{} on)",
+                                    n.status_label(),
+                                    n.flow,
+                                    n.powered_pumps,
+                                    if n.powered_pumps == 1 { "" } else { "s" }
+                                ),
+                                if n.powered_pumps > 0 {
+                                    Color::WHITE
+                                } else {
+                                    Color::srgb(1.0, 0.6, 0.45)
+                                },
+                            ));
+                        }
+                    }
+                    BuildingKind::HeatExchanger => {
+                        let tw = thermal.water.temp_at(*pos);
+                        let w = thermal.water.amount_at(*pos);
+                        if let Some(n) = net {
+                            lines.push((
+                                format!(
+                                    "Pickup: {:.0}H/s | water {:.1} @ {:.0}°C",
+                                    n.pickup_rate, w, tw
+                                ),
+                                Color::WHITE,
+                            ));
+                        }
+                    }
+                    BuildingKind::Radiator => {
+                        let tw = thermal.water.temp_at(*pos);
+                        if let Some(n) = net {
+                            lines.push((
+                                format!(
+                                    "Dumping: {:.0}H/s | water at {:.0}°C",
+                                    n.dump_rate / (n.radiators.max(1) as f32),
+                                    tw
+                                ),
+                                Color::WHITE,
+                            ));
+                        }
+                    }
+                    BuildingKind::Reservoir => {
+                        let w = thermal.water.amount_at(*pos);
+                        lines.push((
+                            format!(
+                                "Stored: {:.0}/{:.0} water @ {:.0}°C",
+                                w,
+                                crate::coolant::PIPE_TILE_CAP + crate::coolant::RESERVOIR_ADD_CAP,
+                                thermal.water.temp_at(*pos)
+                            ),
+                            Color::WHITE,
+                        ));
+                    }
+                    _ => {}
+                }
                 if demo.is_some() {
                     lines.push((
                         if b.demo_progress > 0.0 {
@@ -1642,7 +1918,7 @@ fn selection_panel_system(
                 }
                 v
             }
-            SelSig::Generator { e, on, demo } => {
+            SelSig::Generator { e, on, demo, .. } => {
                 let mut v = vec![BtnCfg::new(
                     if *on { "Standby" } else { "Online" },
                     Action::SetGeneratorOn { gen: *e, on: !*on },
@@ -1753,8 +2029,6 @@ fn hud_update_system(
     stats: Res<crate::stats::Stats>,
     log: Res<EventLog>,
     build_mode: Res<BuildMode>,
-    power: Res<PowerOverlay>,
-    power_state: Res<PowerState>,
     mut speed_btn_q: Query<
         (&SpeedIndex, &Interaction, &mut BackgroundColor),
         (With<SpeedIndex>, Without<BuildCat>),
@@ -1776,7 +2050,13 @@ fn hud_update_system(
         ),
         With<Item>,
     >,
-    racks: Query<(&TilePos, &StorageCell), With<StorageCell>>,
+    racks: Query<(
+        Entity,
+        &TilePos,
+        &StorageCell,
+        Option<&Building>,
+        Option<&MarkedForDeconstruct>,
+    )>,
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
 ) {
     let now = clock.now();
@@ -1817,25 +2097,6 @@ fn hud_update_system(
         };
     }
 
-    // ---- power network summary (power view) ----
-    if let Ok((mut text, _, _)) = texts.get_mut(hud.power_line) {
-        if power.0 {
-            if power_state.networks.is_empty() {
-                text.0 = "POWER: no networks".to_string();
-            } else {
-                let parts: Vec<String> = power_state
-                    .networks
-                    .iter()
-                    .enumerate()
-                    .map(|(i, net)| format!("NET {}: {}", i + 1, net.summary()))
-                    .collect();
-                text.0 = format!("POWER | {}", parts.join(" | "));
-            }
-        } else {
-            text.0 = String::new();
-        }
-    }
-
     // ---- sim scheduler telemetry (debug row) ----
     if let Ok((mut text, _, _)) = texts.get_mut(hud.sim_telemetry) {
         text.0 = format!(
@@ -1857,8 +2118,8 @@ fn hud_update_system(
 
     // ---- stats line ----
     let marked = items.iter().filter(|(.., m, _, _, _)| m.is_some()).count();
-    let stored: u32 = racks.iter().map(|(_, s)| s.stored()).sum();
-    let cap: u32 = racks.iter().map(|(_, s)| s.capacity).sum();
+    let stored: u32 = racks.iter().map(|(_, _, s, _, _)| s.stored()).sum();
+    let cap: u32 = racks.iter().map(|(_, _, s, _, _)| s.capacity).sum();
     let idle = crews
         .iter()
         .filter(|(_, _, t, ..)| matches!(t, CrewTask::Idle(_)))

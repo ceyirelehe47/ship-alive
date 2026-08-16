@@ -29,6 +29,9 @@ fn setup_full_world() -> World {
     world.insert_resource(EventLog::default());
     world.insert_resource(ship_alive::stats::Stats::default());
     let mut cables = CableGrid::new(w, h);
+    let mut pipes = ship_alive::coolant::PipeGrid::new(w, h);
+    let mut water = ship_alive::coolant::WaterGrid::new(w, h);
+    let mut reservoir_tiles: Vec<TilePos> = Vec::new();
     let mut crew_idx = 0;
     for req in spawns {
         match req {
@@ -90,12 +93,81 @@ fn setup_full_world() -> World {
             SpawnReq::Cable { pos } => {
                 cables.set(pos, true);
             }
+            SpawnReq::Pipe { pos } => {
+                pipes.set(pos, true);
+            }
+            SpawnReq::Pump { pos } => {
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Pump,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::coolant::Pump,
+                    PowerRole::consumer(ship_alive::coolant::PUMP_DEMAND),
+                    PowerStatus::default(),
+                ));
+            }
+            SpawnReq::Reservoir { pos } => {
+                reservoir_tiles.push(pos);
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Reservoir,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::coolant::Reservoir,
+                ));
+            }
+            SpawnReq::HeatExchanger { pos } => {
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::HeatExchanger,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::coolant::HeatExchanger,
+                ));
+            }
+            SpawnReq::Radiator { pos } => {
+                world.spawn((
+                    pos,
+                    Footprint::new(pos.x, pos.y, 1, 1),
+                    Building {
+                        kind: BuildingKind::Radiator,
+                        foot: Footprint::new(pos.x, pos.y, 1, 1),
+                        demo_progress: 0.0,
+                    },
+                    ship_alive::coolant::Radiator { hull_ok: true },
+                ));
+            }
             SpawnReq::Item { pos, kind } => {
                 world.spawn((pos, Item { kind }));
             }
         }
     }
+    // Mirror the game's boot: the starter loop ships 80% full.
+    for pos in pipes.iter_pipes() {
+        water.fill(pos, 5.0, ship_alive::thermal::AMBIENT_START);
+    }
+    for pos in &reservoir_tiles {
+        water.fill(*pos, 50.0, ship_alive::thermal::AMBIENT_START);
+    }
     world.insert_resource(cables);
+    world.insert_resource(pipes);
+    world.insert_resource(water);
+    let thermal = {
+        let map = world.resource::<ShipMap>();
+        ship_alive::thermal::ThermalGrid::new(map)
+    };
+    world.insert_resource(thermal);
+    world.insert_resource(ship_alive::coolant::CoolantStats::default());
     world.insert_resource(ship_alive::power::PowerState::default());
     world.insert_resource(ship_alive::simtime::SimClock::default());
     world.init_resource::<Events<Action>>();
@@ -117,9 +189,11 @@ fn fab_fleet_builds_with_material_conservation() {
             .chain(),
     );
 
-    // F's script.
+    // F's script. (The 6th fab sits at (14,10): the old (17,16) corner now
+    // hosts the pre-installed coolant loop, and (17,10) must stay clear —
+    // it is the only walkable entry below FABRICATION's door.)
     let mut ev = world.resource_mut::<Events<Action>>();
-    for pos in [(12, 10), (19, 10), (17, 14), (19, 14), (17, 16), (12, 12)] {
+    for pos in [(12, 10), (19, 10), (17, 14), (19, 14), (14, 10), (12, 12)] {
         ev.send(Action::PlaceBlueprint {
             kind: BuildingKind::Fabricator,
             pos: TilePos::new(pos.0, pos.1),
@@ -141,7 +215,7 @@ fn fab_fleet_builds_with_material_conservation() {
             pos: TilePos::new(19, y),
         });
     }
-    for p in [(13, 12), (13, 13), (14, 13)] {
+    for p in [(13, 12), (13, 13), (14, 13), (16, 11)] {
         ev.send(Action::PlaceBlueprint {
             kind: BuildingKind::PowerCable,
             pos: TilePos::new(p.0, p.1),
@@ -263,15 +337,17 @@ fn fab_fleet_builds_with_material_conservation() {
     }
 
     // The whole fleet must share ONE power network with the reactor:
-    // 7 fabs x 20 PU = 140 demand vs 100 generation -> deterministic shed.
+    // 7 fabs x 20 PU + the coolant pump = 146 demand vs 100 generation.
+    // Shedding is whole-consumer in entity order: the map-spawned pump (6)
+    // plus four fabricators (80) fit, the rest shed -> served 86.
     let nets = world
         .resource::<ship_alive::power::PowerState>()
         .networks
         .clone();
     assert_eq!(nets.len(), 1, "spur bridges into the main grid: {nets:?}");
     assert_eq!(nets[0].generation, 100);
-    assert_eq!(nets[0].demand, 140);
-    assert_eq!(nets[0].served, 100);
+    assert_eq!(nets[0].demand, 146);
+    assert_eq!(nets[0].served, 86);
 
     // All six fabricators built, nothing left mid-flight.
     let built = world

@@ -156,7 +156,8 @@ fn select_and_box_system(
     >,
     mut selection: ResMut<Selection>,
     build_mode: Res<BuildMode>,
-    cables: Res<CableGrid>,
+    // Nested tuple = one system param (the flat list would exceed 16).
+    (cables, pipes): (Res<CableGrid>, Res<crate::coolant::PipeGrid>),
     mut box_select: ResMut<BoxSelect>,
     mut actions: EventWriter<Action>,
     mut last_paint: Local<Option<TilePos>>,
@@ -165,17 +166,20 @@ fn select_and_box_system(
         return;
     };
 
-    // Cable drag-paint: hold the left button and sweep tiles to lay cable
-    // blueprints along the way (click also works: the press frame paints).
-    if let Some(Tool::Build(BuildingKind::PowerCable)) = build_mode.0 {
+    // Drag-paint for underfloor runs: hold the left button and sweep tiles to
+    // lay cable/pipe blueprints along the way (click also works: the press
+    // frame paints).
+    let drag_kind = match build_mode.0 {
+        Some(Tool::Build(BuildingKind::PowerCable)) => Some(BuildingKind::PowerCable),
+        Some(Tool::Build(BuildingKind::CoolantPipe)) => Some(BuildingKind::CoolantPipe),
+        _ => None,
+    };
+    if let Some(kind) = drag_kind {
         if !pointer_over_ui(&ui) && buttons.pressed(MouseButton::Left) {
             if let Some(tile) = cursor_tile(window, &camera, &map) {
                 if *last_paint != Some(tile) {
                     *last_paint = Some(tile);
-                    actions.write(Action::PlaceBlueprint {
-                        kind: BuildingKind::PowerCable,
-                        pos: tile,
-                    });
+                    actions.write(Action::PlaceBlueprint { kind, pos: tile });
                 }
             }
         } else {
@@ -201,7 +205,7 @@ fn select_and_box_system(
                 // Plain click: tool action, or select.
                 if let Some(tool) = build_mode.0 {
                     match tool {
-                        Tool::Build(BuildingKind::PowerCable) => {
+                        Tool::Build(BuildingKind::PowerCable | BuildingKind::CoolantPipe) => {
                             // Handled by drag-paint on the press frame.
                         }
                         Tool::Build(kind) => {
@@ -234,6 +238,8 @@ fn select_and_box_system(
                                 // cable instead (visible in the power overlay).
                                 if cables.has(tile) {
                                     actions.write(Action::MarkCableDeconstruct { pos: tile });
+                                } else if pipes.has(tile) {
+                                    actions.write(Action::MarkPipeDeconstruct { pos: tile });
                                 }
                             }
                         }
@@ -340,7 +346,7 @@ fn action_keys_system(
         actions.write(Action::MarkAll);
     }
     if keys.just_pressed(KeyCode::KeyP) {
-        actions.write(Action::TogglePowerView);
+        actions.write(Action::CycleOverlay);
     }
     if keys.just_pressed(KeyCode::KeyC) {
         actions.write(Action::CancelAll);
@@ -351,7 +357,9 @@ fn action_keys_system(
         }
     }
     if keys.just_pressed(KeyCode::KeyB) {
-        // Cycle build tools: none → wall → door → rack → fabricator → deconstruct → none.
+        // Cycle build tools: none → wall → door → rack → fabricator → cable
+        // → reactor → pipe → pump → heat exchanger → radiator → reservoir →
+        // deconstruct → none. (The full set also lives in the BUILD menu.)
         let next = match build_mode.0 {
             None => Some(Tool::Build(BuildingKind::Wall)),
             Some(Tool::Build(BuildingKind::Wall)) => Some(Tool::Build(BuildingKind::Door)),
@@ -361,7 +369,16 @@ fn action_keys_system(
                 Some(Tool::Build(BuildingKind::PowerCable))
             }
             Some(Tool::Build(BuildingKind::PowerCable)) => Some(Tool::Build(BuildingKind::Reactor)),
-            Some(Tool::Build(BuildingKind::Reactor)) => Some(Tool::Deconstruct),
+            Some(Tool::Build(BuildingKind::Reactor)) => {
+                Some(Tool::Build(BuildingKind::CoolantPipe))
+            }
+            Some(Tool::Build(BuildingKind::CoolantPipe)) => Some(Tool::Build(BuildingKind::Pump)),
+            Some(Tool::Build(BuildingKind::Pump)) => Some(Tool::Build(BuildingKind::HeatExchanger)),
+            Some(Tool::Build(BuildingKind::HeatExchanger)) => {
+                Some(Tool::Build(BuildingKind::Radiator))
+            }
+            Some(Tool::Build(BuildingKind::Radiator)) => Some(Tool::Build(BuildingKind::Reservoir)),
+            Some(Tool::Build(BuildingKind::Reservoir)) => Some(Tool::Deconstruct),
             Some(Tool::Deconstruct) => None,
         };
         actions.write(Action::SetTool { tool: next });

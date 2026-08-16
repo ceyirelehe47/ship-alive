@@ -53,6 +53,8 @@ SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
 SLICE4_SCENARIO=A cargo run    # Slice 4 气密验收场景（A–F、H–L、N–P）
+SLICE4_DOORPIN=6,6:0.5 cargo run  # 门美术检查：钉住 (x,y) 门的开启进度/模式（[:Auto|HoldOpen|LockClosed]）
+SLICE4_DEBUG_DOOR=11,10 cargo run # 门美术检查：绕过建造规则在该格生成一扇门（可放进竖墙验证 Ew 朝向）
 cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
 ```
 

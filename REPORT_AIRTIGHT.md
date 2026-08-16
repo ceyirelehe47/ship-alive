@@ -219,9 +219,10 @@ Precise isolation rates are unit-tested (`closed_door_blocks_fast_ambient_mixing
   summary, sides ("Compartment 5 | sealed | Compartment 6" ↔ "<-air-linked"),
   airtight status, plus Auto / Hold Open / Lock Closed buttons (current mode
   highlighted) and Deconstruct.
-- **Normal view** (`#38`): the leaf squashes along its wall line as it opens
-  (Ns shrinks X, Ew shrinks Y — verified in screenshots), open doors render
-  as a faded sliver, locked doors take a red tint; door tooltip shows
+- **Normal view** (`#38`): the door renders as two leaves that slide apart
+  toward the walls on either side as it opens (leaves sit just below wall z,
+  so open leaves tuck behind the walls), open doors leave a thin faded frame
+  sliver, locked doors take a red tint; door tooltip shows
   "Closed (Auto) — airtight".
 - Ghost: legal door placements preview the axis; illegal ones show
   "doors need a one-tile wall opening".
@@ -282,7 +283,8 @@ topology cache, door-toggle cache behavior, 128×128 rebuild/step perf,
 ## Playtest pass 1 — door readability
 
 Screenshot + vision-model verification on the live game: doors visibly change
-between closed (full leaf), open (retracted sliver, faded) and locked
+between closed (full two-leaf slab), open (leaves slid into the walls, thin
+faded frame sliver) and locked
 (red-tinted); the Compartments overlay was found via `P` on the first try and
 read correctly ("distinct pastel tints per room, red door tiles, HUD:
 COMPARTMENTS 7 structural | 7 sealed | 0 exposed, Doors 5 closed / 0 open").
@@ -353,8 +355,8 @@ escalated to pass-through). Power/cooling loops unaffected.
 - A locked door whose tile holds a ground item: haul jobs to that item fail
   with the standard unreachable cooldown (bounded, but the item is stranded
   until unlock — acceptable, matches wall behavior).
-- Door visuals reuse the Slice 0 door art with squash/tint; no dedicated
-  open/locked sprites yet (readable, but art polish is open).
+- Door visuals reuse the Slice 0 door art as two mirrored sliding leaves;
+  no dedicated open/locked sprites yet (readable, but art polish is open).
 - `M` layout A/B: absolute time-to-parts roughly doubled after the rework
   phase because the fresh ore spawns route cargo→corridor→FAB through two
   doors; haul *distance* per part still improved (206 vs 273). Scenario A

@@ -31,6 +31,10 @@ pub enum Role {
     CrewCarry,
     /// Finished building (wall/door/fabricator sprite, sized to footprint).
     BuildingSprite,
+    /// Door leaf sliding toward the negative end of the wall line.
+    DoorLeafA,
+    /// Door leaf sliding toward the positive end of the wall line.
+    DoorLeafB,
     /// Construction blueprint ghost sprite.
     BlueprintSprite,
     /// Blueprint materials/progress text.
@@ -544,7 +548,12 @@ fn ensure_visuals_system(
     racks: Query<(Entity, &TilePos), (With<StorageCell>, Without<HasVisual>)>,
     blueprints: Query<(Entity, &building::Footprint, &Blueprint), Without<HasVisual>>,
     buildings: Query<
-        (Entity, &building::Footprint, &Building),
+        (
+            Entity,
+            &building::Footprint,
+            &Building,
+            Option<&crate::airtight::Door>,
+        ),
         (Without<HasVisual>, Without<StorageCell>),
     >,
 ) {
@@ -667,10 +676,55 @@ fn ensure_visuals_system(
         ));
         commands.entity(e).insert(HasVisual);
     }
-    for (e, foot, b) in buildings.iter() {
+    for (e, foot, b, door) in buildings.iter() {
         let p = foot_world_pos(foot);
         let d = building::def(b.kind);
         let size = crate::TILE * d.w as f32 * 0.98;
+        if let Some(door) = door {
+            // Doors render as two leaves. Closed, each leaf parks on its half
+            // of the tile; the sync system slides them apart toward the walls
+            // on either side as the door opens. Leaves sit just below wall z,
+            // so an open leaf tucks behind the wall and only a thin frame
+            // sliver stays visible in the doorway.
+            let half = size * 0.5;
+            let (a_off, b_off, b_flip) = match door.axis {
+                // Wall line runs east-west: leaves park west/east.
+                crate::airtight::DoorAxis::Ns => (
+                    Vec2::new(-half * 0.5, 0.0),
+                    Vec2::new(half * 0.5, 0.0),
+                    (true, false),
+                ),
+                // Wall line runs north-south: leaves park south/north.
+                crate::airtight::DoorAxis::Ew => (
+                    Vec2::new(0.0, -half * 0.5),
+                    Vec2::new(0.0, half * 0.5),
+                    (false, true),
+                ),
+            };
+            let (lw, lh) = match door.axis {
+                crate::airtight::DoorAxis::Ns => (half, size),
+                crate::airtight::DoorAxis::Ew => (size, half),
+            };
+            for (role, off, (fx, fy)) in [
+                (Role::DoorLeafA, a_off, (false, false)),
+                (Role::DoorLeafB, b_off, b_flip),
+            ] {
+                commands.spawn((
+                    Visual { target: e, role },
+                    Sprite {
+                        image: art.building(b.kind).clone(),
+                        custom_size: Some(Vec2::new(lw, lh)),
+                        flip_x: fx,
+                        flip_y: fy,
+                        color: Color::WHITE,
+                        ..default()
+                    },
+                    Transform::from_translation((p + off).extend(0.14)),
+                ));
+            }
+            commands.entity(e).insert(HasVisual);
+            continue;
+        }
         commands.spawn((
             Visual {
                 target: e,
@@ -1459,37 +1513,53 @@ fn pipe_bucket(amount: f32, temp: f32) -> u32 {
 // Slice 4: doors & compartments
 // =====================================================================================
 
-/// Normal-view door readability: the leaf squashes along its wall line as it
-/// opens (Ns doors shrink horizontally, Ew vertically), locked doors take a
-/// red tint. `Door` mutates every step while moving, so Changed<> filters
-/// idle frames for free.
+/// Normal-view door readability: the two door leaves slide apart toward the
+/// walls on either side of the doorway as it opens (leaf sprites sit just
+/// below wall z, so open leaves tuck behind the walls and only thin frame
+/// slivers remain in the doorway). Locked doors take a red tint, doors marked
+/// for deconstruction a yellow one.
 fn sync_door_visuals_system(
+    map: Res<ShipMap>,
     index: Res<VisualIndex>,
-    doors: Query<(Entity, &crate::airtight::Door)>,
-    mut sprites: Query<&mut Sprite, Without<Text2d>>,
+    doors: Query<(
+        Entity,
+        &TilePos,
+        &crate::airtight::Door,
+        Option<&MarkedForDeconstruct>,
+    )>,
+    mut leaves: Query<(&mut Transform, &mut Sprite), Without<Text2d>>,
 ) {
-    for (e, door) in doors.iter() {
-        let Some(ve) = index.get(e, Role::BuildingSprite) else {
+    for (e, pos, door, marked) in doors.iter() {
+        let (Some(la), Some(lb)) = (index.get(e, Role::DoorLeafA), index.get(e, Role::DoorLeafB))
+        else {
             continue;
         };
-        let Ok(mut sprite) = sprites.get_mut(ve) else {
-            continue;
-        };
+        let p = map.world_pos(*pos);
         let base = crate::TILE * 0.98;
-        let (w, h) = match door.axis {
-            // Wall line runs east-west: the leaf retracts along X.
-            crate::airtight::DoorAxis::Ns => (base * (1.0 - door.progress).max(0.12), base),
-            // Wall line runs north-south: the leaf retracts along Y.
-            crate::airtight::DoorAxis::Ew => (base, base * (1.0 - door.progress).max(0.12)),
+        // Closed: each leaf centered on its half of the tile. Fully open:
+        // slid outward until only a 12% sliver still covers the doorway.
+        let at = base * 0.25 + base * 0.38 * door.progress;
+        let (a, b) = match door.axis {
+            // Wall line runs east-west: the leaves slide along X.
+            crate::airtight::DoorAxis::Ns => (p + Vec2::new(-at, 0.0), p + Vec2::new(at, 0.0)),
+            // Wall line runs north-south: the leaves slide along Y.
+            crate::airtight::DoorAxis::Ew => (p + Vec2::new(0.0, -at), p + Vec2::new(0.0, at)),
         };
-        sprite.custom_size = Some(Vec2::new(w.max(4.0), h.max(4.0)));
-        sprite.color = if door.mode == crate::airtight::DoorMode::LockClosed {
+        let color = if marked.is_some() {
+            Color::srgb(1.0, 0.8, 0.25)
+        } else if door.mode == crate::airtight::DoorMode::LockClosed {
             Color::srgb(1.0, 0.45, 0.4)
         } else if door.progress >= 1.0 {
             Color::srgba(0.75, 0.95, 1.0, 0.45)
         } else {
             Color::WHITE
         };
+        for (ve, want) in [(la, a), (lb, b)] {
+            if let Ok((mut tr, mut sp)) = leaves.get_mut(ve) {
+                tr.translation = want.extend(0.14);
+                sp.color = color;
+            }
+        }
     }
 }
 

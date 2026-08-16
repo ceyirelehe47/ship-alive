@@ -5,7 +5,7 @@
 //! a world state summary and exits. Used to smoke-test the acceptance
 //! scenarios from the design briefs without manual play.
 
-use crate::building::{Blueprint, Building, BuildingKind};
+use crate::building::{Blueprint, Building, BuildingKind, Footprint};
 use crate::crew::{Crew, CrewTask, Priority, WorkKind};
 use crate::items::{Item, ItemKind, MarkedForHaul, ReservedBy};
 use crate::jobs::Action;
@@ -21,7 +21,13 @@ impl Plugin for AutotestPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(
             Update,
-            (scenario_driver, slice2_driver, slice3_driver, slice4_driver)
+            (
+                scenario_driver,
+                slice2_driver,
+                slice3_driver,
+                slice4_driver,
+                slice4_dev_pins,
+            )
                 .in_set(crate::Set::Input),
         );
     }
@@ -1960,5 +1966,95 @@ fn slice4_driver(
             }
         }
         _ => {}
+    }
+}
+
+/// Dev hooks for door-art inspection on the full app (no scenario needed):
+/// - `SLICE4_DEBUG_DOOR=x,y` spawns a finished door on that tile at boot,
+///   bypassing build rules — e.g. straight into a vertical wall, so the Ew
+///   leaf orientation can be exercised on the starter ship.
+/// - `SLICE4_DOORPIN=x,y:progress[:mode]` pins a door's runtime state every
+///   frame (progress 0..1; mode Auto/HoldOpen/LockClosed), so screenshots
+///   capture exact mid-animation geometry instead of racing the door cycle.
+///
+/// Runs in `Set::Input`: after the FixedUpdate door logic, before the render
+/// sync — what you see is exactly the pinned state.
+fn slice4_dev_pins(
+    mut commands: Commands,
+    mut map: ResMut<crate::map::ShipMap>,
+    mut doors: Query<(&TilePos, &mut crate::airtight::Door)>,
+    mut spawned: Local<bool>,
+) {
+    if !*spawned {
+        *spawned = true;
+        if let Ok(spec) = std::env::var("SLICE4_DEBUG_DOOR") {
+            let mut it = spec.split(',');
+            if let (Some(x), Some(y)) = (
+                it.next().and_then(|s| s.parse::<i32>().ok()),
+                it.next().and_then(|s| s.parse::<i32>().ok()),
+            ) {
+                let pos = TilePos::new(x, y);
+                // Floor works anywhere a real door could go; Wall/BuiltWall
+                // lets the hook drop one straight into a vertical wall to
+                // exercise the Ew orientation.
+                let hostable = map.tile(pos).is_some_and(|t| {
+                    t == crate::map::Tile::Floor
+                        || t == crate::map::Tile::Wall
+                        || t == crate::map::Tile::BuiltWall
+                });
+                if hostable {
+                    let axis = crate::airtight::door_axis(&map, pos)
+                        .unwrap_or(crate::airtight::DoorAxis::Ns);
+                    map.set_tile(pos, crate::map::Tile::Door);
+                    commands.spawn((
+                        pos,
+                        Building {
+                            kind: BuildingKind::Door,
+                            foot: Footprint::new(x, y, 1, 1),
+                            demo_progress: 0.0,
+                        },
+                        crate::airtight::Door::new(axis),
+                    ));
+                } else {
+                    println!("SLICE4_DEBUG_DOOR: ({x},{y}) is not a floor tile");
+                }
+            }
+        }
+    }
+    let Ok(spec) = std::env::var("SLICE4_DOORPIN") else {
+        return;
+    };
+    let mut parts = spec.split(':');
+    let mut pos_it = parts.next().unwrap_or_default().split(',');
+    let (Some(x), Some(y)) = (
+        pos_it.next().and_then(|s| s.parse::<i32>().ok()),
+        pos_it.next().and_then(|s| s.parse::<i32>().ok()),
+    ) else {
+        return;
+    };
+    let progress: f32 = parts
+        .next()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    let mode = match parts.next().unwrap_or("HoldOpen") {
+        "LockClosed" => crate::airtight::DoorMode::LockClosed,
+        "Auto" => crate::airtight::DoorMode::Auto,
+        _ => crate::airtight::DoorMode::HoldOpen,
+    };
+    for (p, mut door) in doors.iter_mut() {
+        if p.x != x || p.y != y {
+            continue;
+        }
+        door.mode = mode;
+        door.progress = progress;
+        door.phase = if progress >= 1.0 {
+            crate::airtight::DoorPhase::Open
+        } else if progress <= 0.0 {
+            crate::airtight::DoorPhase::Closed
+        } else {
+            crate::airtight::DoorPhase::Opening
+        };
+        door.hold_until = f64::MAX / 2.0;
     }
 }

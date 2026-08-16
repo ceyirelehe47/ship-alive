@@ -459,6 +459,6 @@ device-independent thermal nodes; high-rate (Cruise) batched stepping
 
 ## Git
 
-Implementation commit: pushed to `main` after all gates — see the final
-report message for the SHA (this file is committed together with the code
-it describes).
+Code commit: `5143a4c` ("Slice 5 — Atmosphere & pressure: per-cell conserved
+gas, derived pressure, door/breach flow", pushed to `main`). This report and
+a SHA pin note are the only follow-up commit on top.

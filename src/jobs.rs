@@ -118,6 +118,11 @@ pub enum Action {
         work: WorkKind,
         level: Priority,
     },
+    /// Restore every crew member's work priorities to the defaults
+    /// (all Normal) and wake idle scanners.
+    ResetWorkPriorities,
+    /// UI-only: show/hide the WORK tab (consumed by the worktab plugin).
+    ToggleWorkTab,
     /// UI-only: select a build tool (consumed by the input plugin).
     SetTool {
         tool: Option<crate::input::Tool>,
@@ -491,9 +496,16 @@ pub fn actions_system(
                 }
             }
             Action::SetPriority { crew, work, level } => {
-                for (e, mut c, _, _, _) in crews.iter_mut() {
+                for (e, mut c, task, _, _) in crews.iter_mut() {
                     if e == crew {
                         c.priorities.set(work, level);
+                        // RimWorld-style responsiveness: a priority change
+                        // never interrupts the running job, but an idle crew
+                        // must re-scan immediately instead of waiting out its
+                        // nothing-to-do backoff.
+                        if matches!(*task, CrewTask::Idle(_)) {
+                            c.next_scan = now;
+                        }
                         log.push(
                             now,
                             LogKind::Info,
@@ -501,6 +513,15 @@ pub fn actions_system(
                         );
                     }
                 }
+            }
+            Action::ResetWorkPriorities => {
+                for (_, mut c, task, _, _) in crews.iter_mut() {
+                    c.priorities = crate::crew::WorkPriorities::default();
+                    if matches!(*task, CrewTask::Idle(_)) {
+                        c.next_scan = now;
+                    }
+                }
+                log.push(now, LogKind::Info, "Work priorities reset to defaults");
             }
             Action::SetGeneratorOn { gen, on } => {
                 if let Ok((_, mut role)) = gens.get_mut(gen) {
@@ -578,6 +599,9 @@ pub fn actions_system(
             }
             Action::SetTool { .. } => {
                 // Consumed by the input plugin.
+            }
+            Action::ToggleWorkTab => {
+                // Consumed by worktab::work_tab_toggle_system.
             }
             Action::SetDoorMode { .. } => {
                 // Consumed by airtight::door_action_system.

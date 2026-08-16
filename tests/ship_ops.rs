@@ -760,6 +760,184 @@ fn mixed_work_distributes_without_conflicts() {
 }
 
 // =====================================================================================
+// Slice 7: WORK tab semantics
+// =====================================================================================
+
+#[test]
+fn priority_cycle_visits_every_tier_in_order() {
+    // The WORK tab cycles cells Off -> Low -> Normal -> High -> Off.
+    let mut p = Priority::Normal;
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        p = p.cycle();
+        seen.push(p);
+    }
+    assert_eq!(
+        seen,
+        vec![
+            Priority::High,
+            Priority::Disabled,
+            Priority::Low,
+            Priority::Normal
+        ],
+        "full round trip in cycle order"
+    );
+    // Codes are stable (the panel renders them).
+    assert_eq!(Priority::Disabled.code(), "—");
+    assert_eq!(Priority::Low.code(), "L");
+    assert_eq!(Priority::Normal.code(), "N");
+    assert_eq!(Priority::High.code(), "H");
+}
+
+#[test]
+fn set_priority_wakes_an_idle_crew_instead_of_waiting_out_the_backoff() {
+    let mut h = Harness::new();
+    // Two crews settle into nothing-to-do (their next scan backs off to
+    // +36 sim s).
+    let c1 = spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    let c2 = spawn_crew(&mut h.world, "B", TilePos::new(1, 5));
+    let _rack = spawn_rack(&mut h.world, TilePos::new(5, 1));
+    h.steps(0.05, 2);
+    assert!(matches!(
+        h.crew_task(c1),
+        CrewTask::Idle(IdleCause::NothingToDo)
+    ));
+    let backoff = h.world.get::<Crew>(c1).unwrap().next_scan;
+    let now = h.world.resource::<ship_alive::simtime::SimClock>().now();
+    assert!(backoff - now > 20.0, "crew is in the idle backoff window");
+
+    // Work appears and ONLY crew 1 gets a priority action.
+    let item = spawn_item(&mut h.world, TilePos::new(2, 1), ItemKind::Crate);
+    h.world.entity_mut(item).insert(MarkedForHaul);
+    h.send(Action::SetPriority {
+        crew: c1,
+        work: WorkKind::Haul,
+        level: Priority::High,
+    });
+    h.step(0.05);
+    assert_eq!(h.task_kind(c1), "haul", "woken crew claims immediately");
+    assert_eq!(
+        h.task_kind(c2),
+        "idle",
+        "untouched crew still waits out its backoff"
+    );
+}
+
+#[test]
+fn disabling_work_mid_job_does_not_interrupt_the_running_job() {
+    let mut h = Harness::new();
+    let crew = spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    let rack = spawn_rack(&mut h.world, TilePos::new(5, 1));
+    let item = spawn_item(&mut h.world, TilePos::new(2, 1), ItemKind::Crate);
+    h.world.entity_mut(item).insert(MarkedForHaul);
+    h.step(0.1);
+    assert_eq!(h.task_kind(crew), "haul");
+
+    // Player turns haul OFF while the job is in flight: the delivery must
+    // still complete (no dropped/limbo items), and no new haul may start.
+    h.send(Action::SetPriority {
+        crew,
+        work: WorkKind::Haul,
+        level: Priority::Disabled,
+    });
+    h.steps(0.05, 400);
+    let stored = h.world.get::<StorageCell>(rack).unwrap().stored();
+    assert_eq!(stored, 1, "the in-flight haul finished into the rack");
+    assert_eq!(h.world.get::<Crew>(crew).unwrap().delivered, 1);
+
+    let item2 = spawn_item(&mut h.world, TilePos::new(2, 2), ItemKind::Crate);
+    h.world.entity_mut(item2).insert(MarkedForHaul);
+    h.steps(0.05, 20);
+    assert_eq!(h.task_kind(crew), "idle", "no new haul after the disable");
+}
+
+#[test]
+fn all_work_types_disabled_reports_the_dedicated_idle_cause() {
+    let mut h = Harness::new();
+    let crew = spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    let _rack = spawn_rack(&mut h.world, TilePos::new(5, 1));
+    let item = spawn_item(&mut h.world, TilePos::new(3, 2), ItemKind::Crate);
+    h.world.entity_mut(item).insert(MarkedForHaul);
+    for wk in WorkKind::ALL {
+        set_priority(&mut h.world, crew, wk, Priority::Disabled);
+    }
+    h.steps(0.05, 10);
+    assert!(matches!(
+        h.crew_task(crew),
+        CrewTask::Idle(IdleCause::AllWorkDisabled)
+    ));
+    assert!(
+        h.world
+            .query_filtered::<Entity, With<ReservedBy>>()
+            .iter(&h.world)
+            .count()
+            == 0
+    );
+}
+
+#[test]
+fn high_tier_beats_normal_tier_over_distance() {
+    let mut h = Harness::new();
+    let crew = spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    let _rack = spawn_rack(&mut h.world, TilePos::new(5, 1));
+    // A marked item RIGHT next to the crew (haul work, distance 1).
+    let near = spawn_item(&mut h.world, TilePos::new(2, 1), ItemKind::Crate);
+    h.world.entity_mut(near).insert(MarkedForHaul);
+    // A fully supplied wall blueprint several tiles away (build work).
+    let _bp = h
+        .world
+        .spawn((
+            TilePos::new(3, 5),
+            Footprint::new(3, 5, 1, 1),
+            Blueprint {
+                kind: BuildingKind::Wall,
+                foot: Footprint::new(3, 5, 1, 1),
+                delivered: [0, 0, 1], // supplied
+                progress: 0.0,
+            },
+        ))
+        .id();
+    set_priority(&mut h.world, crew, WorkKind::Haul, Priority::Normal);
+    set_priority(&mut h.world, crew, WorkKind::Build, Priority::High);
+    h.step(0.1);
+    assert_eq!(
+        h.task_kind(crew),
+        "build",
+        "High build must beat the nearer Normal haul"
+    );
+}
+
+#[test]
+fn reset_priorities_action_restores_defaults_and_wakes_idlers() {
+    let mut h = Harness::new();
+    let crew = spawn_crew(&mut h.world, "A", TilePos::new(1, 1));
+    let _rack = spawn_rack(&mut h.world, TilePos::new(5, 1));
+    for wk in WorkKind::ALL {
+        set_priority(&mut h.world, crew, wk, Priority::Disabled);
+    }
+    let item = spawn_item(&mut h.world, TilePos::new(3, 2), ItemKind::Crate);
+    h.world.entity_mut(item).insert(MarkedForHaul);
+    h.steps(0.05, 2);
+    assert!(matches!(
+        h.crew_task(crew),
+        CrewTask::Idle(IdleCause::AllWorkDisabled)
+    ));
+
+    // The WORK tab's Defaults button resets every tier AND wakes the crew.
+    h.send(Action::ResetWorkPriorities);
+    h.step(0.05);
+    let p = h.world.get::<Crew>(crew).unwrap().priorities;
+    for wk in WorkKind::ALL {
+        assert_eq!(p.get(wk), Priority::Normal);
+    }
+    assert_eq!(
+        h.task_kind(crew),
+        "haul",
+        "reset crew immediately takes the available work"
+    );
+}
+
+// =====================================================================================
 // Deconstruct rack drops contents
 // =====================================================================================
 

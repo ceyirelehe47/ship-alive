@@ -28,6 +28,7 @@ impl Plugin for AutotestPlugin {
                 slice4_driver,
                 slice5_driver,
                 slice6_driver,
+                slice7_driver,
                 slice5_dev_tools,
                 slice4_dev_pins,
             )
@@ -3762,6 +3763,378 @@ fn slice6_driver(
                 println!(
                     "S6_U_SETTLED t={t:.1} active_duct_cells={} (sealed network sleeps; open interfaces keep a bounded workset)",
                     ducts.awake_count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        _ => {}
+    }
+}
+
+// =====================================================================================
+// SLICE7_SCENARIO. Work priority acceptance driver: A (specialists take only
+// their enabled work), B (a priority change wakes an idle scanner), C (High
+// tier beats Normal tier over distance), D (disabling mid-job keeps the
+// running job), E (all work disabled), F (frozen while paused, resumes after).
+// =====================================================================================
+
+fn s7_task_label(task: &CrewTask) -> &'static str {
+    match task {
+        CrewTask::Idle(_) => "idle",
+        CrewTask::Haul(_) => "haul",
+        CrewTask::Build(_) => "build",
+        CrewTask::Deconstruct(_) => "deconstruct",
+        CrewTask::Operate(_) => "operate",
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slice7_driver(
+    (mut actions, mut exit, mut speed): (
+        EventWriter<Action>,
+        EventWriter<AppExit>,
+        ResMut<crate::time_ctrl::GameSpeed>,
+    ),
+    clock: Res<crate::simtime::SimClock>,
+    items: Query<(Entity, &Item), With<MarkedForHaul>>,
+    crews: Query<(Entity, &Crew, &CrewTask, &TilePos), With<Crew>>,
+    racks: Query<(Entity, &TilePos, &StorageCell)>,
+    buildings: Query<(Entity, &TilePos, &Building), Without<Blueprint>>,
+    reserved: Query<(Entity, &ReservedBy)>,
+    stats: Res<crate::stats::Stats>,
+    log: Res<EventLog>,
+    mut fired: Local<Vec<&'static str>>,
+    mut frame: Local<u32>,
+    mut go_sim: Local<f64>,
+) {
+    let Some(scenario) = std::env::var("SLICE7_SCENARIO").ok() else {
+        return;
+    };
+    let t = clock.now() / crate::simtime::BASE_SIM_RATE;
+    *frame += 1;
+    let roster: Vec<(Entity, String, &CrewTask, TilePos)> = crews
+        .iter()
+        .map(|(e, c, task, p)| (e, c.name.clone(), task, *p))
+        .collect();
+    let ava = roster.first().map(|(e, ..)| *e);
+
+    let task_list = |roster: &Vec<(Entity, String, &CrewTask, TilePos)>| -> Vec<String> {
+        roster
+            .iter()
+            .map(|(_, n, task, _)| format!("{}={}", n, s7_task_label(task)))
+            .collect()
+    };
+
+    match scenario.as_str() {
+        // A - specialists: dedicate crew[0..3] to haul/build/operate and
+        // verify everyone only ever takes their enabled work.
+        "A" => {
+            if !fired.contains(&"speed") {
+                fired.push("speed");
+                speed.index = 3;
+            }
+            if !fired.contains(&"prio") && t >= 0.2 {
+                fired.push("prio");
+                for (i, (e, _, _, _)) in roster.iter().enumerate() {
+                    for wk in WorkKind::ALL {
+                        let level = match (i, wk) {
+                            (0, WorkKind::Haul) | (1, WorkKind::Build) | (2, WorkKind::Operate) => {
+                                Priority::High
+                            }
+                            (0, WorkKind::Build) | (0, WorkKind::Operate) => Priority::Disabled,
+                            (1, WorkKind::Haul) | (1, WorkKind::Operate) => Priority::Disabled,
+                            (2, WorkKind::Haul) | (2, WorkKind::Build) => Priority::Disabled,
+                            _ => Priority::Normal,
+                        };
+                        let _ = actions.write(Action::SetPriority {
+                            crew: *e,
+                            work: wk,
+                            level,
+                        });
+                    }
+                }
+            }
+            if !fired.contains(&"work") && t >= 0.4 {
+                fired.push("work");
+                let _ = actions.write(Action::MarkAll);
+                if let Some((e, _, _, _)) = crews.iter().next() {
+                    let _ = actions.write(Action::FabAddOrder { fab: e, batches: 4 });
+                }
+                let _ = actions.write(Action::PlaceBlueprint {
+                    kind: BuildingKind::Wall,
+                    pos: TilePos::new(13, 11),
+                });
+            }
+            for at in [1.5f64, 6.0, 12.0] {
+                let tag: &'static str = match at {
+                    1.5 => "snap1",
+                    6.0 => "snap2",
+                    _ => "snap3",
+                };
+                if !fired.contains(&tag) && t >= at {
+                    fired.push(tag);
+                    println!("S7_A_SNAP t={t:.1} tasks={:?}", task_list(&roster));
+                }
+            }
+            if !fired.contains(&"done") && t >= 30.0 {
+                fired.push("done");
+                let totals: Vec<String> = crews
+                    .iter()
+                    .map(|(_, c, _, _)| {
+                        format!(
+                            "{}[h={},b={},o={}]",
+                            c.name, c.delivered, c.built, c.operated
+                        )
+                    })
+                    .collect();
+                let stored: u32 = racks.iter().map(|(_, _, s)| s.stored()).sum();
+                println!(
+                    "S7_A_DONE t={t:.1} totals={totals:?} stored={stored} reserved={} stats=[{}]",
+                    reserved.iter().count(),
+                    stats.summary(),
+                );
+                println!("LOG_TAIL_BEGIN");
+                for e in log
+                    .entries
+                    .iter()
+                    .rev()
+                    .take(12)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .rev()
+                {
+                    println!("  [{:.1}s] {:?} {}", e.time, e.kind, e.text);
+                }
+                println!("LOG_TAIL_END");
+                exit.write(AppExit::Success);
+            }
+        }
+        // B - wake: after everyone settles into nothing-to-do, MarkAll plus
+        // one SetPriority (Ava, Haul, High) — Ava must claim on the very
+        // next scan instead of waiting out the idle backoff.
+        "B" => {
+            let all_idle = roster
+                .iter()
+                .all(|(_, _, task, _)| matches!(task, CrewTask::Idle(_)));
+            if !fired.contains(&"go") && t >= 4.0 && all_idle {
+                fired.push("go");
+                *go_sim = clock.now();
+                let _ = actions.write(Action::MarkAll);
+                if let Some(e) = ava {
+                    let _ = actions.write(Action::SetPriority {
+                        crew: e,
+                        work: WorkKind::Haul,
+                        level: Priority::High,
+                    });
+                }
+                println!(
+                    "S7_B_GO t={t:.1} all_idle=true — marked work + Ava Haul=High (idle backoff would be up to {sim:.0} sim s)",
+                    sim = 1.0 * crate::simtime::BASE_SIM_RATE,
+                );
+            }
+            if fired.contains(&"go") && *go_sim >= 0.0 && !fired.contains(&"wake") {
+                if let Some((_, n, task, _)) = roster.first() {
+                    if !matches!(task, CrewTask::Idle(_)) {
+                        fired.push("wake");
+                        println!(
+                            "S7_B_WAKE crew={n} claimed {} after {:.1} sim s (no backoff wait)",
+                            s7_task_label(task),
+                            clock.now() - *go_sim
+                        );
+                    }
+                }
+            }
+            if !fired.contains(&"done") && t >= 30.0 {
+                fired.push("done");
+                println!(
+                    "S7_B_DONE t={t:.1} tasks={:?} reserved={}",
+                    task_list(&roster),
+                    reserved.iter().count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // C - High beats Normal over distance: Ava walks past a nearby marked
+        // item to reach a far deconstruction because Build=High > Haul=Normal.
+        "C" => {
+            if !fired.contains(&"prio") && t >= 0.2 {
+                fired.push("prio");
+                if let Some(e) = ava {
+                    let _ = actions.write(Action::SetPriority {
+                        crew: e,
+                        work: WorkKind::Build,
+                        level: Priority::High,
+                    });
+                    let _ = actions.write(Action::SetPriority {
+                        crew: e,
+                        work: WorkKind::Operate,
+                        level: Priority::Disabled,
+                    });
+                }
+                // Everyone else keeps their hands off hauls so the nearby
+                // marked item stays free for Ava to refuse.
+                for (e, _, _, _) in roster.iter().skip(1) {
+                    let _ = actions.write(Action::SetPriority {
+                        crew: *e,
+                        work: WorkKind::Haul,
+                        level: Priority::Disabled,
+                    });
+                }
+            }
+            if !fired.contains(&"work") && t >= 0.4 {
+                fired.push("work");
+                let _ = actions.write(Action::MarkAll);
+                // Farthest building from Ava (walls are map tiles, not
+                // Building entities — racks/doors/reactors are).
+                let home = roster
+                    .first()
+                    .map(|(_, _, _, p)| *p)
+                    .unwrap_or(TilePos::new(17, 2));
+                let far = buildings
+                    .iter()
+                    .max_by_key(|(_, p, _)| crate::path::octile_distance(home, **p) as i32)
+                    .map(|(e, p, b)| (e, *p, b.kind));
+                if let Some((e, p, kind)) = far {
+                    println!(
+                        "S7_C_MARK far_{}=({},{}) dist={}",
+                        kind.label(),
+                        p.x,
+                        p.y,
+                        crate::path::octile_distance(home, p)
+                    );
+                    let _ = actions.write(Action::MarkDeconstruct { building: e });
+                }
+            }
+            if !fired.contains(&"snap") && t >= 1.5 {
+                fired.push("snap");
+                if let Some((_, n, task, _)) = roster.first() {
+                    println!(
+                        "S7_C_TASK crew={n} task={} (expected deconstruct: High Build beats Normal Haul)",
+                        s7_task_label(task)
+                    );
+                }
+            }
+            if !fired.contains(&"done") && t >= 3.0 {
+                fired.push("done");
+                println!("S7_C_DONE t={t:.1} tasks={:?}", task_list(&roster));
+                exit.write(AppExit::Success);
+            }
+        }
+        // D - mid-job disable: Ava finishes her in-flight haul after Haul is
+        // disabled, then never claims another.
+        "D" => {
+            if !fired.contains(&"mark") && t >= 0.3 {
+                fired.push("mark");
+                let _ = actions.write(Action::MarkAll);
+            }
+            let ava_hauling = roster
+                .first()
+                .is_some_and(|(_, _, task, _)| matches!(task, CrewTask::Haul(_)));
+            if !fired.contains(&"off") && t >= 1.5 && ava_hauling {
+                fired.push("off");
+                let delivered = ava
+                    .and_then(|e| crews.get(e).ok())
+                    .map(|(_, c, _, _)| c.delivered)
+                    .unwrap_or(0);
+                *go_sim = delivered as f64;
+                let _ = actions.write(Action::SetPriority {
+                    crew: ava.unwrap(),
+                    work: WorkKind::Haul,
+                    level: Priority::Disabled,
+                });
+                println!(
+                    "S7_D_OFF t={t:.1} Ava mid-haul, delivered={delivered} -> Haul disabled (job must finish)"
+                );
+            }
+            if fired.contains(&"off") && !fired.contains(&"done") && t >= 12.0 {
+                fired.push("done");
+                let (delivered, task, cause) = ava
+                    .and_then(|e| crews.get(e).ok())
+                    .map(|(_, c, t2, _)| {
+                        let cause = if let CrewTask::Idle(c) = t2 {
+                            c.label()
+                        } else {
+                            s7_task_label(t2).to_string()
+                        };
+                        (c.delivered, s7_task_label(t2), cause)
+                    })
+                    .unwrap_or((0, "gone", "gone".into()));
+                println!(
+                    "S7_D_DONE t={t:.1} Ava delivered {}->{delivered} (in-flight haul finished), now task={task} cause={cause}",
+                    *go_sim as u32
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // E - all work disabled: every crew reports AllWorkDisabled and
+        // nothing is ever claimed.
+        "E" => {
+            if !fired.contains(&"off") && t >= 0.3 {
+                fired.push("off");
+                for (e, _, _, _) in roster.iter() {
+                    for wk in WorkKind::ALL {
+                        let _ = actions.write(Action::SetPriority {
+                            crew: *e,
+                            work: wk,
+                            level: Priority::Disabled,
+                        });
+                    }
+                }
+                let _ = actions.write(Action::MarkAll);
+            }
+            if !fired.contains(&"done") && t >= 3.0 {
+                fired.push("done");
+                let causes: Vec<String> = roster
+                    .iter()
+                    .map(|(_, n, task, _)| {
+                        let cause = if let CrewTask::Idle(c) = task {
+                            c.label()
+                        } else {
+                            s7_task_label(task).to_string()
+                        };
+                        format!("{}: {}", n, cause)
+                    })
+                    .collect();
+                println!(
+                    "S7_E_DONE t={t:.1} causes={causes:?} reserved={} marked_left={}",
+                    reserved.iter().count(),
+                    items.iter().count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // F - frozen while paused (run with SLICE0_SPEED=0): priority
+        // actions apply but no claims happen until the driver resumes.
+        "F" => {
+            if *frame == 5 {
+                println!(
+                    "S7_F_PAUSE0 speed_index={} t={t:.3} — applying priorities while paused",
+                    speed.index
+                );
+                let _ = actions.write(Action::SetPriority {
+                    crew: ava.unwrap(),
+                    work: WorkKind::Haul,
+                    level: Priority::High,
+                });
+                let _ = actions.write(Action::MarkAll);
+            }
+            if *frame == 40 {
+                let prio = ava
+                    .and_then(|e| crews.get(e).ok())
+                    .map(|(_, c, _, _)| c.priorities.get(WorkKind::Haul).label().to_string())
+                    .unwrap_or_default();
+                println!(
+                    "S7_F_FROZEN prio_applied={prio} tasks={:?} (no claims while paused)",
+                    task_list(&roster)
+                );
+                speed.index = 1;
+            }
+            if *frame > 40 && t >= 1.0 && !fired.contains(&"done") {
+                fired.push("done");
+                println!(
+                    "S7_F_RESUMED t={t:.1} tasks={:?} reserved={}",
+                    task_list(&roster),
+                    reserved.iter().count()
                 );
                 exit.write(AppExit::Success);
             }

@@ -1,6 +1,10 @@
-# Ship Alive — Playable Slice 6 / Ventilation & Gas Handling
+# Ship Alive — Playable Slice 7 / Work Priorities & the WORK Tab
 
-> **Slice 6 新增：玩家可以主动、空间化、守恒地搬运、储存和控制气体——
+> **Slice 7 新增：环世界式工作优先级列表——WORK 面板（[Tab] 打开），
+> 三类工作 × 每名船员的 H/N/L/— 优先级矩阵，点击循环改档，
+> 空闲船员即时响应，运行中的任务绝不打断。**
+
+> **Slice 6：玩家可以主动、空间化、守恒地搬运、储存和控制气体——
 > 风管层 + 通风口 + 鼓风机 + 储气罐。**
 
 > **Slice 5：空气成为真实、逐格、守恒、可以流动和流失的资源。**
@@ -76,17 +80,31 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
   方向/阀门按钮）；BUILD→Atmosphere 分类；开局预装 FABRICATION↔CREW
   QUARTERS 起步管网（19 格风管 + 2 通风口 + 1 鼓风机 + 1 预充储气罐，
   鼓风机待机不打扰开局环境）
+- **Slice 7 — 工作优先级列表（WORK Tab）**：`Tab`（或顶栏 Work [Tab] 按钮）
+  打开环世界式优先级矩阵——行 = 工作类型（Haul 搬运 / Build 建造与拆除 /
+  Operate 操作制造机），列 = 船员；每格显示当前档位（H 绿 / N 白 / L 灰 /
+  — 红关），点击循环 Off→Low→Normal→High→Off；Current 行实时显示每名
+  船员正在做什么（含空闲原因），Done 行显示终身 h/b/o 计数；点击列头名字
+  选中该船员；Defaults 一键重置全员（并唤醒空闲扫描）；**改优先级立即
+  唤醒空闲船员**（不等 nothing-to-do 退避），但**绝不打断进行中的任务**
+  （优先级只决定"下一个"任务）；优先级档位压倒距离（High 远任务胜过
+  Normal 近任务，档内才比距离）；Esc 先关面板；选中船员面板的 12 个
+  优先级按钮移除，统一入口 WORK 面板
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 187 个单元/集成测试
+cargo test                     # 193 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
 SLICE4_SCENARIO=A cargo run    # Slice 4 气密验收场景（A–F、H–L、N–P）
 SLICE5_SCENARIO=A cargo run    # Slice 5 大气验收场景（A–I、O/P/Q）
 SLICE6_SCENARIO=A cargo run    # Slice 6 通风验收场景（A B C D E F G H I L M N P Q R S T U）
+SLICE7_SCENARIO=A cargo run    # Slice 7 优先级验收场景（A 专职分工 / B 即时唤醒 /
+                               # C 高档压倒距离 / D 任务中禁用不打断 / E 全员停工 /
+                               # F 暂停冻结+恢复，配 SLICE0_SPEED=0）
 SLICE6_VIEW=ventilation cargo run  # 直接以 Ventilation 覆盖层启动
+SLICE7_VIEW=work cargo run     # 直接以 WORK 面板打开启动（截图/检查用）
 SLICE5_TOOLS=1 cargo run       # 开发者大气工具：悬停 + F5 破口 / F6 降压 / F7 恢复标准 / F8 注 CO2 / F9 注污染物
 SLICE4_DOORPIN=6,6:0.5 cargo run  # 门美术检查：钉住 (x,y) 门的开启进度/模式（[:Auto|HoldOpen|LockClosed]）
 SLICE4_DEBUG_DOOR=11,10 cargo run # 门美术检查：绕过建造规则在该格生成一扇门（可放进竖墙验证 Ew 朝向）
@@ -130,6 +148,8 @@ src/
   input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
   render.rs      建筑/蓝图/机器状态可视化 + 放置 ghost + 房间标注
   ui.rs          HUD（环世界式四角浮动面板）：左上状态+事件流、右上船钟+速度+警报、左下 BUILD 分类栏、中下船员条、右下检视面板
+  worktab.rs     Slice 7：WORK 面板（优先级矩阵池、档位循环按钮、Current
+                 活动行、点击列头选人、Defaults 重置、[Tab]/Esc/顶栏开关）
   ui_overlay.rs  悬停 tooltip + 框选矩形
   autotest.rs    SLICE0_SCENARIO=A..L + P1/P2/M 自动验收与试玩驱动器（开发工具）
   stats.rs       开发遥测（产量/搬运距离等，用于布局 A/B 对比）
@@ -140,7 +160,9 @@ tests/
   airtight.rs    Slice 4 气密测试（舱室/暴露/门户/连通/门模式/防夹/等门/
                  禁穿锁门/热隔离与守恒/缓存/128×128 性能）
   haul_logic.rs  Slice 0B 无头集成测试（领取互斥/框选/满仓/…）
-  ship_ops.rs    Slice 1 无头集成测试（建造/拆除/生产/过滤/优先级）
+  ship_ops.rs    Slice 1 无头集成测试（建造/拆除/生产/过滤/优先级）+
+                 Slice 7 优先级语义测试（循环次序/即时唤醒/任务中禁用不打断/
+                 全禁用原因/高档压距离/Defaults 重置唤醒）
   power_ops.rs   Slice 2 电力测试（拓扑/分割/并网/过载/断电生产）
   fleet_ops.rs   多制造机建造+材料守恒+封死房间不泵料
   thermal.rs     热能集成测试：守恒/启动稳定/满载危机+恢复/滞迟/暂停不变性/
@@ -160,9 +182,9 @@ art_raw/         Codex image generation 原图（洋红底）
 → `assets/art/`（透明背景 256×256）。游戏启动时若文件存在则加载，
 否则用程序化色块，保证仓库在任何状态下都能跑。
 
-状态：**Slice 6（Ventilation & Gas Handling）完成，等待试玩反馈。**
+状态：**Slice 7（Work Priorities & the WORK Tab）完成，等待试玩反馈。**
 交付报告：`REPORT.md` / `REPORT_0B.md` / `REPORT_1.md` / `REPORT_2.md` /
 `REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md` /
-`REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md`；
+`REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md` / `REPORT_PRIORITIES.md`；
 性能优化轮：`REPORT_PERF.md`；
 试玩指南：`PLAYTEST.md`；代理经验：`AGENTS.md`。

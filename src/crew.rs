@@ -59,6 +59,15 @@ impl WorkKind {
             WorkKind::Operate => "Operate",
         }
     }
+
+    /// One-line description shown next to the WORK tab row.
+    pub fn desc(&self) -> &'static str {
+        match self {
+            WorkKind::Haul => "carry items to racks / supply sites & machines",
+            WorkKind::Build => "construct blueprints & deconstruct marked buildings",
+            WorkKind::Operate => "run fabricator cycles",
+        }
+    }
 }
 
 /// Player-set priority for one work type.
@@ -95,6 +104,48 @@ impl Priority {
             Priority::Low => 200,
             Priority::Normal => 500,
             Priority::High => 1000,
+        }
+    }
+
+    /// Next tier when the player clicks a WORK tab cell (RimWorld-style
+    /// cycling). The panel shows the CURRENT tier; one click advances to
+    /// `cycle(current)`.
+    pub fn cycle(self) -> Self {
+        match self {
+            Priority::Disabled => Priority::Low,
+            Priority::Low => Priority::Normal,
+            Priority::Normal => Priority::High,
+            Priority::High => Priority::Disabled,
+        }
+    }
+
+    /// Compact WORK tab cell code (with the color from [`Self::color`]).
+    pub fn code(self) -> &'static str {
+        match self {
+            Priority::Disabled => "—",
+            Priority::Low => "L",
+            Priority::Normal => "N",
+            Priority::High => "H",
+        }
+    }
+
+    /// WORK tab cell text color; the cell background is derived from it.
+    pub fn color(self) -> Color {
+        match self {
+            Priority::Disabled => Color::srgb(0.85, 0.45, 0.4),
+            Priority::Low => Color::srgb(0.58, 0.63, 0.7),
+            Priority::Normal => Color::WHITE,
+            Priority::High => Color::srgb(0.45, 1.0, 0.55),
+        }
+    }
+
+    /// Dark cell background for the WORK tab (a dimmed tint of the tier).
+    pub fn bg(self) -> Color {
+        match self {
+            Priority::Disabled => Color::srgb(0.26, 0.12, 0.11),
+            Priority::Low => Color::srgb(0.15, 0.17, 0.2),
+            Priority::Normal => Color::srgb(0.16, 0.21, 0.24),
+            Priority::High => Color::srgb(0.09, 0.26, 0.13),
         }
     }
 }

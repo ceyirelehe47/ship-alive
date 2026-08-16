@@ -344,6 +344,7 @@ fn hover_system(
 fn action_keys_system(
     keys: Res<ButtonInput<KeyCode>>,
     debug: Option<Res<crate::ui::DebugBarVisible>>,
+    worktab: Option<Res<crate::worktab::WorkTabVisible>>,
     mut selection: ResMut<Selection>,
     build_mode: Res<BuildMode>,
     mut actions: EventWriter<Action>,
@@ -353,6 +354,9 @@ fn action_keys_system(
     }
     if keys.just_pressed(KeyCode::KeyP) {
         actions.write(Action::CycleOverlay);
+    }
+    if keys.just_pressed(KeyCode::Tab) {
+        actions.write(Action::ToggleWorkTab);
     }
     if keys.just_pressed(KeyCode::KeyC) {
         actions.write(Action::CancelAll);
@@ -399,7 +403,10 @@ fn action_keys_system(
         }
     }
     if keys.just_pressed(KeyCode::Escape) {
-        if build_mode.0.is_some() {
+        if worktab.is_some_and(|w| w.0) {
+            // The WORK tab closes first; a second Esc clears tools/selection.
+            actions.write(Action::ToggleWorkTab);
+        } else if build_mode.0.is_some() {
             actions.write(Action::SetTool { tool: None });
         } else {
             selection.0 = None;

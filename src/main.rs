@@ -64,19 +64,25 @@ fn perf_report(
     clock: Res<ship_alive::simtime::SimClock>,
     mut speed: ResMut<time_ctrl::GameSpeed>,
     // Nested tuple = one system param (the flat list would exceed the limit).
-    (mut frames, mut ms_sum, mut steps_sum, mut last_now, mut last_wall): (
+    (mut frames, mut ms_sum, mut steps_sum, mut last_now, mut last_wall, mut forced): (
         Local<u64>,
         Local<f64>,
         Local<u64>,
         Local<f64>,
         Local<f64>,
+        Local<bool>,
     ),
 ) {
-    if let Some(idx) = std::env::var("SLICE0_SPEED")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-    {
-        speed.index = idx;
+    // Force only once: re-forcing every frame would also stomp on mid-run
+    // speed changes (the pause/resume acceptance scenario).
+    if !*forced {
+        *forced = true;
+        if let Some(idx) = std::env::var("SLICE0_SPEED")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            speed.index = idx;
+        }
     }
     if std::env::var("SLICE0_PERF").is_err() {
         return;

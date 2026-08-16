@@ -16,7 +16,7 @@
 
 use crate::building::{Building, BuildingKind, MarkedForDeconstruct};
 use crate::coolant::{CoolantState, WaterGrid};
-use crate::crew::{Crew, CrewTask, HaulPhase, Priority, WorkKind};
+use crate::crew::{Crew, CrewTask, HaulPhase};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::jobs::Action;
@@ -30,10 +30,10 @@ use crate::OverlayMode;
 use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 
-const PANEL_BG: Color = Color::srgba(0.06, 0.08, 0.11, 0.88);
-const BUTTON_BG: Color = Color::srgba(0.22, 0.27, 0.34, 1.0);
-const BUTTON_ACTIVE: Color = Color::srgba(0.95, 0.72, 0.20, 1.0);
-const BUTTON_HOVER: Color = Color::srgba(0.34, 0.40, 0.48, 1.0);
+pub(crate) const PANEL_BG: Color = Color::srgba(0.06, 0.08, 0.11, 0.88);
+pub(crate) const BUTTON_BG: Color = Color::srgba(0.22, 0.27, 0.34, 1.0);
+pub(crate) const BUTTON_ACTIVE: Color = Color::srgba(0.95, 0.72, 0.20, 1.0);
+pub(crate) const BUTTON_HOVER: Color = Color::srgba(0.34, 0.40, 0.48, 1.0);
 
 /// Component linking a button to the action it fires when pressed.
 #[derive(Component)]
@@ -190,13 +190,18 @@ const UI_REFRESH_SECS: f32 = 0.2;
 
 /// Assign UI text only when it actually changed — avoids re-triggering
 /// Bevy's text layout for mostly-static lines.
-fn set_text_if_changed(text: &mut Text, want: String) {
+pub(crate) fn set_text_if_changed(text: &mut Text, want: String) {
     if text.0 != want {
         text.0 = want;
     }
 }
 
-fn label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
+pub(crate) fn label(
+    parent: &mut ChildSpawnerCommands,
+    text: &str,
+    size: f32,
+    color: Color,
+) -> Entity {
     parent
         .spawn((
             Text::new(text),
@@ -254,7 +259,15 @@ impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<DebugBarVisible>();
         app.init_resource::<BuildMenu>();
-        app.add_systems(Startup, (build_hud, crate::ui_overlay::build_overlay));
+        app.init_resource::<crate::worktab::WorkTabVisible>();
+        app.add_systems(
+            Startup,
+            (
+                build_hud,
+                crate::worktab::build_work_tab,
+                crate::ui_overlay::build_overlay,
+            ),
+        );
         app.add_systems(
             Update,
             (
@@ -265,7 +278,13 @@ impl Plugin for UiPlugin {
                 overlay_cycle_system,
                 overlay_summary_system,
                 debug_toggle_system,
-                (hud_update_system, selection_panel_system).chain(),
+                crate::worktab::work_tab_toggle_system,
+                (
+                    hud_update_system,
+                    selection_panel_system,
+                    crate::worktab::work_tab_system,
+                )
+                    .chain(),
                 (
                     crate::ui_overlay::tooltip_system,
                     crate::ui_overlay::atmosphere_tooltip_system,
@@ -401,7 +420,7 @@ fn build_hud(mut commands: Commands) {
 
                     label(
                         panel,
-                        "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark | B: build tools | Space/1/2/3: speed",
+                        "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark | B: build tools | Tab: work | Space/1/2/3: speed",
                         11.0,
                         Color::srgb(0.6, 0.66, 0.72),
                     );
@@ -449,6 +468,24 @@ fn build_hud(mut commands: Commands) {
                         ))
                         .with_children(|b| {
                             power_button_label = label(b, "View [P]", 13.0, Color::WHITE);
+                        });
+                        row.spawn((
+                            Button,
+                            Interaction::default(),
+                            OnPress(Action::ToggleWorkTab),
+                            crate::worktab::WorkTabButton::Toggle,
+                            Node {
+                                width: Val::Px(88.0),
+                                height: Val::Px(26.0),
+                                margin: UiRect::all(Val::Px(2.0)),
+                                align_items: AlignItems::Center,
+                                justify_content: JustifyContent::Center,
+                                ..default()
+                            },
+                            BackgroundColor(BUTTON_BG),
+                        ))
+                        .with_children(|b| {
+                            label(b, "Work [Tab]", 13.0, Color::WHITE);
                         });
                         row.spawn((
                             Button,
@@ -1614,7 +1651,6 @@ enum SelSig {
     None,
     Crew {
         e: Entity,
-        prio: [u8; 3],
     },
     Item {
         e: Entity,
@@ -1671,18 +1707,6 @@ enum SelSig {
         valve: bool,
         demo: bool,
     },
-}
-
-fn prio_code(p: &crate::crew::WorkPriorities) -> [u8; 3] {
-    let enc = |p: Priority| -> u8 {
-        match p {
-            Priority::Disabled => 0,
-            Priority::Low => 1,
-            Priority::Normal => 2,
-            Priority::High => 3,
-        }
-    };
-    [enc(p.haul), enc(p.build), enc(p.operate)]
 }
 
 #[allow(clippy::type_complexity)]
@@ -1763,10 +1787,7 @@ fn selection_panel_system(
     let sig = match selection.0 {
         None => SelSig::None,
         Some(Selected::Crew(e)) => match crews.get(e) {
-            Ok((_, c, _, _, _)) => SelSig::Crew {
-                e,
-                prio: prio_code(&c.priorities),
-            },
+            Ok(_) => SelSig::Crew { e },
             Err(_) => SelSig::None,
         },
         Some(Selected::Item(e)) => match items.get(e) {
@@ -1946,7 +1967,8 @@ fn selection_panel_system(
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
                 lines.push((
-                    "Work priorities (below) decide which jobs this crew takes first.".to_string(),
+                    "Work priorities live in the WORK tab [Tab] — click cells to steer this crew."
+                        .to_string(),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
             }
@@ -2493,26 +2515,8 @@ fn selection_panel_system(
         *last_sig = sig.clone();
         let cfgs: Vec<BtnCfg> = match &sig {
             SelSig::None => Vec::new(),
-            SelSig::Crew { e, .. } => {
-                let mut v = Vec::new();
-                if let Ok((_, crew, _, _, _)) = crews.get(*e) {
-                    for wk in WorkKind::ALL {
-                        for p in Priority::ALL {
-                            v.push(
-                                BtnCfg::new(
-                                    format!("{}:{}", wk.label(), p.label()),
-                                    Action::SetPriority {
-                                        crew: *e,
-                                        work: wk,
-                                        level: p,
-                                    },
-                                )
-                                .active(crew.priorities.get(wk) == p),
-                            );
-                        }
-                    }
-                }
-                v
+            SelSig::Crew { .. } => {
+                vec![BtnCfg::new("Open WORK [Tab]", Action::ToggleWorkTab)]
             }
             SelSig::Item { e, marked } => vec![BtnCfg::new(
                 if *marked {

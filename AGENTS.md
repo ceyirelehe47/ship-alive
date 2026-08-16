@@ -54,13 +54,22 @@ API 签名、crate 版本行为、框架迁移差异、报错原文等随时会�
 9. **UI 遥测色不能在刷新趟里被换掉**：覆盖层实体池的 spawn 颜色会被
    周期刷新趟覆盖——改颜色要改刷新趟那一处（Slice 6 流向箭头一度
    被 10 Hz 刷新写成近白色，截图里"看不见箭头"才暴露）。
+10. **`SLICE0_SPEED` 曾经每帧强制覆盖 `GameSpeed`**（`perf_report`）：
+    任何验收 driver 想在运行中变速/恢复都会被它压回，进程表现为
+    "永不退出的挂死"。现已改为只在首帧强制；写需要中途变速的场景时
+    记得这个历史。
+11. **墙不是 Building 实体**：船体 `#` 是地图 Tile，`MarkDeconstruct`
+    只对实体建筑（架/门/反应堆/水箱…）有效。验收场景想拆"墙"时
+    要选最远的 Building，别 filter `BuildingKind::Wall`（结果为空、
+    场景静默跑偏）。
 
 ## 工程约定
 
 - 质量门禁：`cargo fmt --check`、`cargo clippy --all-targets --all-features -- -D warnings`、
   `cargo test` 全绿才算完成；不许删测试或大面积 `#[allow]` 压警告。
 - 验收场景：`SLICE0_SCENARIO=A..L,P1,P2,M`（0/0B/1 代）、`SLICE2_SCENARIO=A..J`（电力代）、
-  `SLICE6_SCENARIO=A..U`（通风代，跳过与 S5 重叠的 J/K）。改动核心系统后全量回归。
+  `SLICE6_SCENARIO=A..U`（通风代，跳过与 S5 重叠的 J/K）、`SLICE7_SCENARIO=A..F`
+ （优先级代，F 配 `SLICE0_SPEED=0`）。改动核心系统后全量回归。
 - 报告文化：每个 Slice 一份 `REPORT*.md`，含 Design assumptions / Temporary
   behaviors / 发现的问题；临时决定不许悄悄升级成永久设计。
 - 美术管线：`art_raw/`（Codex 生图，洋红底）→ `cargo run --bin prep_art` →

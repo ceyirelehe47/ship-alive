@@ -34,6 +34,7 @@ pub mod time_ctrl;
 pub mod ui;
 pub mod ui_overlay;
 pub mod ventilation;
+pub mod worktab;
 
 /// World-space size of one map tile.
 pub const TILE: f32 = 32.0;

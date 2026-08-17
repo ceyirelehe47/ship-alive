@@ -13,7 +13,7 @@
 //! corridor) as walls when re-planning around congestion.
 
 use crate::map::{ShipMap, TilePos};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::BinaryHeap;
 
 /// Fixed-point step costs (×10 tile-distance). 14 ≈ 10·√2, slightly under
 /// the true value so the heuristic stays admissible.
@@ -145,6 +145,11 @@ fn step_enterable(
 
 /// Returns the path from `from` to `to` excluding `from` itself.
 /// Returns `None` if no route exists (or the goal is not enterable).
+///
+/// Search state lives in flat `u32` arrays indexed by tile index (the map is
+/// a dense grid) instead of hash maps — this is the inner loop of every job
+/// claim. Expansion order (heap, DIRS order, relax check) is unchanged, so
+/// the produced paths are identical to the previous HashMap version.
 pub fn find_path(
     map: &ShipMap,
     from: TilePos,
@@ -161,31 +166,38 @@ pub fn find_path(
         return None;
     }
     let heuristic = |p: TilePos| octile_cost(p, to);
+    let (w, n) = (map.width as u32, map.width as u32 * map.height as u32);
+    let idx = |p: TilePos| (p.y as u32 * w + p.x as u32) as usize;
     let mut open = BinaryHeap::new();
-    let mut best_cost: HashMap<TilePos, u32> = HashMap::new();
-    let mut came_from: HashMap<TilePos, TilePos> = HashMap::new();
+    let mut best_cost = vec![u32::MAX; n as usize];
+    let mut came_from = vec![u32::MAX; n as usize];
+    let from_i = idx(from);
 
     open.push(OpenNode {
         cost: 0,
         est_total: heuristic(from),
         pos: from,
     });
-    best_cost.insert(from, 0);
+    best_cost[from_i] = 0;
 
     while let Some(OpenNode { cost, pos, .. }) = open.pop() {
         if pos == to {
             let mut path = vec![to];
-            while let Some(&prev) = came_from.get(path.last().unwrap()) {
-                if prev == from {
+            let mut cur = idx(to) as u32;
+            loop {
+                let prev_i = came_from[cur as usize];
+                if prev_i == u32::MAX || prev_i == from_i as u32 {
                     break;
                 }
-                path.push(prev);
+                path.push(TilePos::new((prev_i % w) as i32, (prev_i / w) as i32));
+                cur = prev_i;
             }
             path.reverse();
             return Some(path);
         }
         // Stale queue entry (a better route to `pos` was already expanded).
-        if best_cost.get(&pos).is_some_and(|c| *c < cost) {
+        let pos_i = idx(pos);
+        if best_cost[pos_i] < cost {
             continue;
         }
         for (dx, dy) in DIRS {
@@ -194,9 +206,10 @@ pub fn find_path(
                 continue;
             }
             let next_cost = cost + step_cost(pos, next);
-            if next_cost < *best_cost.get(&next).unwrap_or(&u32::MAX) {
-                best_cost.insert(next, next_cost);
-                came_from.insert(next, pos);
+            let next_i = idx(next);
+            if next_cost < best_cost[next_i] {
+                best_cost[next_i] = next_cost;
+                came_from[next_i] = pos_i as u32;
                 open.push(OpenNode {
                     cost: next_cost,
                     est_total: next_cost + heuristic(next),
@@ -211,6 +224,7 @@ pub fn find_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn map(rows: &[&str]) -> ShipMap {
         ShipMap::from_layout(rows).0

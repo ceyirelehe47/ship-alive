@@ -932,7 +932,7 @@ fn fail_haul(
 
 /// Whether a crew standing on `pos` can interact with `foot`.
 fn at_interaction(map: &ShipMap, pos: TilePos, foot: &Footprint) -> bool {
-    building::interaction_tiles(map, foot).contains(&pos)
+    building::is_interaction_tile(map, pos, foot)
 }
 
 /// Abort a work job cleanly (releases the reservation).
@@ -1041,13 +1041,18 @@ pub fn crew_task_system(
         (Entity, &TilePos, &crate::ventilation::GasTank),
         (Without<Crew>, Without<Blueprint>),
     >,
+    // Reused per-step snapshots (completion effects read them; allocating
+    // fresh vectors every fixed step showed up in the churn profile).
+    mut crew_positions: Local<Vec<(Entity, TilePos)>>,
+    mut ground_now: Local<Vec<TilePos>>,
 ) {
     let dt = clock.dt() as f32;
     let now = clock.now();
     let l = strings(*lang);
-    let crew_positions: Vec<(Entity, TilePos)> =
-        crews.iter().map(|(e, _, _, p, _)| (e, *p)).collect();
-    let ground_now: Vec<TilePos> = items.iter().map(|(_, p, ..)| *p).collect();
+    crew_positions.clear();
+    crew_positions.extend(crews.iter().map(|(e, _, _, p, _)| (e, *p)));
+    ground_now.clear();
+    ground_now.extend(items.iter().map(|(_, p, ..)| *p));
 
     for (crew_e, mut crew, mut task, pos, mut mov) in crews.iter_mut() {
         // ---- haul ------------------------------------------------------------
@@ -1883,40 +1888,37 @@ enum Cand {
 /// Nearest usable source (ground item preferred, rack stock with +1 distance
 /// penalty so racks act as reserves) for one auto-logistics demand.
 #[allow(clippy::type_complexity)]
+/// Per-frame ground-item view shared by every idle crew in one scan pass:
+/// `(entity, pos, cooldown-until)` per kind, built once from the live query
+/// (unmarked / unreserved / uncarried — the auto-logistics sources) with
+/// entries removed as crews claim them within the frame.
+struct GroundIndex {
+    by_kind: [Vec<(Entity, TilePos, f64)>; 3],
+}
+
+impl GroundIndex {
+    fn remove(&mut self, item: Entity, kind: ItemKind) {
+        let bucket = &mut self.by_kind[kind.index()];
+        if let Some(i) = bucket.iter().position(|&(e, _, _)| e == item) {
+            bucket.swap_remove(i);
+        }
+    }
+}
+
 fn best_source_for(
     crew_pos: TilePos,
     kind: ItemKind,
-    items: &Query<
-        (
-            Entity,
-            &TilePos,
-            &Item,
-            Option<&ReservedBy>,
-            Option<&CarriedBy>,
-            Option<&NoPathUntil>,
-            Option<&MarkedForHaul>,
-        ),
-        With<Item>,
-    >,
+    ground: &GroundIndex,
     racks: &Query<(Entity, &TilePos, &mut StorageCell), Without<Crew>>,
-    local_claims: &HashSet<Entity>,
     now: f64,
     dest: HaulDest,
 ) -> Option<(f32, Cand)> {
     let mut best: Option<(f32, Cand)> = None;
-    for (e, p, it, reserved, carried, cooled, marked) in items.iter() {
-        if it.kind != kind
-            || marked.is_some() // player storage intent wins over auto demands
-            || reserved.is_some()
-            || carried.is_some()
-            || local_claims.contains(&e)
-        {
+    for &(e, p, cooled_until) in &ground.by_kind[kind.index()] {
+        if cooled_until > now {
             continue;
         }
-        if cooled.is_some_and(|c| c.0 > now) {
-            continue;
-        }
-        let d = crate::path::octile_distance(crew_pos, *p);
+        let d = crate::path::octile_distance(crew_pos, p);
         if best.as_ref().is_none_or(|(bd, _)| d < *bd) {
             best = Some((d, Cand::Ground { item: e, dest }));
         }
@@ -2013,6 +2015,63 @@ pub fn crew_scan_system(
     // Entities claimed this frame (commands are deferred; this set closes the gap).
     let mut local_claims: HashSet<Entity> = HashSet::new();
 
+    // ---- shared per-frame indexes (identical data for every idle crew;
+    // entries claimed this frame are removed at claim time). Built lazily:
+    // most steps nobody scans, and the build is O(entities). ----
+    let any_scanning = crews
+        .iter()
+        .any(|(_, c, t, _, _)| matches!(t, CrewTask::Idle(_)) && now >= c.next_scan);
+    let mut ground = GroundIndex {
+        by_kind: [Vec::new(), Vec::new(), Vec::new()],
+    };
+    let mut marked_free: Vec<(Entity, TilePos, ItemKind, f64)> = Vec::new();
+    let mut marked_exists = false;
+    // Any rack with space per kind (frame-static; replaces the per-item
+    // rack scans of the marked loop).
+    let mut rack_accepts = [false; 3];
+    let mut bp_needs: Vec<(Entity, ItemKind, u32)> = Vec::new();
+    let mut fab_needs: Vec<(Entity, u32)> = Vec::new();
+    if any_scanning {
+        for (_, _, cell) in racks.iter() {
+            for k in ItemKind::ALL {
+                if cell.can_take(k) {
+                    rack_accepts[k.index()] = true;
+                }
+            }
+        }
+        for (e, p, it, reserved, carried, cooled, marked) in items.iter() {
+            let cooled_until = cooled.map_or(f64::NEG_INFINITY, |c| c.0);
+            let free = reserved.is_none() && carried.is_none();
+            if free {
+                ground.by_kind[it.kind.index()].push((e, *p, cooled_until));
+            }
+            if marked.is_some() {
+                marked_exists = true;
+                if free {
+                    // Cooldown expiry rides along; the "still counts as
+                    // free" idle-cause semantics live at the read site.
+                    marked_free.push((e, *p, it.kind, cooled_until));
+                }
+            }
+        }
+        // Blueprint/fabricator material demands (frame-static: deliveries
+        // and buffer changes are deferred commands; the per-crew inbound
+        // check stays live).
+        for (e, _, bp, _) in blueprints.iter() {
+            for (kind, miss) in bp.missing_list() {
+                bp_needs.push((e, kind, miss));
+            }
+        }
+        // (entity, input_want(inbound=0)); `input_want` is linear in
+        // inbound, so the per-crew check is base.saturating_sub(already).
+        for (e, _, f, _, _) in fabs.iter() {
+            let base = f.input_want(0);
+            if base > 0 {
+                fab_needs.push((e, base));
+            }
+        }
+    }
+
     for (crew_e, mut crew, mut task, pos, mut mov) in crews.iter_mut() {
         if std::env::var("SLICE0_SCAN_DEBUG").is_ok() && !matches!(*task, CrewTask::Idle(_)) {
             if let CrewTask::Haul(j) = &*task {
@@ -2035,81 +2094,58 @@ pub fn crew_scan_system(
         let operate_prio = crew.priorities.get(WorkKind::Operate);
 
         let mut candidates: Vec<Candidate> = Vec::new();
-        let mut marked_exists = false;
         let mut marked_any_free = false;
         let mut storage_ok = false;
 
         // ---- haul candidates -------------------------------------------------
         if haul_prio != Priority::Disabled {
-            // (a) player-marked ground items → storage.
-            for (e, p, it, reserved, carried, cooled, marked) in items.iter() {
-                if marked.is_none() {
-                    continue;
-                }
-                marked_exists = true;
-                if reserved.is_some() || carried.is_some() || local_claims.contains(&e) {
-                    continue;
-                }
+            // (a) player-marked ground items → storage (shared per-frame
+            // list; claimed entries were removed by earlier crews).
+            for &(e, p, kind, cooled_until) in &marked_free {
                 // Free-but-cooled items still count as "free" for idle-cause
                 // reporting; they only fail the claim attempt itself.
                 marked_any_free = true;
-                if cooled.is_some_and(|c| c.0 > now) {
+                if cooled_until > now {
                     continue;
                 }
-                if racks.iter().any(|(_, _, s)| s.can_take(it.kind)) {
+                if rack_accepts[kind.index()] {
                     storage_ok = true;
+                    let d = crate::path::octile_distance(*pos, p);
+                    candidates.push(Candidate {
+                        prio: haul_prio,
+                        dist: d,
+                        cand: Cand::Ground {
+                            item: e,
+                            dest: HaulDest::Storage,
+                        },
+                    });
                 }
-                if !racks.iter().any(|(_, _, s)| s.can_take(it.kind)) {
+            }
+            // (b) blueprint material demands (shared per-frame list).
+            for &(e, kind, miss) in &bp_needs {
+                let already = inbound.get(&(e, kind.index())).copied().unwrap_or(0);
+                if already >= miss {
                     continue;
                 }
-                let d = crate::path::octile_distance(*pos, *p);
-                candidates.push(Candidate {
-                    prio: haul_prio,
-                    dist: d,
-                    cand: Cand::Ground {
-                        item: e,
-                        dest: HaulDest::Storage,
-                    },
-                });
-            }
-            // (b) blueprint material demands.
-            for (e, _, bp, _) in blueprints.iter() {
-                for (kind, miss) in bp.missing_list() {
-                    let already = inbound.get(&(e, kind.index())).copied().unwrap_or(0);
-                    if already >= miss {
-                        continue;
-                    }
-                    if let Some((d, cand)) = best_source_for(
-                        *pos,
-                        kind,
-                        &items,
-                        &racks,
-                        &local_claims,
-                        now,
-                        HaulDest::Blueprint(e),
-                    ) {
-                        candidates.push(Candidate {
-                            prio: haul_prio,
-                            dist: d,
-                            cand,
-                        });
-                    }
+                if let Some((d, cand)) =
+                    best_source_for(*pos, kind, &ground, &racks, now, HaulDest::Blueprint(e))
+                {
+                    candidates.push(Candidate {
+                        prio: haul_prio,
+                        dist: d,
+                        cand,
+                    });
                 }
             }
-            // (c) fabricator input demands.
-            for (e, _, f, _, _) in fabs.iter() {
+            // (c) fabricator input demands (shared per-frame list).
+            for &(e, base_want) in &fab_needs {
                 let in_kind = crate::production::RECIPE.in_kind;
-                let want = f.input_want(inbound.get(&(e, in_kind.index())).copied().unwrap_or(0));
+                let already = inbound.get(&(e, in_kind.index())).copied().unwrap_or(0);
+                let want = base_want.saturating_sub(already);
                 if want > 0 {
-                    if let Some((d, cand)) = best_source_for(
-                        *pos,
-                        in_kind,
-                        &items,
-                        &racks,
-                        &local_claims,
-                        now,
-                        HaulDest::Machine(e),
-                    ) {
+                    if let Some((d, cand)) =
+                        best_source_for(*pos, in_kind, &ground, &racks, now, HaulDest::Machine(e))
+                    {
                         candidates.push(Candidate {
                             prio: haul_prio,
                             dist: d,
@@ -2238,6 +2274,13 @@ pub fn crew_scan_system(
                         Some(path) => {
                             commands.entity(item).insert(ReservedBy(crew_e));
                             local_claims.insert(item);
+                            // Drop the claim from the shared per-frame lists
+                            // so later crews this frame skip it (the old code
+                            // re-checked local_claims in the per-crew loops).
+                            ground.remove(item, it.kind);
+                            if let Some(i) = marked_free.iter().position(|&(e, ..)| e == item) {
+                                marked_free.swap_remove(i);
+                            }
                             stats.haul_distance += crate::path::path_length(Some(*pos), &path);
                             set_haul_task(&mut task, &mut mov, item, dest, path, crew_e);
                             let name = crew.name.clone();

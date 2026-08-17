@@ -107,7 +107,7 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 202 个单元/集成测试
+cargo test                     # 205 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
@@ -194,7 +194,9 @@ tests/
   ventilation.rs Slice 6 通风测试（有限容积/局部性/模式语义/鼓风机压头与上限/
                  罐混合与阀门/拆除守恒/破口抽管网/拓扑缓存/独立网络/暂停与
                  倍速等价/睡眠/128×128 稳定与活跃性能）
-  localization.rs Slice 8 本地化测试（settings.ini 往返/损坏回退/文件格式/
+  localization.rs Slice 8 本地化测试
+  perf_jobs.rs    性能第二轮基准（A* 进程内 A/B 对照、满载工作扫描、
+                 128×128 全链搬运 churn；release 跑 --nocapture 看数字）（settings.ini 往返/损坏回退/文件格式/
                  系统 CJK 字体解析（无则跳过）/关键表项双语覆盖锚点）
 tools/           截图脚本（开发用）
 assets/art/      运行时加载的 PNG（缺失时自动退化为色块占位）
@@ -212,5 +214,5 @@ art_raw/         Codex image generation 原图（洋红底）
 `REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md` /
 `REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md` / `REPORT_PRIORITIES.md` /
 `REPORT_LOCALIZATION.md`；
-性能优化轮：`REPORT_PERF.md`；
+性能优化轮：`REPORT_PERF.md` / `REPORT_PERF2.md`；
 试玩指南：`PLAYTEST.md`；代理经验：`AGENTS.md`。

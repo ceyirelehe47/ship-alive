@@ -139,8 +139,10 @@ impl FromWorld for UiFont {
 }
 
 /// Apply the CJK font to every text as it appears (CJK fonts include Latin
-/// glyphs, so both languages render from one font).
-fn font_apply_system(ui_font: Res<UiFont>, mut q: Query<&mut TextFont>) {
+/// glyphs, so both languages render from one font). Change-driven: new
+/// texts appear via `Changed`, and our own font write marks one extra pass
+/// that then finds nothing to do and settles.
+fn font_apply_system(ui_font: Res<UiFont>, mut q: Query<&mut TextFont, Changed<TextFont>>) {
     let Some(handle) = &ui_font.0 else {
         return;
     };
@@ -153,8 +155,18 @@ fn font_apply_system(ui_font: Res<UiFont>, mut q: Query<&mut TextFont>) {
 
 // ---- static labels ----------------------------------------------------------
 
-/// Keep every `StaticLabel` in sync with the active language.
-fn static_label_system(lang: Res<Lang>, mut q: Query<(&StaticLabel, &mut Text)>) {
+/// Keep every `StaticLabel` in sync with the active language. Runs on the
+/// first frame (initial fill) and whenever the language changes; static
+/// labels never spawn after startup.
+fn static_label_system(
+    lang: Res<Lang>,
+    mut q: Query<(&StaticLabel, &mut Text)>,
+    mut inited: Local<bool>,
+) {
+    if *inited && !lang.is_changed() {
+        return;
+    }
+    *inited = true;
     let l = strings(*lang);
     for (sel, mut text) in q.iter_mut() {
         let want = (sel.0)(l);

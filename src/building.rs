@@ -584,6 +584,24 @@ fn foot_overlap(a: &Footprint, b: &Footprint) -> bool {
 /// Tiles a crew member can stand on to interact with a footprint: any
 /// walkable footprint tile (blueprints are walkable) plus the 4-adjacent
 /// perimeter.
+/// Allocation-free `interaction_tiles(map, foot).contains(pos)` — the task
+/// system asks this every step for every active job.
+pub fn is_interaction_tile(map: &ShipMap, pos: TilePos, foot: &Footprint) -> bool {
+    if !map.is_walkable(pos) {
+        return false;
+    }
+    let inside =
+        pos.x >= foot.x && pos.x < foot.x + foot.w && pos.y >= foot.y && pos.y < foot.y + foot.h;
+    if inside {
+        return true;
+    }
+    // Otherwise pos must stand 4-adjacent to some footprint tile.
+    [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dy)| {
+        let t = TilePos::new(pos.x + dx, pos.y + dy);
+        t.x >= foot.x && t.x < foot.x + foot.w && t.y >= foot.y && t.y < foot.y + foot.h
+    })
+}
+
 pub fn interaction_tiles(map: &ShipMap, foot: &Footprint) -> Vec<TilePos> {
     let mut out: Vec<TilePos> = foot.tiles().filter(|&t| map.is_walkable(t)).collect();
     for t in foot.tiles() {

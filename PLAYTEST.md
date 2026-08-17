@@ -366,4 +366,4 @@ SLICE2_SCENARIO=PW cargo run   # 电力试玩：开视图→剪线→复电全�
 - `SLICE8_SCENARIO=A cargo run`：Slice 8 语言验收场景（A 启动状态+字体+文件 /
   B 切中文并落盘 / C 切回英文 / D 文件与活语言一致）；配 `SLICE8_LANG=zh|en`
   强制语言、`SLICE8_VIEW=settings` 直接开设置面板。
-- `cargo test`：202 个单元/集成测试。
+- `cargo test`：205 个单元/集成测试。

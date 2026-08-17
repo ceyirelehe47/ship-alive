@@ -115,7 +115,7 @@
 
 ## Git
 
-- 代码与文档提交：见仓库 main 分支最新提交（SHA 在下方回填）。
+- 代码与文档提交：**`be03bad`**（main，直接提交，未 force-push）。
 - 门禁：`cargo fmt` ✅、`cargo clippy --all-targets --all-features -- -D warnings` ✅、
   `cargo test` **202/202** ✅；全量回归批（S0-A/K、S2-A、S3-A、S4-A、
   S5-A、S6-A、S7-A/F）复跑通过。

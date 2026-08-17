@@ -20,9 +20,11 @@ use crate::crew::{Crew, CrewTask, HaulPhase};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::jobs::Action;
+use crate::loc::{self, strings, Lang, Strings};
 use crate::log::{EventLog, LogKind};
 use crate::map::TilePos;
 use crate::power::{PowerRole, PowerState, PowerStatus};
+use crate::settings::StaticLabel;
 use crate::storage::StorageCell;
 use crate::thermal::ThermalGrid;
 use crate::time_ctrl::GameSpeed;
@@ -60,6 +62,10 @@ pub enum BuildCatKind {
 }
 
 impl BuildCatKind {
+    pub fn label_loc(self, l: &Strings) -> &'static str {
+        cat_str(self, l)
+    }
+
     pub const ALL: [BuildCatKind; 6] = [
         BuildCatKind::Structure,
         BuildCatKind::Storage,
@@ -196,6 +202,65 @@ pub(crate) fn set_text_if_changed(text: &mut Text, want: String) {
     }
 }
 
+/// Static, language-bound label: spawns with the current language and is
+/// rewritten by the settings module when the language switches.
+pub(crate) fn klabel(
+    parent: &mut ChildSpawnerCommands,
+    lang: Lang,
+    sel: impl Fn(&Strings) -> &'static str + Send + Sync + 'static,
+    size: f32,
+    color: Color,
+) -> Entity {
+    parent
+        .spawn((
+            Text::new(sel(strings(lang))),
+            TextFont {
+                font_size: size,
+                ..default()
+            },
+            TextColor(color),
+            StaticLabel::new(sel),
+        ))
+        .id()
+}
+
+/// Button whose caption is a language-bound static label.
+pub(crate) fn kbutton(
+    parent: &mut ChildSpawnerCommands,
+    lang: Lang,
+    sel: impl Fn(&Strings) -> &'static str + Send + Sync + 'static,
+    action: Action,
+    width: f32,
+) -> Entity {
+    parent
+        .spawn((
+            Button,
+            Interaction::default(),
+            OnPress(action),
+            Node {
+                width: Val::Px(width),
+                height: Val::Px(26.0),
+                margin: UiRect::all(Val::Px(2.0)),
+                align_items: AlignItems::Center,
+                justify_content: JustifyContent::Center,
+                ..default()
+            },
+            BackgroundColor(BUTTON_BG),
+        ))
+        .with_children(|b| {
+            b.spawn((
+                Text::new(sel(strings(lang))),
+                TextFont {
+                    font_size: 13.0,
+                    ..default()
+                },
+                TextColor(Color::WHITE),
+                StaticLabel::new(sel),
+            ));
+        })
+        .id()
+}
+
 pub(crate) fn label(
     parent: &mut ChildSpawnerCommands,
     text: &str,
@@ -253,6 +318,17 @@ fn button(parent: &mut ChildSpawnerCommands, text: &str, action: Action, width: 
         .id()
 }
 
+fn cat_str(cat: BuildCatKind, l: &Strings) -> &'static str {
+    match cat {
+        BuildCatKind::Structure => l.cat_structure,
+        BuildCatKind::Storage => l.cat_storage,
+        BuildCatKind::Machines => l.cat_machines,
+        BuildCatKind::Power => l.cat_power,
+        BuildCatKind::Thermal => l.cat_thermal,
+        BuildCatKind::Atmosphere => l.cat_atmosphere,
+    }
+}
+
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
@@ -300,7 +376,7 @@ impl Plugin for UiPlugin {
     }
 }
 
-fn build_hud(mut commands: Commands) {
+fn build_hud(mut commands: Commands, lang: Res<Lang>) {
     let mut speed_buttons = Vec::new();
     let mut stats = Entity::PLACEHOLDER;
     let mut ship_time_label = Entity::PLACEHOLDER;
@@ -310,7 +386,7 @@ fn build_hud(mut commands: Commands) {
     let mut sel_btns = Vec::new();
     let mut log_lines = Vec::new();
     let mut debug_row = Entity::PLACEHOLDER;
-    let mut debug_button_label = Entity::PLACEHOLDER;
+    let debug_button_label = Entity::PLACEHOLDER;
     let mut sim_telemetry = Entity::PLACEHOLDER;
     let mut tool_hint = Entity::PLACEHOLDER;
     let mut tool_buttons = Vec::new();
@@ -353,39 +429,47 @@ fn build_hud(mut commands: Commands) {
                     BackgroundColor(PANEL_BG),
                 ))
                 .with_children(|panel| {
-                    panel.spawn(Node {
-                        flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(6.0),
-                        align_items: AlignItems::Center,
-                        flex_wrap: FlexWrap::Wrap,
-                        ..default()
-                    })
-                    .with_children(|row| {
-                        label(row, "SHIP ALIVE", 15.0, Color::srgb(0.95, 0.85, 0.55));
-                        stats = label(row, "", 14.0, Color::WHITE);
-                        button(row, "Haul All [H]", Action::MarkAll, 96.0);
-                        button(row, "Cancel All [C]", Action::CancelAll, 104.0);
-                    });
+                    panel
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            align_items: AlignItems::Center,
+                            flex_wrap: FlexWrap::Wrap,
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            label(row, "SHIP ALIVE", 15.0, Color::srgb(0.95, 0.85, 0.55));
+                            stats = label(row, "", 14.0, Color::WHITE);
+                            kbutton(row, *lang, |s| s.btn_haul_all, Action::MarkAll, 96.0);
+                            kbutton(row, *lang, |s| s.btn_cancel_all, Action::CancelAll, 104.0);
+                        });
 
                     // Per-network power summary line (visible with the overlay).
                     power_line = label(panel, "", 12.0, Color::srgb(0.62, 0.9, 0.8));
 
                     // Event feed.
-                    panel.spawn((
-                        Interaction::default(),
-                        Node {
-                            padding: UiRect::all(Val::Px(4.0)),
-                            flex_direction: FlexDirection::Column,
-                            row_gap: Val::Px(1.0),
-                            ..default()
-                        },
-                    ))
-                    .with_children(|p| {
-                        label(p, "EVENT LOG", 11.0, Color::srgb(0.5, 0.55, 0.62));
-                        for _ in 0..EventLog::VISIBLE {
-                            log_lines.push(label(p, "", 12.0, Color::srgb(0.75, 0.78, 0.82)));
-                        }
-                    });
+                    panel
+                        .spawn((
+                            Interaction::default(),
+                            Node {
+                                padding: UiRect::all(Val::Px(4.0)),
+                                flex_direction: FlexDirection::Column,
+                                row_gap: Val::Px(1.0),
+                                ..default()
+                            },
+                        ))
+                        .with_children(|p| {
+                            klabel(
+                                p,
+                                *lang,
+                                |s| s.hud_event_log,
+                                11.0,
+                                Color::srgb(0.5, 0.55, 0.62),
+                            );
+                            for _ in 0..EventLog::VISIBLE {
+                                log_lines.push(label(p, "", 12.0, Color::srgb(0.75, 0.78, 0.82)));
+                            }
+                        });
 
                     // Developer toolbar, hidden by default.
                     debug_row = panel
@@ -403,11 +487,27 @@ fn build_hud(mut commands: Commands) {
                             button(
                                 row,
                                 "+Crate",
-                                Action::SpawnItem { kind: ItemKind::Crate },
+                                Action::SpawnItem {
+                                    kind: ItemKind::Crate,
+                                },
                                 64.0,
                             );
-                            button(row, "+Ore", Action::SpawnItem { kind: ItemKind::Ore }, 56.0);
-                            button(row, "+Part", Action::SpawnItem { kind: ItemKind::Part }, 60.0);
+                            button(
+                                row,
+                                "+Ore",
+                                Action::SpawnItem {
+                                    kind: ItemKind::Ore,
+                                },
+                                56.0,
+                            );
+                            button(
+                                row,
+                                "+Part",
+                                Action::SpawnItem {
+                                    kind: ItemKind::Part,
+                                },
+                                60.0,
+                            );
                             label(
                                 row,
                                 "debug tools | [X] deletes the selected item",
@@ -418,9 +518,10 @@ fn build_hud(mut commands: Commands) {
                         })
                         .id();
 
-                    label(
+                    klabel(
                         panel,
-                        "Drag: mark items for hauling | Click: select | Right-drag / WASD: pan | Wheel: zoom | T: mark | B: build tools | Tab: work | Space/1/2/3: speed",
+                        *lang,
+                        |s| s.hud_controls_hint,
                         11.0,
                         Color::srgb(0.6, 0.66, 0.72),
                     );
@@ -440,71 +541,127 @@ fn build_hud(mut commands: Commands) {
                     BackgroundColor(PANEL_BG),
                 ))
                 .with_children(|panel| {
-                    panel.spawn(Node {
-                        flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(4.0),
-                        align_items: AlignItems::Center,
-                        ..default()
-                    })
-                    .with_children(|row| {
-                        ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
-                        for (i, text) in ["Pause", "1x", "2x", "4x"].iter().enumerate() {
-                            speed_buttons
-                                .push(button(row, text, Action::SetSpeed { index: i }, 52.0));
-                        }
-                        row.spawn((
-                            Button,
-                            Interaction::default(),
-                            OnPress(Action::CycleOverlay),
-                            Node {
-                                width: Val::Px(96.0),
-                                height: Val::Px(26.0),
-                                margin: UiRect::all(Val::Px(2.0)),
-                                align_items: AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                ..default()
-                            },
-                            BackgroundColor(BUTTON_BG),
-                        ))
-                        .with_children(|b| {
-                            power_button_label = label(b, "View [P]", 13.0, Color::WHITE);
+                    panel
+                        .spawn(Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(4.0),
+                            align_items: AlignItems::Center,
+                            ..default()
+                        })
+                        .with_children(|row| {
+                            ship_time_label = label(row, "", 14.0, Color::srgb(0.62, 0.9, 0.8));
+                            for (i, text) in ["Pause", "1x", "2x", "4x"].iter().enumerate() {
+                                if i == 0 {
+                                    speed_buttons.push(kbutton(
+                                        row,
+                                        *lang,
+                                        |s| s.btn_pause,
+                                        Action::SetSpeed { index: i },
+                                        52.0,
+                                    ));
+                                } else {
+                                    speed_buttons.push(button(
+                                        row,
+                                        text,
+                                        Action::SetSpeed { index: i },
+                                        52.0,
+                                    ));
+                                }
+                            }
+                            row.spawn((
+                                Button,
+                                Interaction::default(),
+                                OnPress(Action::CycleOverlay),
+                                Node {
+                                    width: Val::Px(96.0),
+                                    height: Val::Px(26.0),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|b| {
+                                power_button_label = label(b, "View [P]", 13.0, Color::WHITE);
+                            });
+                            row.spawn((
+                                Button,
+                                Interaction::default(),
+                                OnPress(Action::ToggleWorkTab),
+                                crate::worktab::WorkTabButton::Toggle,
+                                Node {
+                                    width: Val::Px(88.0),
+                                    height: Val::Px(26.0),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Work [Tab]"),
+                                    TextFont {
+                                        font_size: 13.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                    crate::settings::StaticLabel::new(|s| s.btn_work),
+                                ));
+                            });
+                            row.spawn((
+                                Button,
+                                Interaction::default(),
+                                OnPress(Action::ToggleSettings),
+                                Node {
+                                    width: Val::Px(98.0),
+                                    height: Val::Px(26.0),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new("Settings [O]"),
+                                    TextFont {
+                                        font_size: 13.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                    crate::settings::StaticLabel::new(|s| s.btn_settings),
+                                ));
+                            });
+                            row.spawn((
+                                Button,
+                                Interaction::default(),
+                                OnPress(Action::ToggleDebug),
+                                Node {
+                                    width: Val::Px(64.0),
+                                    height: Val::Px(26.0),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    align_items: AlignItems::Center,
+                                    justify_content: JustifyContent::Center,
+                                    ..default()
+                                },
+                                BackgroundColor(BUTTON_BG),
+                            ))
+                            .with_children(|b| {
+                                b.spawn((
+                                    Text::new(strings(*lang).btn_debug),
+                                    TextFont {
+                                        font_size: 13.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                    StaticLabel::new(|s| s.btn_debug),
+                                ));
+                            });
                         });
-                        row.spawn((
-                            Button,
-                            Interaction::default(),
-                            OnPress(Action::ToggleWorkTab),
-                            crate::worktab::WorkTabButton::Toggle,
-                            Node {
-                                width: Val::Px(88.0),
-                                height: Val::Px(26.0),
-                                margin: UiRect::all(Val::Px(2.0)),
-                                align_items: AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                ..default()
-                            },
-                            BackgroundColor(BUTTON_BG),
-                        ))
-                        .with_children(|b| {
-                            label(b, "Work [Tab]", 13.0, Color::WHITE);
-                        });
-                        row.spawn((
-                            Button,
-                            Interaction::default(),
-                            OnPress(Action::ToggleDebug),
-                            Node {
-                                width: Val::Px(64.0),
-                                height: Val::Px(26.0),
-                                margin: UiRect::all(Val::Px(2.0)),
-                                align_items: AlignItems::Center,
-                                justify_content: JustifyContent::Center,
-                                ..default()
-                            },
-                            BackgroundColor(BUTTON_BG),
-                        ))
-                        .with_children(|b| {
-                            debug_button_label = label(b, "Debug", 13.0, Color::WHITE);
-                        });
-                    });
 
                     alert_line = label(panel, "", 13.0, Color::srgb(1.0, 0.4, 0.3));
                 });
@@ -526,271 +683,296 @@ fn build_hud(mut commands: Commands) {
             .with_children(|bottom| {
                 // Build panel: the category bar sits in the bottom-left
                 // corner; its flyout and the placement hint open above it.
-                bottom.spawn((
-                    Interaction::default(),
-                    Node {
-                        flex_direction: FlexDirection::Column,
-                        align_items: AlignItems::FlexStart,
-                        row_gap: Val::Px(2.0),
-                        flex_shrink: 0.0,
-                        ..default()
-                    },
-                ))
-                .with_children(|panel| {
-                    tool_hint = label(panel, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
-
-                    // Flyout: the concrete buildings of the opened category.
-                    flyout = panel
-                        .spawn((
-                            FlyoutRoot,
-                            Interaction::default(),
-                            CollapseWhenHidden,
-                            Node {
-                                flex_direction: FlexDirection::Column,
-                                padding: UiRect::all(Val::Px(6.0)),
-                                margin: UiRect::all(Val::Px(2.0)),
-                                border: UiRect::all(Val::Px(1.0)),
-                                ..default()
-                            },
-                            BorderColor(Color::srgba(0.45, 0.55, 0.65, 0.8)),
-                            BackgroundColor(Color::srgba(0.09, 0.12, 0.16, 0.95)),
-                            Visibility::Hidden,
-                        ))
-                        .with_children(|f| {
-                            for cat in BuildCatKind::ALL {
-                                let row_e = f
-                                    .spawn((
-                                        FlyoutRow(cat),
-                                        CollapseWhenHidden,
-                                        Node {
-                                            flex_direction: FlexDirection::Row,
-                                            column_gap: Val::Px(4.0),
-                                            align_items: AlignItems::Center,
-                                            ..default()
-                                        },
-                                        Visibility::Hidden,
-                                    ))
-                                    .with_children(|r| {
-                                        let header = match cat {
-                                            BuildCatKind::Structure => "Structure:",
-                                            BuildCatKind::Storage => "Storage:",
-                                            BuildCatKind::Machines => "Machines:",
-                                            BuildCatKind::Power => "Power:",
-                                            BuildCatKind::Thermal => "Thermal:",
-                                            BuildCatKind::Atmosphere => "Atmosphere:",
-                                        };
-                                        label(r, header, 11.0, Color::srgb(0.55, 0.62, 0.7));
-                                        for kind in cat.kinds() {
-                                            let tool = Tool::Build(*kind);
-                                            let e = button(
-                                                r,
-                                                kind.label(),
-                                                Action::SetTool { tool: Some(tool) },
-                                                match kind {
-                                                    BuildingKind::Fabricator => 88.0,
-                                                    BuildingKind::Door => 56.0,
-                                                    BuildingKind::Wall => 56.0,
-                                                    BuildingKind::Rack => 96.0,
-                                                    BuildingKind::PowerCable => 96.0,
-                                                    BuildingKind::Reactor => 72.0,
-                                                    BuildingKind::CoolantPipe => 96.0,
-                                                    BuildingKind::Pump => 96.0,
-                                                    BuildingKind::Reservoir => 110.0,
-                                                    BuildingKind::HeatExchanger => 118.0,
-                                                    BuildingKind::Radiator => 76.0,
-                                                    BuildingKind::GasDuct => 86.0,
-                                                    BuildingKind::Vent => 60.0,
-                                                    BuildingKind::Blower => 72.0,
-                                                    BuildingKind::GasTank => 82.0,
-                                                },
-                                            );
-                                            pending_tool_btns.push((e, tool));
-                                            tool_buttons.push(e);
-                                        }
-                                    })
-                                    .id();
-                                flyout_rows.push((cat, row_e));
-                            }
-                        })
-                        .id();
-
-                    // Category bar (RimWorld-style architect tabs). Only
-                    // categories live here; their buildings sit in the
-                    // flyout opened on click (see build_menu_system).
-                    panel.spawn((
+                bottom
+                    .spawn((
                         Interaction::default(),
                         Node {
-                            flex_direction: FlexDirection::Row,
-                            column_gap: Val::Px(4.0),
-                            align_items: AlignItems::Center,
-                            padding: UiRect::vertical(Val::Px(4.0)),
+                            flex_direction: FlexDirection::Column,
+                            align_items: AlignItems::FlexStart,
+                            row_gap: Val::Px(2.0),
+                            flex_shrink: 0.0,
                             ..default()
                         },
-                        BackgroundColor(PANEL_BG),
                     ))
-                    .with_children(|row| {
-                        for cat in BuildCatKind::ALL {
-                            let e = row
-                                .spawn((
-                                    Button,
-                                    Interaction::default(),
-                                    BuildCat(cat),
-                                    Node {
-                                        height: Val::Px(26.0),
-                                        padding: UiRect::horizontal(Val::Px(10.0)),
-                                        margin: UiRect::all(Val::Px(2.0)),
-                                        align_items: AlignItems::Center,
-                                        justify_content: JustifyContent::Center,
-                                        ..default()
-                                    },
-                                    BackgroundColor(BUTTON_BG),
-                                ))
-                                .with_children(|b| {
-                                    label(b, cat.label(), 13.0, Color::WHITE);
-                                })
-                                .id();
-                            build_cat_buttons.push((cat, e));
-                        }
-                        let demo_tool = Tool::Deconstruct;
-                        let e = button(
-                            row,
-                            "Deconstruct",
-                            Action::SetTool { tool: Some(demo_tool) },
-                            100.0,
-                        );
-                        pending_tool_btns.push((e, demo_tool));
-                        tool_buttons.push(e);
-                        button(
-                            row,
-                            "Cancel Tool [Esc]",
-                            Action::SetTool { tool: None },
-                            110.0,
-                        );
-                    });
-                });
+                    .with_children(|panel| {
+                        tool_hint = label(panel, "", 12.0, Color::srgb(0.6, 0.8, 0.65));
 
-                // Crew chips (bottom-center): basis 0 so they only ever take
-                // the space the corner panels leave, wrapping as needed.
-                bottom.spawn((
-                    Interaction::default(),
-                    Node {
-                        flex_direction: FlexDirection::Row,
-                        column_gap: Val::Px(6.0),
-                        row_gap: Val::Px(4.0),
-                        flex_wrap: FlexWrap::Wrap,
-                        flex_grow: 1.0,
-                        flex_basis: Val::Px(0.0),
-                        justify_content: JustifyContent::Center,
-                        ..default()
-                    },
-                ))
-                .with_children(|row| {
-                    for _ in 0..4 {
-                        chips.push(
-                            row.spawn((
-                                Text::new(""),
-                                TextFont {
-                                    font_size: 13.0,
+                        // Flyout: the concrete buildings of the opened category.
+                        flyout = panel
+                            .spawn((
+                                FlyoutRoot,
+                                Interaction::default(),
+                                CollapseWhenHidden,
+                                Node {
+                                    flex_direction: FlexDirection::Column,
+                                    padding: UiRect::all(Val::Px(6.0)),
+                                    margin: UiRect::all(Val::Px(2.0)),
+                                    border: UiRect::all(Val::Px(1.0)),
                                     ..default()
                                 },
-                                TextColor(Color::WHITE),
+                                BorderColor(Color::srgba(0.45, 0.55, 0.65, 0.8)),
+                                BackgroundColor(Color::srgba(0.09, 0.12, 0.16, 0.95)),
+                                Visibility::Hidden,
+                            ))
+                            .with_children(|f| {
+                                for cat in BuildCatKind::ALL {
+                                    let row_e = f
+                                        .spawn((
+                                            FlyoutRow(cat),
+                                            CollapseWhenHidden,
+                                            Node {
+                                                flex_direction: FlexDirection::Row,
+                                                column_gap: Val::Px(4.0),
+                                                align_items: AlignItems::Center,
+                                                ..default()
+                                            },
+                                            Visibility::Hidden,
+                                        ))
+                                        .with_children(|r| {
+                                            let c = cat;
+                                            r.spawn((
+                                                Text::new(cat_str(c, strings(*lang))),
+                                                TextFont {
+                                                    font_size: 11.0,
+                                                    ..default()
+                                                },
+                                                TextColor(Color::srgb(0.55, 0.62, 0.7)),
+                                                StaticLabel::new(move |s| cat_str(c, s)),
+                                            ));
+                                            for kind in cat.kinds() {
+                                                let tool = Tool::Build(*kind);
+                                                let e = kbutton(
+                                                    r,
+                                                    *lang,
+                                                    move |s| loc::building_label(*kind, s),
+                                                    Action::SetTool { tool: Some(tool) },
+                                                    match kind {
+                                                        BuildingKind::Fabricator => 88.0,
+                                                        BuildingKind::Door => 56.0,
+                                                        BuildingKind::Wall => 56.0,
+                                                        BuildingKind::Rack => 96.0,
+                                                        BuildingKind::PowerCable => 96.0,
+                                                        BuildingKind::Reactor => 72.0,
+                                                        BuildingKind::CoolantPipe => 96.0,
+                                                        BuildingKind::Pump => 96.0,
+                                                        BuildingKind::Reservoir => 110.0,
+                                                        BuildingKind::HeatExchanger => 118.0,
+                                                        BuildingKind::Radiator => 76.0,
+                                                        BuildingKind::GasDuct => 86.0,
+                                                        BuildingKind::Vent => 60.0,
+                                                        BuildingKind::Blower => 72.0,
+                                                        BuildingKind::GasTank => 82.0,
+                                                    },
+                                                );
+                                                pending_tool_btns.push((e, tool));
+                                                tool_buttons.push(e);
+                                            }
+                                        })
+                                        .id();
+                                    flyout_rows.push((cat, row_e));
+                                }
+                            })
+                            .id();
+
+                        // Category bar (RimWorld-style architect tabs). Only
+                        // categories live here; their buildings sit in the
+                        // flyout opened on click (see build_menu_system).
+                        panel
+                            .spawn((
+                                Interaction::default(),
                                 Node {
-                                    padding: UiRect::all(Val::Px(4.0)),
+                                    flex_direction: FlexDirection::Row,
+                                    column_gap: Val::Px(4.0),
+                                    align_items: AlignItems::Center,
+                                    padding: UiRect::vertical(Val::Px(4.0)),
                                     ..default()
                                 },
                                 BackgroundColor(PANEL_BG),
                             ))
-                            .id(),
-                        );
-                    }
-                });
+                            .with_children(|row| {
+                                for cat in BuildCatKind::ALL {
+                                    let e = row
+                                        .spawn((
+                                            Button,
+                                            Interaction::default(),
+                                            BuildCat(cat),
+                                            Node {
+                                                height: Val::Px(26.0),
+                                                padding: UiRect::horizontal(Val::Px(10.0)),
+                                                margin: UiRect::all(Val::Px(2.0)),
+                                                align_items: AlignItems::Center,
+                                                justify_content: JustifyContent::Center,
+                                                ..default()
+                                            },
+                                            BackgroundColor(BUTTON_BG),
+                                        ))
+                                        .with_children(|b| {
+                                            let c = cat;
+                                            b.spawn((
+                                                Text::new(cat_str(c, strings(*lang))),
+                                                TextFont {
+                                                    font_size: 13.0,
+                                                    ..default()
+                                                },
+                                                TextColor(Color::WHITE),
+                                                StaticLabel::new(move |s| cat_str(c, s)),
+                                            ));
+                                        })
+                                        .id();
+                                    build_cat_buttons.push((cat, e));
+                                }
+                                let demo_tool = Tool::Deconstruct;
+                                let e = kbutton(
+                                    row,
+                                    *lang,
+                                    |s| s.btn_deconstruct,
+                                    Action::SetTool {
+                                        tool: Some(demo_tool),
+                                    },
+                                    100.0,
+                                );
+                                pending_tool_btns.push((e, demo_tool));
+                                tool_buttons.push(e);
+                                kbutton(
+                                    row,
+                                    *lang,
+                                    |s| s.btn_cancel_tool,
+                                    Action::SetTool { tool: None },
+                                    110.0,
+                                );
+                            });
+                    });
+
+                // Crew chips (bottom-center): basis 0 so they only ever take
+                // the space the corner panels leave, wrapping as needed.
+                bottom
+                    .spawn((
+                        Interaction::default(),
+                        Node {
+                            flex_direction: FlexDirection::Row,
+                            column_gap: Val::Px(6.0),
+                            row_gap: Val::Px(4.0),
+                            flex_wrap: FlexWrap::Wrap,
+                            flex_grow: 1.0,
+                            flex_basis: Val::Px(0.0),
+                            justify_content: JustifyContent::Center,
+                            ..default()
+                        },
+                    ))
+                    .with_children(|row| {
+                        for _ in 0..4 {
+                            chips.push(
+                                row.spawn((
+                                    Text::new(""),
+                                    TextFont {
+                                        font_size: 13.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                    Node {
+                                        padding: UiRect::all(Val::Px(4.0)),
+                                        ..default()
+                                    },
+                                    BackgroundColor(PANEL_BG),
+                                ))
+                                .id(),
+                            );
+                        }
+                    });
 
                 // Inspect pane: environment overview by default, selection
                 // details + operation buttons while something is selected.
-                bottom.spawn((
-                    Interaction::default(),
-                    Node {
-                        width: Val::Px(300.0),
-                        padding: UiRect::all(Val::Px(8.0)),
-                        flex_direction: FlexDirection::Column,
-                        row_gap: Val::Px(2.0),
-                        flex_shrink: 0.0,
-                        ..default()
-                    },
-                    BackgroundColor(PANEL_BG),
-                ))
-                .with_children(|sb| {
-                    label(sb, "SHIP STATUS", 12.0, Color::srgb(0.5, 0.55, 0.62));
+                bottom
+                    .spawn((
+                        Interaction::default(),
+                        Node {
+                            width: Val::Px(300.0),
+                            padding: UiRect::all(Val::Px(8.0)),
+                            flex_direction: FlexDirection::Column,
+                            row_gap: Val::Px(2.0),
+                            flex_shrink: 0.0,
+                            ..default()
+                        },
+                        BackgroundColor(PANEL_BG),
+                    ))
+                    .with_children(|sb| {
+                        klabel(
+                            sb,
+                            *lang,
+                            |s| s.hud_ship_status,
+                            12.0,
+                            Color::srgb(0.5, 0.55, 0.62),
+                        );
 
-                    // Environment mode (nothing selected).
-                    env_section = sb
-                        .spawn((
-                            CollapseWhenHidden,
-                            Node {
-                                flex_direction: FlexDirection::Column,
-                                row_gap: Val::Px(2.0),
-                                ..default()
-                            },
-                        ))
-                        .with_children(|sec| {
-                            for _ in 0..ENV_LINES {
-                                env_lines.push(label(sec, "", 12.0, Color::WHITE));
-                            }
-                        })
-                        .id();
-
-                    // Entity mode (something selected): properties + operations.
-                    entity_section = sb
-                        .spawn((
-                            CollapseWhenHidden,
-                            Node {
-                                flex_direction: FlexDirection::Column,
-                                row_gap: Val::Px(2.0),
-                                ..default()
-                            },
-                            Visibility::Hidden,
-                        ))
-                        .with_children(|sec| {
-                            for _ in 0..SEL_LINES {
-                                sel_lines.push(label(sec, "", 13.0, Color::WHITE));
-                            }
-                            // Re-purposable operation buttons (wrap to pane width).
-                            for _row_idx in 0..2 {
-                                sec.spawn(Node {
-                                    flex_direction: FlexDirection::Row,
-                                    flex_wrap: FlexWrap::Wrap,
-                                    column_gap: Val::Px(3.0),
+                        // Environment mode (nothing selected).
+                        env_section = sb
+                            .spawn((
+                                CollapseWhenHidden,
+                                Node {
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(2.0),
                                     ..default()
-                                })
-                                .with_children(|r| {
-                                    for _ in 0..(SEL_BTNS / 2) {
-                                        sel_btns.push(
-                                            r.spawn((
-                                                Button,
-                                                Interaction::default(),
-                                                CollapseWhenHidden,
-                                                Node {
-                                                    height: Val::Px(24.0),
-                                                    padding: UiRect::horizontal(Val::Px(8.0)),
-                                                    margin: UiRect::all(Val::Px(1.0)),
-                                                    align_items: AlignItems::Center,
-                                                    justify_content: JustifyContent::Center,
-                                                    ..default()
-                                                },
-                                                BackgroundColor(BUTTON_BG),
-                                                Visibility::Hidden,
-                                            ))
-                                            .with_children(|b| {
-                                                label(b, "", 12.0, Color::WHITE);
-                                            })
-                                            .id(),
-                                        );
-                                    }
-                                });
-                            }
-                        })
-                        .id();
-                });
+                                },
+                            ))
+                            .with_children(|sec| {
+                                for _ in 0..ENV_LINES {
+                                    env_lines.push(label(sec, "", 12.0, Color::WHITE));
+                                }
+                            })
+                            .id();
+
+                        // Entity mode (something selected): properties + operations.
+                        entity_section = sb
+                            .spawn((
+                                CollapseWhenHidden,
+                                Node {
+                                    flex_direction: FlexDirection::Column,
+                                    row_gap: Val::Px(2.0),
+                                    ..default()
+                                },
+                                Visibility::Hidden,
+                            ))
+                            .with_children(|sec| {
+                                for _ in 0..SEL_LINES {
+                                    sel_lines.push(label(sec, "", 13.0, Color::WHITE));
+                                }
+                                // Re-purposable operation buttons (wrap to pane width).
+                                for _row_idx in 0..2 {
+                                    sec.spawn(Node {
+                                        flex_direction: FlexDirection::Row,
+                                        flex_wrap: FlexWrap::Wrap,
+                                        column_gap: Val::Px(3.0),
+                                        ..default()
+                                    })
+                                    .with_children(|r| {
+                                        for _ in 0..(SEL_BTNS / 2) {
+                                            sel_btns.push(
+                                                r.spawn((
+                                                    Button,
+                                                    Interaction::default(),
+                                                    CollapseWhenHidden,
+                                                    Node {
+                                                        height: Val::Px(24.0),
+                                                        padding: UiRect::horizontal(Val::Px(8.0)),
+                                                        margin: UiRect::all(Val::Px(1.0)),
+                                                        align_items: AlignItems::Center,
+                                                        justify_content: JustifyContent::Center,
+                                                        ..default()
+                                                    },
+                                                    BackgroundColor(BUTTON_BG),
+                                                    Visibility::Hidden,
+                                                ))
+                                                .with_children(|b| {
+                                                    label(b, "", 12.0, Color::WHITE);
+                                                })
+                                                .id(),
+                                            );
+                                        }
+                                    });
+                                }
+                            })
+                            .id();
+                    });
             });
         });
     commands.insert_resource(Hud {
@@ -858,6 +1040,7 @@ fn button_system(
 #[allow(clippy::too_many_arguments)]
 fn sidebar_system(
     hud: Res<Hud>,
+    lang: Res<Lang>,
     // Real time: the UI refresh cadence is wall-clock (the virtual clock
     // runs at BASE_SIM_RATE × game speed and pauses with the game).
     time: Res<Time<Real>>,
@@ -868,11 +1051,14 @@ fn sidebar_system(
     stats: Res<crate::stats::Stats>,
     power_state: Res<PowerState>,
     thermal: ThermalView,
-    reactors: Query<(&crate::building::Footprint, &crate::thermal::ThermalState)>,
-    racks: Query<&StorageCell>,
-    items: Query<(&Item, Option<&MarkedForHaul>), With<Item>>,
-    fabs: Query<&PowerStatus, With<crate::production::Fabricator>>,
-    crews: Query<&CrewTask, With<Crew>>,
+    // Nested tuple = one system param (the flat list would exceed 16).
+    (reactors, racks, items, fabs, crews): (
+        Query<(&crate::building::Footprint, &crate::thermal::ThermalState)>,
+        Query<&StorageCell>,
+        Query<(&Item, Option<&MarkedForHaul>), With<Item>>,
+        Query<&PowerStatus, With<crate::production::Fabricator>>,
+        Query<&CrewTask, With<Crew>>,
+    ),
     mut texts: Query<(&mut Text, &mut TextColor, &mut Visibility), Without<Button>>,
     mut vis_q: Query<&mut Visibility, (With<Node>, Without<Text>, Without<Button>)>,
 ) {
@@ -901,6 +1087,7 @@ fn sidebar_system(
         }
         *ui_acc = 0.0;
         // ---- environment content ----
+        let l = strings(*lang);
         let ship_time = crate::simtime::format_sim_stamp(clock.now());
 
         let stored: u32 = racks.iter().map(|c| c.stored()).sum();
@@ -929,23 +1116,34 @@ fn sidebar_system(
         let dim = Color::srgb(0.55, 0.6, 0.66);
         let mut lines: Vec<(String, Color)> = vec![
             (
-                format!("Time {ship_time} | {}", speed.label()),
+                crate::tfmt!(
+                    l.fmt_env_time,
+                    time = ship_time,
+                    speed = loc::speed_label_loc(speed.index, l)
+                ),
                 Color::WHITE,
             ),
             (String::new(), Color::WHITE),
-            ("POWER".to_string(), dim),
+            (l.env_power.to_string(), dim),
         ];
         if power_state.networks.is_empty() {
-            lines.push(("no networks (lay cables)".into(), dim));
+            lines.push((l.env_no_networks.into(), dim));
         }
         for (i, net) in power_state.networks.iter().enumerate().take(3) {
-            lines.push((format!("NET {}: {}", i + 1, net.summary()), {
-                if net.generation == 0 || net.demand > net.generation {
-                    Color::srgb(1.0, 0.6, 0.45)
-                } else {
-                    Color::srgb(0.7, 0.95, 0.75)
-                }
-            }));
+            lines.push((
+                crate::tfmt!(
+                    l.fmt_env_net,
+                    i = i + 1,
+                    summary = loc::power_net_summary(net, l)
+                ),
+                {
+                    if net.generation == 0 || net.demand > net.generation {
+                        Color::srgb(1.0, 0.6, 0.45)
+                    } else {
+                        Color::srgb(0.7, 0.95, 0.75)
+                    }
+                },
+            ));
         }
         // Thermal block: cores + hottest room + coolant loops.
         let mut hottest_core = f32::NEG_INFINITY;
@@ -961,45 +1159,52 @@ fn sidebar_system(
         }
         let total_water = thermal.water.total_water();
         lines.push((String::new(), Color::WHITE));
-        lines.push(("THERMAL".to_string(), dim));
+        lines.push((l.env_thermal.to_string(), dim));
         if reactors.is_empty() {
-            lines.push(("no reactor installed".into(), dim));
+            lines.push((l.env_no_reactor.into(), dim));
         } else {
             lines.push((
-                format!("Core: {:.0}°C ({})", hottest_core, worst_state.label()),
+                crate::tfmt!(
+                    l.fmt_env_core,
+                    t = format!("{hottest_core:.0}"),
+                    state = loc::thermal_state_label(worst_state, l)
+                ),
                 match worst_state {
                     crate::thermal::ThermalState::Normal => Color::srgb(0.7, 0.95, 0.75),
                     crate::thermal::ThermalState::Overheat => Color::srgb(1.0, 0.7, 0.25),
                     crate::thermal::ThermalState::Critical => Color::srgb(1.0, 0.4, 0.3),
                 },
             ));
-            lines.push((format!("Hottest room: {:.0}°C", ship_max), Color::WHITE));
+            lines.push((
+                crate::tfmt!(l.fmt_env_hottest, t = format!("{ship_max:.0}")),
+                Color::WHITE,
+            ));
         }
         if thermal.coolant.networks.is_empty() {
-            lines.push(("Coolant: none (lay pipes)".into(), dim));
+            lines.push((l.env_coolant_none.into(), dim));
         } else {
             let dumping: f32 = thermal.coolant.networks.iter().map(|n| n.dump_rate).sum();
             lines.push((
-                format!(
-                    "Coolant: {} net | water {:.0} | dumping {:.0}H/s",
-                    thermal.coolant.networks.len(),
-                    total_water,
-                    dumping
+                crate::tfmt!(
+                    l.fmt_env_coolant,
+                    n = thermal.coolant.networks.len(),
+                    w = format!("{total_water:.0}"),
+                    d = format!("{dumping:.0}")
                 ),
                 Color::WHITE,
             ));
         }
         // Airtight compartments block (Slice 4).
         lines.push((String::new(), Color::WHITE));
-        lines.push(("COMPARTMENTS".to_string(), dim));
+        lines.push((l.env_compartments.to_string(), dim));
         let comps = &thermal.comps;
         let exposed = comps.exposed_count();
         lines.push((
-            format!(
-                "{} structural | {} sealed | {} exposed",
-                comps.regions.len(),
-                comps.sealed_count(),
-                exposed
+            crate::tfmt!(
+                l.fmt_env_comps,
+                n = comps.regions.len(),
+                s = comps.sealed_count(),
+                e = exposed
             ),
             if exposed > 0 {
                 Color::srgb(1.0, 0.45, 0.35)
@@ -1010,25 +1215,28 @@ fn sidebar_system(
         let air_note = if comps.air_groups as usize == comps.regions.len() {
             String::new()
         } else {
-            format!(" | air regions {}", comps.air_groups)
+            crate::tfmt!(l.fmt_env_air_note, n = comps.air_groups)
         };
         lines.push((
-            format!(
-                "Doors: {} closed / {} open{air_note}",
-                comps.doors_closed, comps.doors_open
+            crate::tfmt!(
+                l.fmt_env_doors,
+                c = comps.doors_closed,
+                o = comps.doors_open,
+                note = air_note
             ),
             Color::WHITE,
         ));
         // Atmosphere block (Slice 5) — reads the cached summary only, never
         // a per-frame grid scan.
         lines.push((String::new(), Color::WHITE));
-        lines.push(("ATMOSPHERE".to_string(), dim));
+        lines.push((l.env_atmosphere.to_string(), dim));
         let a = &thermal.atmo_summary;
         let exposed = comps.exposed_count();
         lines.push((
-            format!(
-                "Pressure     {:.0}–{:.0} kPa",
-                a.min_pressure, a.max_pressure
+            crate::tfmt!(
+                l.fmt_env_pressure,
+                min = format!("{:.0}", a.min_pressure),
+                max = format!("{:.0}", a.max_pressure)
             ),
             if a.low_cells > 0 || a.vacuum_cells > 0 {
                 Color::srgb(1.0, 0.45, 0.35)
@@ -1037,9 +1245,10 @@ fn sidebar_system(
             },
         ));
         lines.push((
-            format!(
-                "O2 partial   {:.1}–{:.1} kPa",
-                a.min_o2_partial, a.max_o2_partial
+            crate::tfmt!(
+                l.fmt_env_o2,
+                min = format!("{:.1}", a.min_o2_partial),
+                max = format!("{:.1}", a.max_o2_partial)
             ),
             if a.low_o2_cells > 0 {
                 Color::srgb(1.0, 0.6, 0.4)
@@ -1048,11 +1257,11 @@ fn sidebar_system(
             },
         ));
         lines.push((
-            format!(
-                "Gas retained {:.0}%{}",
-                a.retained * 100.0,
-                if a.max_co2_partial > crate::atmosphere::CO2_HIGH_KPA {
-                    format!(" | CO2 {:.1} kPa", a.max_co2_partial)
+            crate::tfmt!(
+                l.fmt_env_retained,
+                p = format!("{:.0}", a.retained * 100.0),
+                note = if a.max_co2_partial > crate::atmosphere::CO2_HIGH_KPA {
+                    crate::tfmt!(l.fmt_env_co2_note, v = format!("{:.1}", a.max_co2_partial))
                 } else {
                     String::new()
                 }
@@ -1064,11 +1273,11 @@ fn sidebar_system(
             },
         ));
         lines.push((
-            format!(
-                "Exposed      {} compartments{}",
-                exposed,
-                if a.active_cells > 0 {
-                    format!(" | venting, {} cells active", a.active_cells)
+            crate::tfmt!(
+                l.fmt_env_exposed,
+                n = exposed,
+                note = if a.active_cells > 0 {
+                    crate::tfmt!(l.fmt_env_venting_note, n = a.active_cells)
                 } else {
                     String::new()
                 }
@@ -1082,39 +1291,47 @@ fn sidebar_system(
         // Ventilation block (Slice 6) — cached summary only.
         let v = &thermal.vent;
         lines.push((String::new(), Color::WHITE));
-        lines.push(("VENTILATION".to_string(), dim));
+        lines.push((l.env_ventilation.to_string(), dim));
         lines.push((
-            format!(
-                "Networks {} | active {} | gas {:.0} units",
-                v.networks, v.active_cells, v.stored_mol
+            crate::tfmt!(
+                l.fmt_env_vent_nets,
+                n = v.networks,
+                a = v.active_cells,
+                g = format!("{:.0}", v.stored_mol)
             ),
             Color::WHITE,
         ));
         lines.push((
-            format!(
-                "Blowers {}/{} powered{}",
-                v.blowers_on,
-                v.blowers_total,
-                if v.max_tank_p > 0.0 {
-                    format!(" | tanks {:.0} kPa", v.max_tank_p)
+            crate::tfmt!(
+                l.fmt_env_blowers,
+                on = v.blowers_on,
+                total = v.blowers_total,
+                note = if v.max_tank_p > 0.0 {
+                    crate::tfmt!(l.fmt_env_tanks_note, p = format!("{:.0}", v.max_tank_p))
                 } else {
                     String::new()
                 }
             ),
-            match v.alert() {
+            match loc::vent_alert_label(v, l) {
                 Some(_) => Color::srgb(1.0, 0.55, 0.45),
                 None => Color::WHITE,
             },
         ));
-        if let Some(a) = v.alert() {
+        if let Some(a) = loc::vent_alert_label(v, l) {
             lines.push((a.to_string(), Color::srgb(1.0, 0.55, 0.45)));
         }
         lines.push((String::new(), Color::WHITE));
-        lines.push(("STORAGE".to_string(), dim));
+        lines.push((l.env_storage.to_string(), dim));
         lines.push((
-            format!(
-                "Stored {stored}/{cap}{}",
-                if cap == stored { " FULL" } else { "" }
+            crate::tfmt!(
+                l.fmt_env_stored,
+                stored = stored,
+                cap = cap,
+                full = if cap == stored {
+                    l.storage_full_suffix
+                } else {
+                    ""
+                }
             ),
             if cap == stored {
                 Color::srgb(1.0, 0.45, 0.4)
@@ -1123,32 +1340,32 @@ fn sidebar_system(
             },
         ));
         lines.push((
-            format!(
-                "Racks   Ore {} | Part {} | Crate {}",
-                rack_counts[ItemKind::Ore.index()],
-                rack_counts[ItemKind::Part.index()],
-                rack_counts[ItemKind::Crate.index()]
+            crate::tfmt!(
+                l.fmt_env_racks,
+                o = rack_counts[ItemKind::Ore.index()],
+                p = rack_counts[ItemKind::Part.index()],
+                c = rack_counts[ItemKind::Crate.index()]
             ),
             Color::WHITE,
         ));
         lines.push((
-            format!(
-                "Ground  Ore {} | Part {} | Crate {}",
-                ground[ItemKind::Ore.index()],
-                ground[ItemKind::Part.index()],
-                ground[ItemKind::Crate.index()]
+            crate::tfmt!(
+                l.fmt_env_ground,
+                o = ground[ItemKind::Ore.index()],
+                p = ground[ItemKind::Part.index()],
+                c = ground[ItemKind::Crate.index()]
             ),
             Color::WHITE,
         ));
-        lines.push((format!("Marked for haul: {marked}",), Color::WHITE));
+        lines.push((crate::tfmt!(l.fmt_env_marked, n = marked), Color::WHITE));
         lines.push((String::new(), Color::WHITE));
-        lines.push(("PRODUCTION".to_string(), dim));
+        lines.push((l.env_production.to_string(), dim));
         lines.push((
-            format!("Parts made {} | Built {}", stats.produced, stats.built),
+            crate::tfmt!(l.fmt_env_parts, p = stats.produced, b = stats.built),
             Color::WHITE,
         ));
         lines.push((
-            format!("Fabricators {fabs_online}/{fabs_total} powered"),
+            crate::tfmt!(l.fmt_env_fabs, on = fabs_online, total = fabs_total),
             if fabs_online < fabs_total {
                 Color::srgb(1.0, 0.6, 0.45)
             } else {
@@ -1156,11 +1373,11 @@ fn sidebar_system(
             },
         ));
         lines.push((
-            format!(
-                "Crew idle {}/{} | Hauled {}",
-                idle,
-                crews.iter().count(),
-                stats.hauls_done
+            crate::tfmt!(
+                l.fmt_env_idle,
+                idle = idle,
+                total = crews.iter().count(),
+                h = stats.hauls_done
             ),
             Color::WHITE,
         ));
@@ -1257,10 +1474,13 @@ fn build_menu_system(
 
 /// Cycle the map overlay view (button + P hotkey): off → power → thermal →
 /// coolant → off. Modes are mutually exclusive by construction.
+#[allow(clippy::too_many_arguments)]
 fn overlay_cycle_system(
     mut events: EventReader<Action>,
     mut overlay: ResMut<OverlayMode>,
     hud: Res<Hud>,
+    lang: Res<Lang>,
+    mut last_lang: Local<Lang>,
     mut log: ResMut<EventLog>,
     clock: Res<crate::simtime::SimClock>,
     mut text_q: Query<&mut Text>,
@@ -1272,17 +1492,21 @@ fn overlay_cycle_system(
             cycled = true;
         }
     }
-    if !cycled {
+    let lang_changed = *last_lang != *lang;
+    if !cycled && !lang_changed {
         return;
     }
-    let now = clock.now();
-    log.push(
-        now,
-        LogKind::Info,
-        format!("Overlay view: {}", overlay.label()),
-    );
+    *last_lang = *lang;
+    let l = strings(*lang);
+    if cycled {
+        log.push(
+            clock.now(),
+            LogKind::Info,
+            crate::tfmt!(l.fmt_log_overlay, mode = loc::overlay_label(*overlay, l)),
+        );
+    }
     if let Ok(mut text) = text_q.get_mut(hud.power_button_label) {
-        text.0 = format!("View: {} [P]", overlay.label());
+        text.0 = crate::tfmt!(l.btn_view, mode = loc::overlay_label(*overlay, l));
     }
 }
 
@@ -1291,6 +1515,7 @@ fn overlay_cycle_system(
 #[allow(clippy::too_many_arguments)]
 fn overlay_summary_system(
     hud: Res<Hud>,
+    lang: Res<Lang>,
     // Real time: the UI refresh cadence is wall-clock (the virtual clock
     // runs at BASE_SIM_RATE × game speed and pauses with the game).
     time: Res<Time<Real>>,
@@ -1313,6 +1538,7 @@ fn overlay_summary_system(
         return;
     }
     *ui_acc = 0.0;
+    let l = strings(*lang);
 
     // ---- summary line (visible with the matching overlay mode) ----
     if let Ok((mut text, mut color)) = texts.get_mut(hud.power_line) {
@@ -1321,15 +1547,21 @@ fn overlay_summary_system(
         match *overlay {
             OverlayMode::Power => {
                 if power_state.networks.is_empty() {
-                    summary = "POWER: no networks".to_string();
+                    summary = l.ov_power_none.to_string();
                 } else {
                     let parts: Vec<String> = power_state
                         .networks
                         .iter()
                         .enumerate()
-                        .map(|(i, net)| format!("NET {}: {}", i + 1, net.summary()))
+                        .map(|(i, net)| {
+                            crate::tfmt!(
+                                l.fmt_env_net,
+                                i = i + 1,
+                                summary = loc::power_net_summary(net, l)
+                            )
+                        })
                         .collect();
-                    summary = format!("POWER | {}", parts.join(" | "));
+                    summary = crate::tfmt!(l.ov_power, nets = parts.join(" | "));
                 }
             }
             OverlayMode::Thermal => {
@@ -1337,14 +1569,16 @@ fn overlay_summary_system(
                 for (foot, _) in reactors.iter() {
                     hottest = hottest.max(thermal.grid.max_footprint_temp(foot));
                 }
-                summary = format!(
-                    "THERMAL | hottest core {:.0}°C | injected {:.0}H | radiated {:.0}H",
-                    hottest, tstats.injected_total, tstats.radiated_total,
+                summary = crate::tfmt!(
+                    l.fmt_ov_thermal,
+                    t = format!("{hottest:.0}"),
+                    i = format!("{:.0}", tstats.injected_total),
+                    r = format!("{:.0}", tstats.radiated_total)
                 );
             }
             OverlayMode::Coolant => {
                 if thermal.coolant.networks.is_empty() {
-                    summary = "COOLANT: no pipes laid".to_string();
+                    summary = l.ov_coolant_none.to_string();
                 } else {
                     let parts: Vec<String> = thermal
                         .coolant
@@ -1352,18 +1586,18 @@ fn overlay_summary_system(
                         .iter()
                         .enumerate()
                         .map(|(i, n)| {
-                            format!(
-                                "NET {}: {} water {:.0} @ {:.0}°C flow {:.1} dump {:.0}H/s",
-                                i + 1,
-                                n.status_label(),
-                                n.water,
-                                n.avg_temp,
-                                n.flow,
-                                n.dump_rate
+                            crate::tfmt!(
+                                l.fmt_ov_coolant_net,
+                                i = i + 1,
+                                status = loc::coolant_status_label(n, l),
+                                w = format!("{:.0}", n.water),
+                                t = format!("{:.0}", n.avg_temp),
+                                f = format!("{:.1}", n.flow),
+                                d = format!("{:.0}", n.dump_rate)
                             )
                         })
                         .collect();
-                    summary = format!("COOLANT | {}", parts.join(" | "));
+                    summary = crate::tfmt!(l.ov_coolant, nets = parts.join(" | "));
                 }
             }
             OverlayMode::Compartments => {
@@ -1371,47 +1605,52 @@ fn overlay_summary_system(
                 let air_note = if comps.air_groups as usize == comps.regions.len() {
                     String::new()
                 } else {
-                    format!(" | air regions {}", comps.air_groups)
+                    crate::tfmt!(l.fmt_env_air_note, n = comps.air_groups)
                 };
-                summary = format!(
-                    "COMPARTMENTS | {} structural | {} sealed | {} exposed | doors {} closed/{} open{air_note} | hover a room",
-                    comps.regions.len(),
-                    comps.sealed_count(),
-                    comps.exposed_count(),
-                    comps.doors_closed,
-                    comps.doors_open,
+                summary = crate::tfmt!(
+                    l.fmt_ov_comps,
+                    s = comps.regions.len(),
+                    se = comps.sealed_count(),
+                    e = comps.exposed_count(),
+                    dc = comps.doors_closed,
+                    doors_open = comps.doors_open,
+                    note = air_note
                 );
             }
             OverlayMode::Ventilation => {
                 let v = &thermal.vent;
-                summary = format!(
-                    "VENTILATION | {} network{} | duct gas {:.0} | active {} | blowers {}/{} powered{} | tanks {:.0} kPa max",
-                    v.networks,
-                    if v.networks == 1 { "" } else { "s" },
-                    v.stored_mol,
-                    v.active_cells,
-                    v.blowers_on,
-                    v.blowers_total,
-                    if v.alert().is_some() {
-                        format!(" | {}", v.alert().unwrap())
+                summary = crate::tfmt!(
+                    l.fmt_ov_vent,
+                    n = v.networks,
+                    plural = if v.networks == 1 {
+                        ""
+                    } else {
+                        l.ov_vent_plural
+                    },
+                    g = format!("{:.0}", v.stored_mol),
+                    a = v.active_cells,
+                    on = v.blowers_on,
+                    total = v.blowers_total,
+                    alert = if loc::vent_alert_label(v, l).is_some() {
+                        crate::tfmt!(l.fmt_env_tanks_note, p = format!("{:.0}", v.max_tank_p))
                     } else {
                         String::new()
                     },
-                    v.max_tank_p,
+                    p = format!("{:.0}", v.max_tank_p)
                 );
             }
             OverlayMode::Atmosphere => {
                 let a = &thermal.atmo_summary;
                 let exposed = thermal.comps.exposed_count();
-                summary = format!(
-                    "ATMOSPHERE | pressure {:.0}–{:.0} kPa | O2 {:.1}–{:.1} kPa | retained {:.0}% | exposed {} | active {} | hover a tile",
-                    a.min_pressure,
-                    a.max_pressure,
-                    a.min_o2_partial,
-                    a.max_o2_partial,
-                    a.retained * 100.0,
-                    exposed,
-                    a.active_cells,
+                summary = crate::tfmt!(
+                    l.fmt_ov_atmo,
+                    pmin = format!("{:.0}", a.min_pressure),
+                    pmax = format!("{:.0}", a.max_pressure),
+                    omin = format!("{:.1}", a.min_o2_partial),
+                    omax = format!("{:.1}", a.max_o2_partial),
+                    r = format!("{:.0}", a.retained * 100.0),
+                    e = exposed,
+                    a = a.active_cells
                 );
             }
             OverlayMode::Off => {}
@@ -1425,15 +1664,15 @@ fn overlay_summary_system(
     // ---- atmosphere alert (visible even without the overlay) ----
     // Atmosphere loss outranks thermal warnings: air going out the hull is
     // the most time-critical thing on the ship.
-    let atmo_alert = thermal.atmo_summary.alert();
-    let vent_alert = thermal.vent.alert();
+    let atmo_alert = loc::atmo_alert_label(&thermal.atmo_summary, l);
+    let vent_alert = loc::vent_alert_label(&thermal.vent, l);
 
     // ---- thermal alert (always visible when something is wrong) ----
     let mut alert = String::new();
     let mut any_critical = false;
     if let Some(a) = atmo_alert {
         alert = a.to_string();
-        any_critical = alert.starts_with("ATMOSPHERE LOSS");
+        any_critical = thermal.atmo_summary.vacuum_cells > 0 || thermal.atmo_summary.low_cells > 0;
     } else if let Some(v) = vent_alert {
         alert = v.to_string();
     }
@@ -1441,10 +1680,10 @@ fn overlay_summary_system(
         match state {
             crate::thermal::ThermalState::Critical => {
                 any_critical = true;
-                alert = "REACTOR THERMAL CRITICAL — emergency power only".into();
+                alert = l.alert_reactor_crit.into();
             }
             crate::thermal::ThermalState::Overheat if alert.is_empty() => {
-                alert = "REACTOR OVERHEAT — derated, check cooling".into()
+                alert = l.alert_reactor_over.into()
             }
             crate::thermal::ThermalState::Overheat | crate::thermal::ThermalState::Normal => {}
         }
@@ -1453,7 +1692,7 @@ fn overlay_summary_system(
         if let crate::thermal::ThermalState::Critical = state {
             any_critical = true;
             if alert.is_empty() {
-                alert = "FABRICATOR THERMAL CRITICAL — production stopped".into();
+                alert = l.alert_fab_crit.into();
             }
         }
     }
@@ -1524,56 +1763,63 @@ pub fn task_label(
         Option<&Building>,
         Option<&MarkedForDeconstruct>,
     )>,
+    l: &Strings,
 ) -> String {
     match task {
-        CrewTask::Idle(cause) => cause.label(),
+        CrewTask::Idle(cause) => loc::idle_cause_label(cause, l),
         CrewTask::Haul(job) => {
             let kind = items
                 .get(job.item)
-                .map(|(_, _, i, ..)| i.kind.label())
-                .unwrap_or("item");
+                .map(|(_, _, i, ..)| loc::item_label(i.kind, l))
+                .unwrap_or(l.generic_item)
+                .to_string();
             match job.phase {
                 HaulPhase::ToItem | HaulPhase::PickingUp => {
-                    let dest = match job.dest {
-                        crate::crew::HaulDest::Storage => "storage".to_string(),
-                        crate::crew::HaulDest::Blueprint(_) => "a blueprint".to_string(),
-                        crate::crew::HaulDest::Machine(_) => "the fabricator".to_string(),
-                    };
-                    format!("Going to fetch {kind} for {dest}")
+                    crate::tfmt!(
+                        l.fmt_task_haul_going,
+                        kind = kind,
+                        dest = loc::haul_dest_label(job.dest, l)
+                    )
                 }
                 HaulPhase::ToDest | HaulPhase::Delivering => {
                     let dest = match job.dest {
                         crate::crew::HaulDest::Storage => job
                             .target_rack
-                            .and_then(|r| racks.get(r).ok().map(|(_, p, s, _, _)| (p, s)))
-                            .map(|(p, _)| format!("rack at ({},{})", p.x, p.y))
-                            .unwrap_or_else(|| "storage".to_string()),
-                        crate::crew::HaulDest::Blueprint(_) => "blueprint".to_string(),
-                        crate::crew::HaulDest::Machine(_) => "fabricator".to_string(),
+                            .and_then(|r| racks.get(r).ok().map(|(_, p, _, _, _)| *p))
+                            .map(|p| crate::tfmt!(l.fmt_rack_at, x = p.x, y = p.y))
+                            .unwrap_or_else(|| l.dest_storage.to_string()),
+                        crate::crew::HaulDest::Blueprint(_) => l.dest_blueprint.to_string(),
+                        crate::crew::HaulDest::Machine(_) => l.dest_machine.to_string(),
                     };
-                    format!("Carrying {kind} to {dest}")
+                    crate::tfmt!(l.fmt_task_haul_carrying, kind = kind, dest = dest)
                 }
             }
         }
         CrewTask::Build(job) => {
             if job.phase == crate::crew::WorkPhase::Working {
-                format!("Building ({:.0}s left)", job.timer.max(0.0))
+                crate::tfmt!(
+                    l.fmt_task_building,
+                    t = format!("{:.0}", job.timer.max(0.0))
+                )
             } else {
-                "Going to build".to_string()
+                l.task_going_build.to_string()
             }
         }
         CrewTask::Deconstruct(job) => {
             if job.phase == crate::crew::WorkPhase::Working {
-                format!("Deconstructing ({:.0}s left)", job.timer.max(0.0))
+                crate::tfmt!(l.fmt_task_demoing, t = format!("{:.0}", job.timer.max(0.0)))
             } else {
-                "Going to deconstruct".to_string()
+                l.task_going_demo.to_string()
             }
         }
         CrewTask::Operate(job) => {
             if job.phase == crate::crew::WorkPhase::Working {
-                format!("Operating fabricator ({:.0}s left)", job.timer.max(0.0))
+                crate::tfmt!(
+                    l.fmt_task_operating,
+                    t = format!("{:.0}", job.timer.max(0.0))
+                )
             } else {
-                "Going to operate fabricator".to_string()
+                l.task_going_operate.to_string()
             }
         }
     }
@@ -1588,37 +1834,34 @@ pub fn item_status(
     cooled: Option<&NoPathUntil>,
     crews: &Query<(Entity, &Crew, &CrewTask, &TilePos, &crate::crew::Movement)>,
     now: f64,
+    l: &Strings,
 ) -> String {
     if carried.is_some() {
         let carrier = carried
             .and_then(|c| crews.get(c.0).ok())
             .map(|(_, c, ..)| c.name.clone())
-            .unwrap_or_else(|| "someone".into());
-        format!("Being carried by {carrier}")
+            .unwrap_or_else(|| l.generic_someone.into());
+        crate::tfmt!(l.fmt_item_carried, name = carrier)
     } else if let Some(r) = reserved {
         let claimer = crews
             .get(r.0)
             .map(|(_, c, ..)| c.name.clone())
-            .unwrap_or_else(|_| "a crew member".into());
+            .unwrap_or_else(|_| l.generic_crew_member.into());
         let dest = crews
             .get(r.0)
             .ok()
             .and_then(|(_, _, t, ..)| match t {
-                CrewTask::Haul(j) => Some(match j.dest {
-                    crate::crew::HaulDest::Storage => "storage".to_string(),
-                    crate::crew::HaulDest::Blueprint(_) => "a blueprint".to_string(),
-                    crate::crew::HaulDest::Machine(_) => "the fabricator".to_string(),
-                }),
+                CrewTask::Haul(j) => Some(loc::haul_dest_label(j.dest, l)),
                 _ => None,
             })
-            .unwrap_or_else(|| "storage".into());
-        format!("Claimed by {claimer} for {dest}")
+            .unwrap_or_else(|| l.dest_storage.into());
+        crate::tfmt!(l.fmt_item_claimed, name = claimer, dest = dest)
     } else if marked.is_some() {
-        "Marked for hauling".to_string()
+        l.item_marked.to_string()
     } else if cooled.is_some_and(|c| c.0 > now) {
-        "Unreachable".to_string()
+        l.item_unreachable.to_string()
     } else {
-        "On the ground".to_string()
+        l.item_ground.to_string()
     }
 }
 
@@ -1715,6 +1958,7 @@ fn selection_panel_system(
     hud: Res<Hud>,
     selection: Res<Selection>,
     clock: Res<crate::simtime::SimClock>,
+    lang: Res<Lang>,
     mut commands: Commands,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &crate::crew::Movement)>,
     items: Query<
@@ -1729,21 +1973,23 @@ fn selection_panel_system(
         ),
         With<Item>,
     >,
-    racks_full: Query<(
-        Entity,
-        &TilePos,
-        &StorageCell,
-        Option<&Building>,
-        Option<&MarkedForDeconstruct>,
-    )>,
-    blueprints: Query<(Entity, &TilePos, &crate::building::Blueprint)>,
-    fabs: Query<(
-        Entity,
-        &TilePos,
-        &crate::production::Fabricator,
-        &PowerStatus,
-        Option<&MarkedForDeconstruct>,
-    )>,
+    (racks_full, blueprints, fabs): (
+        Query<(
+            Entity,
+            &TilePos,
+            &StorageCell,
+            Option<&Building>,
+            Option<&MarkedForDeconstruct>,
+        )>,
+        Query<(Entity, &TilePos, &crate::building::Blueprint)>,
+        Query<(
+            Entity,
+            &TilePos,
+            &crate::production::Fabricator,
+            &PowerStatus,
+            Option<&MarkedForDeconstruct>,
+        )>,
+    ),
     // Fabricators also carry Building; excluding them here lets the fabs
     // branch below show the order panel instead of the generic building one.
     buildings: Query<
@@ -1780,8 +2026,10 @@ fn selection_panel_system(
         Res<crate::ventilation::DuctGrid>,
     ),
     mut last_sig: Local<SelSig>,
+    mut last_lang: Local<Lang>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     // ---- selection panel: text lines ----
     let mut lines: Vec<(String, Color)> = Vec::new();
     let sig = match selection.0 {
@@ -1911,18 +2159,20 @@ fn selection_panel_system(
         Some(Selected::Crew(e)) => {
             if let Ok((_, crew, task, pos, mov)) = crews.get(e) {
                 lines.push((
-                    format!("Crew {} ({},{})", crew.name, pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_crew, name = crew.name, x = pos.x, y = pos.y),
                     crew.tint,
                 ));
-                lines.push((task_label(task, &items, &racks_full), Color::WHITE));
+                lines.push((task_label(task, &items, &racks_full, l), Color::WHITE));
                 match task {
                     CrewTask::Haul(job) => {
                         let detail = match job.phase {
                             HaulPhase::ToItem | HaulPhase::PickingUp => items
                                 .get(job.item)
                                 .ok()
-                                .map(|(_, p, ..)| format!("Target item at ({},{})", p.x, p.y))
-                                .unwrap_or_else(|| "Target item gone".into()),
+                                .map(|(_, p, ..)| {
+                                    crate::tfmt!(l.fmt_sel_target_item, x = p.x, y = p.y)
+                                })
+                                .unwrap_or_else(|| l.sel_target_gone.into()),
                             _ => match job.dest {
                                 crate::crew::HaulDest::Storage => job
                                     .target_rack
@@ -1930,94 +2180,105 @@ fn selection_panel_system(
                                         racks_full.get(r).ok().map(|(_, p, s, _, _)| (p, s))
                                     })
                                     .map(|(p, s)| {
-                                        format!("Deliver to rack ({},{}) [{}]", p.x, p.y, s.label())
+                                        crate::tfmt!(
+                                            l.fmt_sel_deliver_rack,
+                                            x = p.x,
+                                            y = p.y,
+                                            label = s.label()
+                                        )
                                     })
-                                    .unwrap_or_else(|| "No rack chosen".into()),
-                                crate::crew::HaulDest::Blueprint(_) => {
-                                    "Deliver to blueprint".into()
-                                }
-                                crate::crew::HaulDest::Machine(_) => "Load into fabricator".into(),
+                                    .unwrap_or_else(|| l.sel_no_rack.into()),
+                                crate::crew::HaulDest::Blueprint(_) => l.sel_deliver_bp.into(),
+                                crate::crew::HaulDest::Machine(_) => l.sel_load_fab.into(),
                             },
                         };
                         lines.push((detail, Color::srgb(0.75, 0.78, 0.82)));
                     }
-                    CrewTask::Build(_) => lines.push((
-                        "Target: construction blueprint".into(),
-                        Color::srgb(0.75, 0.78, 0.82),
-                    )),
-                    CrewTask::Deconstruct(_) => lines.push((
-                        "Target: building to tear down".into(),
-                        Color::srgb(0.75, 0.78, 0.82),
-                    )),
+                    CrewTask::Build(_) => {
+                        lines.push((l.sel_target_bp.into(), Color::srgb(0.75, 0.78, 0.82)))
+                    }
+                    CrewTask::Deconstruct(_) => {
+                        lines.push((l.sel_target_demo.into(), Color::srgb(0.75, 0.78, 0.82)))
+                    }
                     CrewTask::Operate(_) => {
-                        lines.push(("Target: fabricator".into(), Color::srgb(0.75, 0.78, 0.82)))
+                        lines.push((l.sel_target_fab.into(), Color::srgb(0.75, 0.78, 0.82)))
                     }
                     CrewTask::Idle(cause) => {
-                        lines.push((cause.label(), Color::srgb(0.7, 0.74, 0.8)));
+                        lines.push((loc::idle_cause_label(cause, l), Color::srgb(0.7, 0.74, 0.8)));
                     }
                 }
                 lines.push((
-                    format!(
-                        "Hauled: {} | Built: {} | Operated: {} | Path: {}",
-                        crew.delivered,
-                        crew.built,
-                        crew.operated,
-                        mov.path.len()
+                    crate::tfmt!(
+                        l.fmt_sel_counts,
+                        h = crew.delivered,
+                        b = crew.built,
+                        o = crew.operated,
+                        p = mov.path.len()
                     ),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
-                lines.push((
-                    "Work priorities live in the WORK tab [Tab] — click cells to steer this crew."
-                        .to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_work_hint.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             }
         }
         Some(Selected::Item(e)) => {
             if let Ok((_, pos, item, marked, reserved, carried, cooled)) = items.get(e) {
                 lines.push((
-                    format!("Item: {} ({},{})", item.kind.label(), pos.x, pos.y),
+                    crate::tfmt!(
+                        l.fmt_sel_item,
+                        kind = loc::item_label(item.kind, l),
+                        x = pos.x,
+                        y = pos.y
+                    ),
                     Color::srgb(0.95, 0.85, 0.55),
                 ));
                 lines.push((
-                    item_status(reserved, carried, marked, cooled, &crews, now),
+                    item_status(reserved, carried, marked, cooled, &crews, now, l),
                     Color::WHITE,
                 ));
                 if let Some(c) = cooled {
                     if c.0 > now {
                         lines.push((
-                            format!(
-                                "Unreachable (retry in {})",
-                                crate::simtime::format_sim_duration(c.0 - now)
+                            crate::tfmt!(
+                                l.fmt_sel_unreachable,
+                                t = crate::simtime::format_sim_duration(c.0 - now)
                             ),
                             Color::srgb(1.0, 0.45, 0.4),
                         ));
                     }
                 }
-                lines.push((
-                    "[T] toggle haul mark".to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_toggle_mark.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             }
         }
         Some(Selected::Rack(e)) => {
             if let Ok((_, pos, cell, _, demo)) = racks_full.get(e) {
                 lines.push((
-                    format!("Storage rack ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_rack, x = pos.x, y = pos.y),
                     Color::srgb(0.6, 0.9, 0.8),
                 ));
                 let counts = ItemKind::ALL
                     .iter()
-                    .map(|k| format!("{}: {}", k.label(), cell.counts[k.index()]))
+                    .map(|k| {
+                        crate::tfmt!(
+                            l.fmt_sel_rack_counts,
+                            kind = loc::item_label(*k, l),
+                            n = cell.counts[k.index()]
+                        )
+                    })
                     .collect::<Vec<_>>()
                     .join(" | ");
                 lines.push((counts, Color::WHITE));
+                let accepts = if cell.allowed.iter().all(|&a| a) {
+                    l.filter_any.to_string()
+                } else {
+                    ItemKind::ALL
+                        .iter()
+                        .filter(|k| cell.allowed[k.index()])
+                        .map(|k| loc::item_short(*k, l))
+                        .collect::<Vec<_>>()
+                        .join("+")
+                };
                 lines.push((
-                    format!(
-                        "Free slots: {} | Accepts: {}",
-                        cell.free(),
-                        cell.filter_label()
-                    ),
+                    crate::tfmt!(l.fmt_sel_rack_free, free = cell.free(), accepts = accepts),
                     if cell.free() == 0 {
                         Color::srgb(1.0, 0.45, 0.4)
                     } else {
@@ -2025,13 +2286,10 @@ fn selection_panel_system(
                     },
                 ));
                 if demo.is_some() {
-                    lines.push((
-                        "MARKED FOR DECONSTRUCTION".into(),
-                        Color::srgb(1.0, 0.7, 0.25),
-                    ));
+                    lines.push((l.sel_marked_demo.into(), Color::srgb(1.0, 0.7, 0.25)));
                 }
                 lines.push((
-                    "Toggle which kinds this rack accepts (below).".to_string(),
+                    l.sel_rack_filter_hint.to_string(),
                     Color::srgb(0.6, 0.66, 0.72),
                 ));
             }
@@ -2039,22 +2297,34 @@ fn selection_panel_system(
         Some(Selected::Blueprint(e)) => {
             if let Ok((_, pos, bp)) = blueprints.get(e) {
                 lines.push((
-                    format!("Blueprint: {} at ({},{})", bp.kind.label(), pos.x, pos.y),
+                    crate::tfmt!(
+                        l.fmt_sel_blueprint,
+                        kind = loc::building_label(bp.kind, l),
+                        x = pos.x,
+                        y = pos.y
+                    ),
                     Color::srgb(0.55, 0.85, 1.0),
                 ));
-                lines.push((format!("Materials: {}", bp.materials_label()), Color::WHITE));
+                lines.push((
+                    crate::tfmt!(l.fmt_sel_materials, m = bp.materials_label_loc(l)),
+                    Color::WHITE,
+                ));
                 for (kind, miss) in bp.missing_list() {
                     lines.push((
-                        format!("  waiting for {miss} more {}", kind.label()),
+                        crate::tfmt!(
+                            l.fmt_sel_waiting_for,
+                            n = miss,
+                            kind = loc::item_label(kind, l)
+                        ),
                         Color::srgb(1.0, 0.75, 0.4),
                     ));
                 }
                 if bp.fully_supplied() {
                     lines.push((
                         if bp.progress > 0.0 {
-                            format!("Under construction — {}%", (bp.progress * 100.0) as u32)
+                            crate::tfmt!(l.fmt_sel_constructing, p = (bp.progress * 100.0) as u32)
                         } else {
-                            "Fully supplied — waiting for a builder".to_string()
+                            l.sel_bp_ready.to_string()
                         },
                         Color::srgb(0.55, 0.9, 0.6),
                     ));
@@ -2075,14 +2345,19 @@ fn selection_panel_system(
                     });
             if let Some((pos, output, on, status, demo, tstate)) = reactor {
                 lines.push((
-                    format!("Starter Reactor ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_reactor, x = pos.x, y = pos.y),
                     Color::srgb(0.6, 1.0, 0.75),
                 ));
                 lines.push((
-                    format!(
-                        "Output: {output} PU | Status: {} | Grid: {}",
-                        if on { "online" } else { "standby" },
-                        status.label(),
+                    crate::tfmt!(
+                        l.fmt_sel_reactor_line,
+                        out = output,
+                        status = if on {
+                            l.reactor_online
+                        } else {
+                            l.reactor_standby
+                        },
+                        grid = loc::power_status_label(*status, l)
                     ),
                     if status.ok() && on {
                         Color::srgb(0.55, 1.0, 0.65)
@@ -2094,10 +2369,10 @@ fn selection_panel_system(
                 let temp = thermal.grid.amb_at(*pos);
                 let tstate = tstate.copied().unwrap_or_default();
                 lines.push((
-                    format!(
-                        "Core: {:.0}°C — {} | heat follows load",
-                        temp,
-                        tstate.label()
+                    crate::tfmt!(
+                        l.fmt_sel_core,
+                        t = format!("{temp:.0}"),
+                        state = loc::thermal_state_label(tstate, l)
                     ),
                     match tstate {
                         crate::thermal::ThermalState::Normal => Color::WHITE,
@@ -2106,21 +2381,20 @@ fn selection_panel_system(
                     },
                 ));
                 if tstate == crate::thermal::ThermalState::Critical {
-                    lines.push((
-                        "CRITICAL: emergency power only (pumps stay online). \
-                         Restore cooling — View [P] → Coolant."
-                            .to_string(),
-                        Color::srgb(1.0, 0.6, 0.45),
-                    ));
+                    lines.push((l.sel_reactor_crit.to_string(), Color::srgb(1.0, 0.6, 0.45)));
                 }
                 if let Some(net) = thermal.power.device_net.get(&e) {
                     if let Some(info) = thermal.power.networks.get(*net) {
                         lines.push((
-                            format!("Network {}: {}", net + 1, info.summary()),
+                            crate::tfmt!(
+                                l.fmt_sel_net,
+                                i = net + 1,
+                                summary = loc::power_net_summary(info, l)
+                            ),
                             Color::WHITE,
                         ));
                         lines.push((
-                            format!("Status: {}", info.status_label()),
+                            crate::tfmt!(l.fmt_sel_net_status, s = info.status_label()),
                             if info.generation == 0 || info.demand > info.generation {
                                 Color::srgb(1.0, 0.6, 0.45)
                             } else {
@@ -2130,27 +2404,21 @@ fn selection_panel_system(
                     }
                 }
                 if demo.is_some() {
-                    lines.push((
-                        "MARKED FOR DECONSTRUCTION".into(),
-                        Color::srgb(1.0, 0.7, 0.25),
-                    ));
+                    lines.push((l.sel_marked_demo.into(), Color::srgb(1.0, 0.7, 0.25)));
                 }
-                lines.push((
-                    "Toggle the reactor below; inspect cables with Power [P].".to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_reactor_hint.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             } else if let (Ok(door), Ok((_, pos, _, demo))) =
                 (thermal.doors.get(e), buildings.get(e))
             {
                 lines.push((
-                    format!("Door ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_door, x = pos.x, y = pos.y),
                     Color::srgb(0.65, 0.9, 1.0),
                 ));
                 lines.push((
-                    format!(
-                        "State: {} | Mode: {}",
-                        door.phase.label(),
-                        door.mode.label()
+                    crate::tfmt!(
+                        l.fmt_sel_door_state,
+                        state = loc::door_phase_label(door.phase, l),
+                        mode = loc::door_mode_label(door.mode, l)
                     ),
                     match door.mode {
                         crate::airtight::DoorMode::LockClosed => Color::srgb(1.0, 0.55, 0.45),
@@ -2158,12 +2426,12 @@ fn selection_panel_system(
                     },
                 ));
                 lines.push((
-                    format!(
-                        "Passage: {} ({})",
-                        door.axis.label(),
-                        match door.axis {
-                            crate::airtight::DoorAxis::Ns => "walls east+west",
-                            crate::airtight::DoorAxis::Ew => "walls north+south",
+                    crate::tfmt!(
+                        l.fmt_sel_door_passage,
+                        axis = door.axis.label(),
+                        walls = match door.axis {
+                            crate::airtight::DoorAxis::Ns => l.door_walls_ew,
+                            crate::airtight::DoorAxis::Ew => l.door_walls_ns,
                         }
                     ),
                     Color::srgb(0.75, 0.78, 0.82),
@@ -2176,9 +2444,9 @@ fn selection_panel_system(
                     .find(|p| p.entity == Some(e) || p.pos == *pos);
                 let region_label = |id: u16| {
                     if id == crate::airtight::NO_REGION {
-                        "structure".to_string()
+                        l.sel_door_structure.to_string()
                     } else {
-                        format!("Compartment {}", id + 1)
+                        crate::tfmt!(l.fmt_sel_compartment, n = id + 1)
                     }
                 };
                 if let Some(p) = portal {
@@ -2188,11 +2456,15 @@ fn selection_panel_system(
                         && thermal.comps.air_group[a as usize]
                             == thermal.comps.air_group[b as usize];
                     lines.push((
-                        format!(
-                            "Sides: {} {} {}",
-                            region_label(a),
-                            if joined { "<-air-linked" } else { "| sealed |" },
-                            region_label(b)
+                        crate::tfmt!(
+                            l.fmt_sel_sides,
+                            a = region_label(a),
+                            link = if joined {
+                                l.door_air_linked
+                            } else {
+                                l.door_sealed_sep
+                            },
+                            b = region_label(b)
                         ),
                         if joined {
                             Color::srgb(0.6, 1.0, 0.7)
@@ -2201,41 +2473,35 @@ fn selection_panel_system(
                         },
                     ));
                     lines.push((
-                        format!(
-                            "Airtight: {}",
-                            if door.sealed() {
-                                "sealed boundary"
+                        crate::tfmt!(
+                            l.fmt_sel_airtight,
+                            s = if door.sealed() {
+                                l.sel_boundary_sealed
                             } else {
-                                "open — air flows"
+                                l.sel_boundary_open
                             }
                         ),
                         Color::WHITE,
                     ));
                 }
                 if demo.is_some() {
-                    lines.push((
-                        "MARKED FOR DECONSTRUCTION".into(),
-                        Color::srgb(1.0, 0.7, 0.25),
-                    ));
+                    lines.push((l.sel_marked_demo.into(), Color::srgb(1.0, 0.7, 0.25)));
                 }
-                lines.push((
-                    "Set the door mode below; View [P] → Compartments.".to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_door_hint.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             } else if let (Ok((_, _, vent)), Ok((_, pos, _, _))) =
                 (vents_q.get(e), buildings.get(e))
             {
                 lines.push((
-                    format!("Vent ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_vent, x = pos.x, y = pos.y),
                     Color::srgb(0.65, 0.9, 1.0),
                 ));
                 let p_room = thermal.atmo.pressure_at(*pos, &thermal.grid);
                 let p_duct = ducts.pressure_at(*pos);
                 lines.push((
-                    format!(
-                        "Mode: {} | {}",
-                        vent.mode.label(),
-                        if vent.open { "open" } else { "closed" }
+                    crate::tfmt!(
+                        l.fmt_sel_vent_mode,
+                        mode = loc::vent_mode_label(vent.mode, l),
+                        open = if vent.open { l.val_open } else { l.val_closed }
                     ),
                     if vent.open {
                         Color::WHITE
@@ -2244,37 +2510,33 @@ fn selection_panel_system(
                     },
                 ));
                 lines.push((
-                    format!(
-                        "Room {:.0} kPa | duct {:.0} kPa | rate {:.1} mol/s",
-                        p_room, p_duct, vent.last_rate
+                    crate::tfmt!(
+                        l.fmt_sel_vent_pressures,
+                        room = format!("{p_room:.0}"),
+                        duct = format!("{p_duct:.0}"),
+                        rate = format!("{:.1}", vent.last_rate)
                     ),
                     Color::WHITE,
                 ));
                 if !ducts.has(*pos) {
-                    lines.push((
-                        "NO DUCT UNDER THIS VENT".into(),
-                        Color::srgb(1.0, 0.55, 0.45),
-                    ));
+                    lines.push((l.sel_no_duct_vent.into(), Color::srgb(1.0, 0.55, 0.45)));
                 }
-                lines.push((
-                    "Vents exchange only with their own tile; doors stay airtight.".to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_vent_hint.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             } else if let (Ok((_, _, blower)), Ok((_, pos, _, _))) =
                 (blowers_q.get(e), buildings.get(e))
             {
                 lines.push((
-                    format!("Blower ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_blower, x = pos.x, y = pos.y),
                     Color::srgb(0.65, 0.9, 1.0),
                 ));
                 let dd = blower.dir.delta();
                 let out_p = TilePos::new(pos.x + dd.x, pos.y + dd.y);
                 lines.push((
-                    format!(
-                        "Push: {} | {} | flow {:.1} mol/s",
-                        blower.dir.label(),
-                        if blower.enabled { "on" } else { "off" },
-                        blower.last_flow
+                    crate::tfmt!(
+                        l.fmt_sel_blower_push,
+                        dir = loc::dir4_label(blower.dir, l),
+                        on = if blower.enabled { l.val_on } else { l.val_off },
+                        flow = format!("{:.1}", blower.last_flow)
                     ),
                     if blower.enabled {
                         Color::WHITE
@@ -2283,34 +2545,35 @@ fn selection_panel_system(
                     },
                 ));
                 lines.push((
-                    format!(
-                        "Inlet {:.0} kPa | outlet {:.0} kPa",
-                        ducts.pressure_at(*pos),
-                        ducts.pressure_at(out_p)
+                    crate::tfmt!(
+                        l.fmt_sel_blower_p,
+                        inlet = format!("{:.0}", ducts.pressure_at(*pos)),
+                        outlet = format!("{:.0}", ducts.pressure_at(out_p))
                     ),
                     Color::WHITE,
                 ));
                 if !ducts.has(*pos) {
-                    lines.push((
-                        "NO DUCT UNDER THIS BLOWER".into(),
-                        Color::srgb(1.0, 0.55, 0.45),
-                    ));
+                    lines.push((l.sel_no_duct_blower.into(), Color::srgb(1.0, 0.55, 0.45)));
                 }
             } else if let (Ok((_, _, tank)), Ok((_, pos, _, _))) =
                 (tanks_q.get(e), buildings.get(e))
             {
                 lines.push((
-                    format!("Gas Tank ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_tank, x = pos.x, y = pos.y),
                     Color::srgb(0.65, 0.9, 1.0),
                 ));
                 let p = tank.pressure();
                 lines.push((
-                    format!(
-                        "Valve: {} | {:.0} kPa | {:.0}/{} units",
-                        if tank.valve_open { "open" } else { "closed" },
-                        p,
-                        tank.total(),
-                        crate::ventilation::TANK_MOL as u32
+                    crate::tfmt!(
+                        l.fmt_sel_tank_valve,
+                        valve = if tank.valve_open {
+                            l.val_open
+                        } else {
+                            l.val_closed
+                        },
+                        p = format!("{p:.0}"),
+                        units = format!("{:.0}", tank.total()),
+                        cap = crate::ventilation::TANK_MOL as u32
                     ),
                     if p > crate::ventilation::TANK_HIGH_KPA {
                         Color::srgb(1.0, 0.55, 0.45)
@@ -2323,25 +2586,27 @@ fn selection_panel_system(
                 let m = &tank.mix;
                 let t = m.total();
                 lines.push((
-                    format!(
-                        "O2 {:.0}% | inert {:.0}% | CO2 {:.1}% | pollutant {:.1}% | {:.0}°C",
-                        if t > 0.0 { m.mol[0] / t * 100.0 } else { 0.0 },
-                        if t > 0.0 { m.mol[1] / t * 100.0 } else { 0.0 },
-                        if t > 0.0 { m.mol[2] / t * 100.0 } else { 0.0 },
-                        if t > 0.0 { m.mol[3] / t * 100.0 } else { 0.0 },
-                        tank.temp
+                    crate::tfmt!(
+                        l.fmt_sel_tank_mix,
+                        o2 = format!("{:.0}", if t > 0.0 { m.mol[0] / t * 100.0 } else { 0.0 }),
+                        inert = format!("{:.0}", if t > 0.0 { m.mol[1] / t * 100.0 } else { 0.0 }),
+                        co2 = format!("{:.1}", if t > 0.0 { m.mol[2] / t * 100.0 } else { 0.0 }),
+                        pol = format!("{:.1}", if t > 0.0 { m.mol[3] / t * 100.0 } else { 0.0 }),
+                        t = format!("{:.0}", tank.temp)
                     ),
                     Color::WHITE,
                 ));
                 if !ducts.has(*pos) {
-                    lines.push((
-                        "NO DUCT UNDER THIS TANK".into(),
-                        Color::srgb(1.0, 0.55, 0.45),
-                    ));
+                    lines.push((l.sel_no_duct_tank.into(), Color::srgb(1.0, 0.55, 0.45)));
                 }
             } else if let Ok((_, pos, b, demo)) = buildings.get(e) {
                 lines.push((
-                    format!("{} ({},{})", b.kind.label(), pos.x, pos.y),
+                    crate::tfmt!(
+                        l.fmt_sel_building,
+                        kind = loc::building_label(b.kind, l),
+                        x = pos.x,
+                        y = pos.y
+                    ),
                     Color::srgb(0.85, 0.85, 0.9),
                 ));
                 let net = thermal
@@ -2353,12 +2618,12 @@ fn selection_panel_system(
                     BuildingKind::Pump => {
                         if let Some(n) = net {
                             lines.push((
-                                format!(
-                                    "Loop: {} | flow {:.1} ({} pump{} on)",
-                                    n.status_label(),
-                                    n.flow,
-                                    n.powered_pumps,
-                                    if n.powered_pumps == 1 { "" } else { "s" }
+                                crate::tfmt!(
+                                    l.fmt_sel_loop,
+                                    status = loc::coolant_status_label(&n, l),
+                                    flow = format!("{:.1}", n.flow),
+                                    pumps = n.powered_pumps,
+                                    plural = if n.powered_pumps == 1 { "" } else { "s" }
                                 ),
                                 if n.powered_pumps > 0 {
                                     Color::WHITE
@@ -2373,9 +2638,11 @@ fn selection_panel_system(
                         let w = thermal.water.amount_at(*pos);
                         if let Some(n) = net {
                             lines.push((
-                                format!(
-                                    "Pickup: {:.0}H/s | water {:.1} @ {:.0}°C",
-                                    n.pickup_rate, w, tw
+                                crate::tfmt!(
+                                    l.fmt_sel_pickup,
+                                    rate = format!("{:.0}", n.pickup_rate),
+                                    w = format!("{w:.1}"),
+                                    t = format!("{tw:.0}")
                                 ),
                                 Color::WHITE,
                             ));
@@ -2385,10 +2652,11 @@ fn selection_panel_system(
                         let tw = thermal.water.temp_at(*pos);
                         if let Some(n) = net {
                             lines.push((
-                                format!(
-                                    "Dumping: {:.0}H/s | water at {:.0}°C",
-                                    n.dump_rate / (n.radiators.max(1) as f32),
-                                    tw
+                                crate::tfmt!(
+                                    l.fmt_sel_dumping,
+                                    rate =
+                                        format!("{:.0}", n.dump_rate / (n.radiators.max(1) as f32)),
+                                    t = format!("{tw:.0}")
                                 ),
                                 Color::WHITE,
                             ));
@@ -2397,11 +2665,15 @@ fn selection_panel_system(
                     BuildingKind::Reservoir => {
                         let w = thermal.water.amount_at(*pos);
                         lines.push((
-                            format!(
-                                "Stored: {:.0}/{:.0} water @ {:.0}°C",
-                                w,
-                                crate::coolant::PIPE_TILE_CAP + crate::coolant::RESERVOIR_ADD_CAP,
-                                thermal.water.temp_at(*pos)
+                            crate::tfmt!(
+                                l.fmt_sel_reservoir,
+                                w = format!("{w:.0}"),
+                                cap = format!(
+                                    "{:.0}",
+                                    crate::coolant::PIPE_TILE_CAP
+                                        + crate::coolant::RESERVOIR_ADD_CAP
+                                ),
+                                t = format!("{:.0}", thermal.water.temp_at(*pos))
                             ),
                             Color::WHITE,
                         ));
@@ -2411,30 +2683,27 @@ fn selection_panel_system(
                 if demo.is_some() {
                     lines.push((
                         if b.demo_progress > 0.0 {
-                            format!("DECONSTRUCTING — {}%", (b.demo_progress * 100.0) as u32)
+                            crate::tfmt!(l.fmt_sel_demoing, p = (b.demo_progress * 100.0) as u32)
                         } else {
-                            "MARKED FOR DECONSTRUCTION — waiting for a crew".to_string()
+                            l.sel_demo_waiting.to_string()
                         },
                         Color::srgb(1.0, 0.7, 0.25),
                     ));
                 } else {
-                    lines.push((
-                        "Use Deconstruct (BUILD bar) to tear this down.".to_string(),
-                        Color::srgb(0.6, 0.66, 0.72),
-                    ));
+                    lines.push((l.sel_demo_hint.to_string(), Color::srgb(0.6, 0.66, 0.72)));
                 }
             } else if let Ok((_, pos, f, power, demo)) = fabs.get(e) {
                 let state = f.state();
                 lines.push((
-                    format!("Fabricator ({},{})", pos.x, pos.y),
+                    crate::tfmt!(l.fmt_sel_fab, x = pos.x, y = pos.y),
                     Color::srgb(0.75, 0.8, 1.0),
                 ));
                 lines.push((
-                    format!(
-                        "State: {} | in: {} ore | out: {} parts",
-                        state.label(),
-                        f.input[ItemKind::Ore.index()],
-                        f.output[ItemKind::Part.index()]
+                    crate::tfmt!(
+                        l.fmt_sel_fab_state,
+                        state = loc::machine_state_label(state, l),
+                        ore = f.input[ItemKind::Ore.index()],
+                        parts = f.output[ItemKind::Part.index()]
                     ),
                     match state {
                         crate::production::MachineState::Working => Color::srgb(0.55, 1.0, 0.65),
@@ -2445,52 +2714,44 @@ fn selection_panel_system(
                     },
                 ));
                 let order = match &f.order {
-                    Some(o) if o.repeat => "Repeat (endless)".to_string(),
-                    Some(o) => format!("{} batch(es) left", o.batches),
-                    None => "No order".to_string(),
+                    Some(o) if o.repeat => l.sel_order_repeat.to_string(),
+                    Some(o) => crate::tfmt!(l.fmt_sel_order_batches, n = o.batches),
+                    None => l.sel_no_order.to_string(),
                 };
                 lines.push((order, Color::srgb(0.75, 0.78, 0.82)));
                 if state == crate::production::MachineState::Working {
                     lines.push((
-                        format!("Progress: {}%", (f.progress * 100.0) as u32),
+                        crate::tfmt!(l.fmt_sel_fab_progress, p = (f.progress * 100.0) as u32),
                         Color::srgb(0.55, 1.0, 0.65),
                     ));
                 }
                 if !power.ok() {
                     lines.push((
-                        format!("POWER: {} — machine halted", power.label()),
+                        crate::tfmt!(
+                            l.fmt_sel_power_lost,
+                            status = loc::power_status_label(*power, l)
+                        ),
                         Color::srgb(1.0, 0.5, 0.4),
                     ));
                 }
                 if !power.ok() {
                     lines.push((
-                        format!("POWER: {} — machine halted", power.label()),
+                        crate::tfmt!(
+                            l.fmt_sel_power_lost,
+                            status = loc::power_status_label(*power, l)
+                        ),
                         Color::srgb(1.0, 0.5, 0.4),
                     ));
                 }
                 if demo.is_some() {
-                    lines.push((
-                        "MARKED FOR DECONSTRUCTION".into(),
-                        Color::srgb(1.0, 0.7, 0.25),
-                    ));
+                    lines.push((l.sel_marked_demo.into(), Color::srgb(1.0, 0.7, 0.25)));
                 }
-                lines.push((
-                    "Recipe: 2 Ore -> 1 Part (6 ship minutes)".to_string(),
-                    Color::srgb(0.6, 0.66, 0.72),
-                ));
+                lines.push((l.sel_fab_recipe.to_string(), Color::srgb(0.6, 0.66, 0.72)));
             }
         }
         None => {
-            lines.push((
-                "Nothing selected — click a crew member, item, rack, building or blueprint."
-                    .to_string(),
-                Color::srgb(0.6, 0.66, 0.72),
-            ));
-            lines.push((
-                "Build with the BUILD bar, then watch the crew deliver materials and construct."
-                    .to_string(),
-                Color::srgb(0.6, 0.66, 0.72),
-            ));
+            lines.push((l.sel_none_a.to_string(), Color::srgb(0.6, 0.66, 0.72)));
+            lines.push((l.sel_none_b.to_string(), Color::srgb(0.6, 0.66, 0.72)));
         }
     }
 
@@ -2511,18 +2772,19 @@ fn selection_panel_system(
     }
 
     // ---- selection panel: re-purposable buttons ----
-    if *last_sig != sig {
+    if *last_sig != sig || *last_lang != *lang {
+        *last_lang = *lang;
         *last_sig = sig.clone();
         let cfgs: Vec<BtnCfg> = match &sig {
             SelSig::None => Vec::new(),
             SelSig::Crew { .. } => {
-                vec![BtnCfg::new("Open WORK [Tab]", Action::ToggleWorkTab)]
+                vec![BtnCfg::new(l.work_open_btn, Action::ToggleWorkTab)]
             }
             SelSig::Item { e, marked } => vec![BtnCfg::new(
                 if *marked {
-                    "Unmark haul [T]"
+                    format!("{} [T]", l.btn_unmark_haul)
                 } else {
-                    "Mark for haul [T]"
+                    format!("{} [T]", l.btn_mark_haul)
                 },
                 Action::ToggleMark { item: *e },
             )],
@@ -2534,8 +2796,12 @@ fn selection_panel_system(
                     v.push(BtnCfg::new(
                         format!(
                             "{}:{}",
-                            if allowed[k.index()] { "allow" } else { "deny" },
-                            k.label()
+                            if allowed[k.index()] {
+                                l.btn_allow
+                            } else {
+                                l.btn_deny
+                            },
+                            loc::item_label(k, l)
                         ),
                         Action::SetRackFilter {
                             rack: *e,
@@ -2546,12 +2812,12 @@ fn selection_panel_system(
                 }
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2559,18 +2825,22 @@ fn selection_panel_system(
             }
             SelSig::Generator { e, on, demo, .. } => {
                 let mut v = vec![BtnCfg::new(
-                    if *on { "Standby" } else { "Online" },
+                    if *on {
+                        l.btn_reactor_standby
+                    } else {
+                        l.btn_reactor_on
+                    },
                     Action::SetGeneratorOn { gen: *e, on: !*on },
                 )
                 .active(*on)];
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2585,18 +2855,21 @@ fn selection_panel_system(
                 let mut v: Vec<BtnCfg> = crate::airtight::DoorMode::ALL
                     .iter()
                     .map(|&m| {
-                        BtnCfg::new(m.label(), Action::SetDoorMode { door: *e, mode: m })
-                            .active(m == current)
+                        BtnCfg::new(
+                            loc::door_mode_label(m, l),
+                            Action::SetDoorMode { door: *e, mode: m },
+                        )
+                        .active(m == current)
                     })
                     .collect();
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2616,12 +2889,19 @@ fn selection_panel_system(
                 let mut v: Vec<BtnCfg> = crate::ventilation::VentMode::ALL
                     .iter()
                     .map(|&m| {
-                        BtnCfg::new(m.label(), Action::SetVentMode { vent: *e, mode: m })
-                            .active(m == current)
+                        BtnCfg::new(
+                            loc::vent_mode_label(m, l),
+                            Action::SetVentMode { vent: *e, mode: m },
+                        )
+                        .active(m == current)
                     })
                     .collect();
                 v.push(BtnCfg::new(
-                    if *open { "Close vent" } else { "Open vent" },
+                    if *open {
+                        l.btn_close_vent
+                    } else {
+                        l.btn_open_vent
+                    },
                     Action::SetVentOpen {
                         vent: *e,
                         open: !*open,
@@ -2629,12 +2909,12 @@ fn selection_panel_system(
                 ));
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2650,12 +2930,15 @@ fn selection_panel_system(
                 let mut v: Vec<BtnCfg> = crate::ventilation::Dir4::ALL
                     .iter()
                     .map(|&d| {
-                        BtnCfg::new(d.label(), Action::SetBlowerDir { blower: *e, dir: d })
-                            .active(d == current)
+                        BtnCfg::new(
+                            loc::dir4_label(d, l),
+                            Action::SetBlowerDir { blower: *e, dir: d },
+                        )
+                        .active(d == current)
                     })
                     .collect();
                 v.push(BtnCfg::new(
-                    if *on { "Stop" } else { "Run" },
+                    if *on { l.btn_stop } else { l.btn_run },
                     Action::SetBlowerOn {
                         blower: *e,
                         on: !*on,
@@ -2663,12 +2946,12 @@ fn selection_panel_system(
                 ));
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2677,9 +2960,9 @@ fn selection_panel_system(
             SelSig::Tank { e, valve, demo } => {
                 let mut v = vec![BtnCfg::new(
                     if *valve {
-                        "Valve: close"
+                        format!("{}: {}", l.valve_label, l.btn_close)
                     } else {
-                        "Valve: open"
+                        format!("{}: {}", l.valve_label, l.btn_open)
                     },
                     Action::SetTankValve {
                         tank: *e,
@@ -2688,30 +2971,30 @@ fn selection_panel_system(
                 )];
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
                 v
             }
             SelSig::Blueprint { e } => vec![BtnCfg::new(
-                "Cancel blueprint (refund)",
+                l.btn_cancel_blueprint,
                 Action::CancelBlueprint { blueprint: *e },
             )],
             SelSig::Building { e, demo, .. } => {
                 if *demo {
                     vec![BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     )]
                 } else {
                     vec![BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     )]
                 }
@@ -2724,39 +3007,43 @@ fn selection_panel_system(
             } => {
                 let mut v = vec![
                     BtnCfg::new(
-                        "+1 batch",
+                        l.btn_plus1,
                         Action::FabAddOrder {
                             fab: *e,
                             batches: 1,
                         },
                     ),
                     BtnCfg::new(
-                        "+5",
+                        l.btn_plus5,
                         Action::FabAddOrder {
                             fab: *e,
                             batches: 5,
                         },
                     ),
                     BtnCfg::new(
-                        if *repeat { "Repeat: ON" } else { "Repeat: OFF" },
+                        if *repeat {
+                            l.btn_repeat_on
+                        } else {
+                            l.btn_repeat_off
+                        },
                         Action::FabRepeat { fab: *e },
                     )
                     .active(*repeat),
                 ];
                 if *ordered {
                     v.push(BtnCfg::new(
-                        "Clear order",
+                        l.btn_clear_order,
                         Action::FabClearOrder { fab: *e },
                     ));
                 }
                 if *demo {
                     v.push(BtnCfg::new(
-                        "Cancel deconstruction",
+                        l.btn_cancel_demo,
                         Action::UnmarkDeconstruct { building: *e },
                     ));
                 } else {
                     v.push(BtnCfg::new(
-                        "Deconstruct",
+                        l.btn_deconstruct,
                         Action::MarkDeconstruct { building: *e },
                     ));
                 }
@@ -2786,6 +3073,7 @@ fn selection_panel_system(
 #[allow(clippy::too_many_arguments)]
 fn hud_update_system(
     hud: Res<Hud>,
+    lang: Res<Lang>,
     // Real time: the UI refresh cadence is wall-clock (the virtual clock
     // runs at BASE_SIM_RATE × game speed and pauses with the game).
     time: Res<Time<Real>>,
@@ -2853,16 +3141,15 @@ fn hud_update_system(
             bg.0 = want;
         }
     }
+    let l = strings(*lang);
     if let Ok((mut text, _, _)) = texts.get_mut(hud.tool_hint) {
         let want = match build_mode.0 {
-            Some(Tool::Build(kind)) => format!(
-                "Placing {} — click the map ({:?} parts) | Esc to cancel",
-                kind.label(),
-                crate::building::def(kind).cost
+            Some(Tool::Build(kind)) => crate::tfmt!(
+                l.fmt_hint_place,
+                kind = loc::building_label(kind, l),
+                parts = format!("{:?}", crate::building::def(kind).cost)
             ),
-            Some(Tool::Deconstruct) => {
-                "Click a building to mark it for deconstruction | Esc to cancel".to_string()
-            }
+            Some(Tool::Deconstruct) => l.hint_deconstruct.to_string(),
             None => String::new(),
         };
         set_text_if_changed(&mut text, want);
@@ -2894,9 +3181,9 @@ fn hud_update_system(
     if let Ok((mut text, _, _)) = texts.get_mut(hud.ship_time) {
         set_text_if_changed(
             &mut text,
-            format!(
-                "SHIP TIME {}",
-                crate::simtime::format_sim_stamp(clock.now())
+            crate::tfmt!(
+                l.fmt_hud_ship_time,
+                time = crate::simtime::format_sim_stamp(clock.now())
             ),
         );
     }
@@ -2910,9 +3197,14 @@ fn hud_update_system(
         .filter(|(_, _, t, ..)| matches!(t, CrewTask::Idle(_)))
         .count();
     if let Ok((mut text, mut color, _)) = texts.get_mut(hud.stats) {
-        let want = format!(
-            "Marked: {marked} | Storage: {stored}/{cap} | Parts {} | Built {} | Idle {}/4",
-            stats.produced, stats.built, idle,
+        let want = crate::tfmt!(
+            l.fmt_hud_stats,
+            marked = marked,
+            stored = stored,
+            cap = cap,
+            parts = stats.produced,
+            built = stats.built,
+            idle = idle
         );
         set_text_if_changed(&mut text, want);
         let want_c = if cap == stored {
@@ -2935,15 +3227,17 @@ fn hud_update_system(
         };
         if let Ok((mut text, mut color, mut vis)) = texts.get_mut(*chip) {
             *vis = Visibility::Visible;
-            let mut line = format!(
-                "[{}] {}: {}",
-                if mov.path.is_empty() { "·" } else { ">" },
-                crew.name,
-                task_label(task, &items, &racks)
+            let mut line = crate::tfmt!(
+                l.fmt_chip,
+                arrow = if mov.path.is_empty() { "·" } else { ">" },
+                name = crew.name,
+                task = task_label(task, &items, &racks, l)
             );
-            line.push_str(&format!(
-                "  (hauled {} built {} ops {})",
-                crew.delivered, crew.built, crew.operated
+            line.push_str(&crate::tfmt!(
+                l.fmt_chip_counts,
+                h = crew.delivered,
+                b = crew.built,
+                o = crew.operated
             ));
             set_text_if_changed(&mut text, line);
             if color.0 != crew.tint {

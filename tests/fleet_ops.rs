@@ -27,6 +27,7 @@ fn setup_full_world() -> World {
     let (w, h) = (map.width, map.height);
     world.insert_resource(map);
     world.insert_resource(EventLog::default());
+    world.insert_resource(ship_alive::loc::Lang::default());
     world.insert_resource(ship_alive::stats::Stats::default());
     let mut cables = CableGrid::new(w, h);
     let mut pipes = ship_alive::coolant::PipeGrid::new(w, h);

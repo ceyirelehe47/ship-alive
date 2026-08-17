@@ -9,6 +9,7 @@ use crate::building::{Blueprint, Building};
 use crate::crew::{Crew, CrewTask, Movement};
 use crate::input::{BoxSelect, Hovered, Selected};
 use crate::items::{CarriedBy, Item, MarkedForHaul, NoPathUntil, ReservedBy};
+use crate::loc::{self, strings, Lang};
 use crate::map::TilePos;
 use crate::storage::StorageCell;
 use crate::ui::{item_status, task_label};
@@ -94,6 +95,7 @@ pub fn build_overlay(mut commands: Commands) {
 pub fn tooltip_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     hovered: Res<Hovered>,
+    lang: Res<Lang>,
     clock: Res<crate::simtime::SimClock>,
     overlay: Res<Overlay>,
     crews: Query<(Entity, &Crew, &CrewTask, &TilePos, &Movement)>,
@@ -123,32 +125,48 @@ pub fn tooltip_system(
     mut vis_q: Query<&mut Visibility>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     let (title, detail) = match hovered.0 {
         Some(Selected::Crew(e)) => match crews.get(e) {
             Ok((_, c, task, ..)) => (
-                Some(format!("Crew {}", c.name)),
-                Some(task_label(task, &items, &racks)),
+                Some(crate::tfmt!(l.fmt_tip_crew, name = c.name)),
+                Some(task_label(task, &items, &racks, l)),
             ),
             Err(_) => (None, None),
         },
         Some(Selected::Item(e)) => match items.get(e) {
             Ok((_, p, item, m, r, c, cooled)) => (
-                Some(format!("{} ({},{})", item.kind.label(), p.x, p.y)),
-                Some(item_status(r, c, m, cooled, &crews, now)),
+                Some(crate::tfmt!(
+                    l.fmt_tip_item,
+                    kind = loc::item_label(item.kind, l),
+                    x = p.x,
+                    y = p.y
+                )),
+                Some(item_status(r, c, m, cooled, &crews, now, l)),
             ),
             Err(_) => (None, None),
         },
         Some(Selected::Rack(e)) => match racks.get(e) {
             Ok((_, p, cell, _, _)) => (
-                Some(format!("Storage rack ({},{})", p.x, p.y)),
+                Some(crate::tfmt!(l.fmt_tip_rack, x = p.x, y = p.y)),
                 Some(if cell.free() == 0 {
-                    format!("{} — FULL", cell.label())
+                    crate::tfmt!(l.rack_full, label = cell.label())
                 } else {
-                    format!(
-                        "{} — free: {} | accepts: {}",
-                        cell.label(),
-                        cell.free(),
-                        cell.filter_label()
+                    let accepts = if cell.allowed.iter().all(|&a| a) {
+                        l.filter_any.to_string()
+                    } else {
+                        crate::items::ItemKind::ALL
+                            .iter()
+                            .filter(|k| cell.allowed[k.index()])
+                            .map(|k| loc::item_short(*k, l))
+                            .collect::<Vec<_>>()
+                            .join("+")
+                    };
+                    crate::tfmt!(
+                        l.fmt_tip_rack_free,
+                        label = cell.label(),
+                        free = cell.free(),
+                        accepts = accepts
                     )
                 }),
             ),
@@ -156,11 +174,16 @@ pub fn tooltip_system(
         },
         Some(Selected::Blueprint(e)) => match blueprints.get(e) {
             Ok((p, bp)) => (
-                Some(format!("{} blueprint ({},{})", bp.kind.label(), p.x, p.y)),
+                Some(crate::tfmt!(
+                    l.fmt_tip_blueprint,
+                    kind = loc::building_label(bp.kind, l),
+                    x = p.x,
+                    y = p.y
+                )),
                 Some(if bp.fully_supplied() {
-                    "materials complete — awaiting builder".to_string()
+                    l.tip_bp_ready.to_string()
                 } else {
-                    format!("needs: {}", bp.materials_label())
+                    crate::tfmt!(l.fmt_tip_bp_needs, needs = bp.materials_label_loc(l))
                 }),
             ),
             Err(_) => (None, None),
@@ -168,27 +191,30 @@ pub fn tooltip_system(
         Some(Selected::Building(e)) => {
             if let Ok((p, b, door)) = buildings.get(e) {
                 (
-                    Some(format!("{} ({},{})", b.kind.label(), p.x, p.y)),
+                    Some(crate::tfmt!(
+                        l.fmt_tip_building,
+                        kind = loc::building_label(b.kind, l),
+                        x = p.x,
+                        y = p.y
+                    )),
                     Some(match door {
-                        Some(d) => format!(
-                            "{} ({}) — {}",
-                            d.phase.label(),
-                            d.mode.label(),
-                            if d.sealed() {
-                                "airtight"
+                        Some(d) => crate::tfmt!(
+                            l.fmt_tip_door,
+                            phase = loc::door_phase_label(d.phase, l),
+                            mode = loc::door_mode_label(d.mode, l),
+                            air = if d.sealed() {
+                                l.door_airtight
                             } else {
-                                "air flows through"
+                                l.door_air_flows
                             }
                         ),
                         None => match b.kind {
-                            crate::building::BuildingKind::Rack => "storage rack".to_string(),
+                            crate::building::BuildingKind::Rack => l.tip_rack.to_string(),
                             crate::building::BuildingKind::Fabricator => {
-                                "2x2 machine — select for orders".to_string()
+                                l.tip_fab_machine.to_string()
                             }
-                            crate::building::BuildingKind::GasDuct => {
-                                "underfloor gas duct".to_string()
-                            }
-                            _ => "player-built structure".to_string(),
+                            crate::building::BuildingKind::GasDuct => l.tip_gas_duct.to_string(),
+                            _ => l.tip_structure.to_string(),
                         },
                     }),
                 )
@@ -222,7 +248,9 @@ pub fn tooltip_system(
     }
     if let Ok((mut text, mut color)) = text_q.get_mut(overlay.tooltip_detail) {
         text.0 = d.clone();
-        color.0 = if d.starts_with("Unreachable") || d.ends_with("FULL") {
+        color.0 = if d.starts_with(l.item_unreachable)
+            || d.ends_with(strings(*lang).storage_full_suffix.trim())
+        {
             Color::srgb(1.0, 0.55, 0.45)
         } else {
             Color::srgb(0.72, 0.76, 0.82)
@@ -246,6 +274,7 @@ pub fn tooltip_system(
 pub fn atmosphere_tooltip_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Camera, &GlobalTransform), With<Camera2d>>,
+    lang: Res<Lang>,
     hovered: Res<Hovered>,
     overlay: Res<crate::OverlayMode>,
     map: Res<crate::map::ShipMap>,
@@ -280,19 +309,20 @@ pub fn atmosphere_tooltip_system(
         map.tile(p),
         Some(crate::map::Tile::Wall) | Some(crate::map::Tile::BuiltWall)
     );
+    let l = strings(*lang);
     let (title, detail, warn) = if solid {
         (
-            format!("Structure ({},{})", p.x, p.y),
-            "solid — no gas volume".to_string(),
+            crate::tfmt!(l.fmt_tip_compartment, x = p.x, y = p.y),
+            l.tip_solid.to_string(),
             false,
         )
     } else if total <= 0.01 {
         (
-            format!("Atmosphere ({},{})", p.x, p.y),
-            format!(
-                "VACUUM — 0.0 kPa\nTemp {:.1}°C\nCompartment #{}",
-                temp,
-                region_label(&comps, p)
+            crate::tfmt!(l.fmt_tip_atmo_title, x = p.x, y = p.y),
+            crate::tfmt!(
+                l.fmt_tip_vacuum,
+                t = format!("{temp:.1}"),
+                r = region_label(&comps, p)
             ),
             true,
         )
@@ -306,17 +336,29 @@ pub fn atmosphere_tooltip_system(
             || crate::atmosphere::partial_pressure(mix.mol[3], total, temp)
                 > crate::atmosphere::POLLUTANT_HIGH_KPA;
         (
-            format!("Atmosphere ({},{})", p.x, p.y),
-            format!(
-                "Pressure {:.1} kPa | {:.1}°C\nO2 {:.1} kPa ({:.0}%)\ninert {:.0}% | CO2 {:.1}% | pollutant {:.1}%\nCompartment #{}",
-                p_total,
-                temp,
-                o2pp,
-                mix.fraction(crate::atmosphere::Species::O2) * 100.0,
-                mix.fraction(crate::atmosphere::Species::Inert) * 100.0,
-                mix.fraction(crate::atmosphere::Species::Co2) * 100.0,
-                mix.fraction(crate::atmosphere::Species::Pollutant) * 100.0,
-                region_label(&comps, p),
+            crate::tfmt!(l.fmt_tip_atmo_title, x = p.x, y = p.y),
+            crate::tfmt!(
+                l.fmt_tip_gas,
+                p = format!("{p_total:.1}"),
+                t = format!("{temp:.1}"),
+                o2 = format!("{o2pp:.1}"),
+                o2p = format!(
+                    "{:.0}",
+                    mix.fraction(crate::atmosphere::Species::O2) * 100.0
+                ),
+                inert = format!(
+                    "{:.0}",
+                    mix.fraction(crate::atmosphere::Species::Inert) * 100.0
+                ),
+                co2 = format!(
+                    "{:.1}",
+                    mix.fraction(crate::atmosphere::Species::Co2) * 100.0
+                ),
+                pol = format!(
+                    "{:.1}",
+                    mix.fraction(crate::atmosphere::Species::Pollutant) * 100.0
+                ),
+                r = region_label(&comps, p),
             ),
             warn,
         )

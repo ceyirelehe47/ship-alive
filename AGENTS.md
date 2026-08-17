@@ -62,6 +62,15 @@ API 签名、crate 版本行为、框架迁移差异、报错原文等随时会�
     只对实体建筑（架/门/反应堆/水箱…）有效。验收场景想拆"墙"时
     要选最远的 Building，别 filter `BuildingKind::Wall`（结果为空、
     场景静默跑偏）。
+12. **`format!` 不接受运行时模板**：本地化字符串表要配 `tfmt!` 宏
+    （loc.rs，`{key}` 逐个 replace）。约定表内 `fmt_` 字段只用命名
+    占位符并登记进 `format_pairs()`——占位符对齐单测真的抓过
+    `{do}`（Rust 关键字改名后 zh 没跟上）。
+13. **静态 UI 文本的语言切换**：`StaticLabel(Box<dyn Fn>)` 组件 + 一个
+    全量比对同步系统（settings.rs），比给每个 build 系统存句柄省事；
+    捕获型闭包（如 building kind）必须用 Box 而不是 fn 指针。
+14. **英语 `label()` 系列是控制台/测试基线**：autotest 打印、既有断言
+    都依赖它们；本地化一律走 loc.rs 的访问器，别改英文方法的输出。
 
 ## 工程约定
 
@@ -69,7 +78,8 @@ API 签名、crate 版本行为、框架迁移差异、报错原文等随时会�
   `cargo test` 全绿才算完成；不许删测试或大面积 `#[allow]` 压警告。
 - 验收场景：`SLICE0_SCENARIO=A..L,P1,P2,M`（0/0B/1 代）、`SLICE2_SCENARIO=A..J`（电力代）、
   `SLICE6_SCENARIO=A..U`（通风代，跳过与 S5 重叠的 J/K）、`SLICE7_SCENARIO=A..F`
- （优先级代，F 配 `SLICE0_SPEED=0`）。改动核心系统后全量回归。
+ （优先级代，F 配 `SLICE0_SPEED=0`）、`SLICE8_SCENARIO=A..D`（语言代，控制台
+  基线要英文时配 `SLICE8_LANG=en`）。改动核心系统后全量回归。
 - 报告文化：每个 Slice 一份 `REPORT*.md`，含 Design assumptions / Temporary
   behaviors / 发现的问题；临时决定不许悄悄升级成永久设计。
 - 美术管线：`art_raw/`（Codex 生图，洋红底）→ `cargo run --bin prep_art` →

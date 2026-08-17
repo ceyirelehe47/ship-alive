@@ -18,6 +18,7 @@
 //! destroy heat) — only its *conductivity* to the neighbours changes, from
 //! open-air fast exchange to a slow structure-like seep (see `thermal.rs`).
 
+use crate::loc::{strings, Lang};
 use crate::map::{ShipMap, Tile, TilePos};
 use bevy::prelude::*;
 use std::collections::{HashMap, HashSet};
@@ -602,12 +603,14 @@ pub fn door_system(
 /// Player action: set a door's mode (Auto / Hold Open / Lock Closed). Runs on
 /// the frame-based Update schedule next to the other action consumers.
 pub fn door_action_system(
+    lang: Res<Lang>,
     mut events: EventReader<crate::jobs::Action>,
     mut doors: Query<(Entity, &TilePos, &mut Door)>,
     mut log: ResMut<crate::log::EventLog>,
     clock: Res<crate::simtime::SimClock>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     for action in events.read() {
         if let crate::jobs::Action::SetDoorMode { door, mode } = *action {
             if let Ok((_, pos, mut d)) = doors.get_mut(door) {
@@ -615,7 +618,12 @@ pub fn door_action_system(
                 log.push(
                     now,
                     crate::log::LogKind::Info,
-                    format!("Door at ({},{}) -> {}", pos.x, pos.y, mode.label()),
+                    crate::tfmt!(
+                        l.fmt_log_door_mode,
+                        x = pos.x,
+                        y = pos.y,
+                        mode = crate::loc::door_mode_label(mode, l)
+                    ),
                 );
             }
         }

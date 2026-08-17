@@ -12,9 +12,11 @@ use crate::crew::{Crew, CrewTask, Priority, WorkKind};
 use crate::input::{Selected, Selection};
 use crate::items::{CarriedBy, Item, MarkedForHaul, NoPathUntil, ReservedBy};
 use crate::jobs::Action;
+use crate::loc::{self, strings, Lang, Strings};
 use crate::map::TilePos;
+use crate::settings::StaticLabel;
 use crate::storage::StorageCell;
-use crate::ui::{label, OnPress, BUTTON_ACTIVE, BUTTON_BG, BUTTON_HOVER, PANEL_BG};
+use crate::ui::{OnPress, BUTTON_ACTIVE, BUTTON_BG, BUTTON_HOVER, PANEL_BG};
 use bevy::color::Mix;
 use bevy::prelude::*;
 
@@ -63,7 +65,43 @@ pub enum WorkTabButton {
     Cell(usize, WorkKind),
 }
 
-pub fn build_work_tab(mut commands: Commands) {
+/// Plain text spawn (no localization marker) for dynamic/pooled labels.
+fn plain_label(parent: &mut ChildSpawnerCommands, text: &str, size: f32, color: Color) -> Entity {
+    parent
+        .spawn((
+            Text::new(text),
+            TextFont {
+                font_size: size,
+                ..default()
+            },
+            TextColor(color),
+        ))
+        .id()
+}
+
+/// Language-bound static label (spawned with the current language, kept in
+/// sync by the settings module's StaticLabel system).
+fn wlabel(
+    parent: &mut ChildSpawnerCommands,
+    lang: Lang,
+    sel: impl Fn(&Strings) -> &'static str + Send + Sync + 'static,
+    size: f32,
+    color: Color,
+) -> Entity {
+    parent
+        .spawn((
+            Text::new(sel(strings(lang))),
+            TextFont {
+                font_size: size,
+                ..default()
+            },
+            TextColor(color),
+            StaticLabel::new(sel),
+        ))
+        .id()
+}
+
+pub fn build_work_tab(mut commands: Commands, lang: Res<Lang>) {
     let mut cols: Vec<WorkTabCol> = Vec::new();
 
     commands
@@ -102,10 +140,17 @@ pub fn build_work_tab(mut commands: Commands) {
                         ..default()
                     })
                     .with_children(|row| {
-                        label(row, "WORK", 15.0, Color::srgb(0.95, 0.85, 0.55));
-                        label(
+                        wlabel(
                             row,
-                            "— who does what (click a cell to cycle)",
+                            *lang,
+                            |s| s.work_title,
+                            15.0,
+                            Color::srgb(0.95, 0.85, 0.55),
+                        );
+                        wlabel(
+                            row,
+                            *lang,
+                            |s| s.work_subtitle,
                             11.0,
                             Color::srgb(0.55, 0.6, 0.66),
                         );
@@ -113,10 +158,20 @@ pub fn build_work_tab(mut commands: Commands) {
                             flex_grow: 1.0,
                             ..default()
                         });
-                        for (mark, text, action) in [
-                            (WorkTabButton::Reset, "Defaults", Action::ResetWorkPriorities),
-                            (WorkTabButton::Close, "Close [Tab]", Action::ToggleWorkTab),
-                        ] {
+                        type HeaderBtn = (WorkTabButton, fn(&Strings) -> &'static str, Action);
+                        let header_btns: [HeaderBtn; 2] = [
+                            (
+                                WorkTabButton::Reset,
+                                |s| s.work_defaults,
+                                Action::ResetWorkPriorities,
+                            ),
+                            (
+                                WorkTabButton::Close,
+                                |s| s.work_close,
+                                Action::ToggleWorkTab,
+                            ),
+                        ];
+                        for (mark, sel, action) in header_btns {
                             row.spawn((
                                 Button,
                                 Interaction::default(),
@@ -133,7 +188,7 @@ pub fn build_work_tab(mut commands: Commands) {
                                 BackgroundColor(PANEL_BG),
                             ))
                             .with_children(|b| {
-                                label(b, text, 12.0, Color::WHITE);
+                                wlabel(b, *lang, sel, 12.0, Color::WHITE);
                             });
                         }
                     });
@@ -152,10 +207,17 @@ pub fn build_work_tab(mut commands: Commands) {
                             ..default()
                         })
                         .with_children(|c| {
-                            label(c, "crew", 12.0, Color::srgb(0.55, 0.62, 0.7));
-                            label(
+                            wlabel(
                                 c,
-                                "click a name to select",
+                                *lang,
+                                |s| s.work_crew,
+                                12.0,
+                                Color::srgb(0.55, 0.62, 0.7),
+                            );
+                            wlabel(
+                                c,
+                                *lang,
+                                |s| s.work_click_name,
                                 9.0,
                                 Color::srgb(0.42, 0.47, 0.53),
                             );
@@ -180,7 +242,7 @@ pub fn build_work_tab(mut commands: Commands) {
                                 .with_children(|b| {
                                     cols.push(WorkTabCol {
                                         name_btn: Entity::PLACEHOLDER,
-                                        name_label: label(b, "", 12.0, Color::WHITE),
+                                        name_label: plain_label(b, "", 12.0, Color::WHITE),
                                         cur: Entity::PLACEHOLDER,
                                         stats: Entity::PLACEHOLDER,
                                         cells: [(Entity::PLACEHOLDER, Entity::PLACEHOLDER); 3],
@@ -204,7 +266,13 @@ pub fn build_work_tab(mut commands: Commands) {
                             ..default()
                         })
                         .with_children(|c| {
-                            label(c, "Current", 12.0, Color::srgb(0.55, 0.62, 0.7));
+                            wlabel(
+                                c,
+                                *lang,
+                                |s| s.work_current,
+                                12.0,
+                                Color::srgb(0.55, 0.62, 0.7),
+                            );
                         });
                         for col in cols.iter_mut() {
                             col.cur = fixed_label(row, "", 10.0, Color::srgb(0.65, 0.95, 0.7));
@@ -226,8 +294,25 @@ pub fn build_work_tab(mut commands: Commands) {
                                 ..default()
                             })
                             .with_children(|c| {
-                                label(c, kind.label(), 13.0, Color::WHITE);
-                                label(c, kind.desc(), 9.0, Color::srgb(0.42, 0.47, 0.53));
+                                let k = kind;
+                                c.spawn((
+                                    Text::new(loc::work_label(k, strings(*lang))),
+                                    TextFont {
+                                        font_size: 13.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::WHITE),
+                                    StaticLabel::new(move |s| loc::work_label(k, s)),
+                                ));
+                                c.spawn((
+                                    Text::new(loc::work_desc(k, strings(*lang))),
+                                    TextFont {
+                                        font_size: 9.0,
+                                        ..default()
+                                    },
+                                    TextColor(Color::srgb(0.42, 0.47, 0.53)),
+                                    StaticLabel::new(move |s| loc::work_desc(k, s)),
+                                ));
                             });
                             let ki = work_kind_index(kind);
                             for (i, col) in cols.iter_mut().enumerate() {
@@ -248,7 +333,7 @@ pub fn build_work_tab(mut commands: Commands) {
                                     ))
                                     .with_children(|b| {
                                         col.cells[ki].1 =
-                                            label(b, "N", 13.0, Priority::Normal.color());
+                                            plain_label(b, "N", 13.0, Priority::Normal.color());
                                     })
                                     .id();
                                 col.cells[ki].0 = cell;
@@ -269,9 +354,10 @@ pub fn build_work_tab(mut commands: Commands) {
                             ..default()
                         })
                         .with_children(|c| {
-                            label(
+                            wlabel(
                                 c,
-                                "Done (haul/build/operate)",
+                                *lang,
+                                |s| s.work_done,
                                 10.0,
                                 Color::srgb(0.55, 0.62, 0.7),
                             );
@@ -281,9 +367,10 @@ pub fn build_work_tab(mut commands: Commands) {
                         }
                     });
 
-                label(
+                wlabel(
                     panel,
-                    "H high · N normal · L low · — off | priorities steer the NEXT job; running jobs finish first",
+                    *lang,
+                    |s| s.work_hint,
                     10.0,
                     Color::srgb(0.5, 0.55, 0.62),
                 );
@@ -384,6 +471,7 @@ fn truncate(s: String, max: usize) -> String {
 pub(crate) fn work_tab_system(
     mut commands: Commands,
     visible: Res<WorkTabVisible>,
+    lang: Res<Lang>,
     hud: Res<WorkTabHud>,
     mut selection: ResMut<Selection>,
     time: Res<Time<Real>>,
@@ -419,7 +507,9 @@ pub(crate) fn work_tab_system(
     >,
     mut ui_acc: Local<f32>,
     mut sig: Local<Vec<(Entity, [u8; 3])>>,
+    mut last_lang: Local<Lang>,
 ) {
+    let l = strings(*lang);
     if !visible.0 {
         return;
     }
@@ -429,7 +519,8 @@ pub(crate) fn work_tab_system(
 
     // ---- rebuild pass (roster, any tier, or a reopen changed) ----
     // Cells show the CURRENT tier; their click target carries the NEXT one.
-    if *sig != want_sig || visible.is_changed() {
+    if *sig != want_sig || visible.is_changed() || *last_lang != *lang {
+        *last_lang = *lang;
         *sig = want_sig;
         for (i, col) in hud.cols.iter().enumerate() {
             let shown = i < roster.len();
@@ -556,7 +647,7 @@ pub(crate) fn work_tab_system(
         };
         if let Ok((mut text, mut color, _)) = texts.get_mut(col.cur) {
             let idle = matches!(task, CrewTask::Idle(_));
-            let want = truncate(crate::ui::task_label(task, &items, &racks), 26);
+            let want = truncate(crate::ui::task_label(task, &items, &racks, l), 26);
             if text.0 != want {
                 text.0 = want;
             }

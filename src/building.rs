@@ -9,6 +9,7 @@
 //! to encourage layout experiments).
 
 use crate::items::{self, ItemKind};
+use crate::loc::Strings;
 use crate::map::{ShipMap, Tile, TilePos};
 use bevy::prelude::*;
 
@@ -374,6 +375,24 @@ impl Blueprint {
         self.missing_list().is_empty()
     }
 
+    /// Localized `materials_label` (Slice 8).
+    pub fn materials_label_loc(&self, l: &crate::loc::Strings) -> String {
+        let def = def(self.kind);
+        ItemKind::ALL
+            .iter()
+            .filter(|k| def.cost[k.index()] > 0)
+            .map(|k| {
+                crate::tfmt!(
+                    l.fmt_materials_have,
+                    kind = crate::loc::item_short(*k, l),
+                    have = self.delivered[k.index()],
+                    need = def.cost[k.index()]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub fn materials_label(&self) -> String {
         let def = def(self.kind);
         ItemKind::ALL
@@ -625,6 +644,7 @@ pub fn spawn_blueprint(commands: &mut Commands, kind: BuildingKind, origin: Tile
 /// materials (claim races can overshoot by one).
 #[allow(clippy::too_many_arguments)]
 pub fn complete_building(
+    l: &Strings,
     commands: &mut Commands,
     map: &mut ShipMap,
     cables: &mut crate::power::CableGrid,
@@ -652,7 +672,7 @@ pub fn complete_building(
         log.push(
             now,
             crate::log::LogKind::Job,
-            format!("Power cable laid at ({},{})", bp.foot.x, bp.foot.y),
+            crate::tfmt!(l.fmt_log_cable_laid, x = bp.foot.x, y = bp.foot.y),
         );
         return;
     }
@@ -667,7 +687,7 @@ pub fn complete_building(
         log.push(
             now,
             crate::log::LogKind::Job,
-            format!("Coolant pipe laid at ({},{})", bp.foot.x, bp.foot.y),
+            crate::tfmt!(l.fmt_log_pipe_laid, x = bp.foot.x, y = bp.foot.y),
         );
         return;
     }
@@ -684,7 +704,7 @@ pub fn complete_building(
         log.push(
             now,
             crate::log::LogKind::Job,
-            format!("Gas duct laid at ({},{})", bp.foot.x, bp.foot.y),
+            crate::tfmt!(l.fmt_log_duct_laid, x = bp.foot.x, y = bp.foot.y),
         );
         return;
     }
@@ -824,7 +844,12 @@ pub fn complete_building(
     log.push(
         now,
         crate::log::LogKind::Job,
-        format!("{} built at ({},{})", d.label, bp.foot.x, bp.foot.y),
+        crate::tfmt!(
+            l.fmt_log_built,
+            kind = crate::loc::building_label(bp.kind, l),
+            x = bp.foot.x,
+            y = bp.foot.y
+        ),
     );
 }
 
@@ -851,6 +876,7 @@ pub fn nearest_walkable(map: &ShipMap, around: TilePos) -> Option<TilePos> {
 /// any rack contents) as ground items, remove the building.
 #[allow(clippy::too_many_arguments)]
 pub fn complete_deconstruction(
+    l: &Strings,
     commands: &mut Commands,
     map: &mut ShipMap,
     cables: &mut crate::power::CableGrid,
@@ -884,7 +910,7 @@ pub fn complete_deconstruction(
         log.push(
             now,
             crate::log::LogKind::Job,
-            format!("Power cable removed at ({},{})", b.foot.x, b.foot.y),
+            crate::tfmt!(l.fmt_log_cable_removed, x = b.foot.x, y = b.foot.y),
         );
         return;
     }
@@ -901,16 +927,18 @@ pub fn complete_deconstruction(
             log.push(
                 now,
                 crate::log::LogKind::Fail,
-                format!(
-                    "Coolant pipe removed at ({},{}) — {spilled:.1} water spilled (network full)",
-                    b.foot.x, b.foot.y
+                crate::tfmt!(
+                    l.fmt_log_pipe_spilled,
+                    x = b.foot.x,
+                    y = b.foot.y,
+                    spilled = format!("{spilled:.1}")
                 ),
             );
         } else {
             log.push(
                 now,
                 crate::log::LogKind::Job,
-                format!("Coolant pipe removed at ({},{})", b.foot.x, b.foot.y),
+                crate::tfmt!(l.fmt_log_pipe_removed, x = b.foot.x, y = b.foot.y),
             );
         }
         return;
@@ -931,7 +959,7 @@ pub fn complete_deconstruction(
         log.push(
             now,
             crate::log::LogKind::Job,
-            format!("Gas duct removed at ({},{})", b.foot.x, b.foot.y),
+            crate::tfmt!(l.fmt_log_duct_removed, x = b.foot.x, y = b.foot.y),
         );
         return;
     }
@@ -991,6 +1019,9 @@ pub fn complete_deconstruction(
     log.push(
         now,
         crate::log::LogKind::Job,
-        format!("{} deconstructed — materials refunded", d.label),
+        crate::tfmt!(
+            l.fmt_log_deconstructed,
+            kind = crate::loc::building_label(b.kind, l)
+        ),
     );
 }

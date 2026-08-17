@@ -15,6 +15,7 @@ fn main() {
             ..default()
         }))
         .add_plugins((
+            ship_alive::settings::SettingsPlugin,
             setup::SetupPlugin,
             autotest::AutotestPlugin,
             ship_alive::simtime::SimTimePlugin,

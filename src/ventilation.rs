@@ -29,6 +29,7 @@ use crate::atmosphere::{
     eq_amount, move_gas, pressure_vol, GasMixture, GAS_CAP_PER_MOL, KELVIN_OFFSET, PRESSURE_REF,
     TEMP_REF,
 };
+use crate::loc::{strings, Lang};
 use crate::map::{ShipMap, TilePos};
 use bevy::prelude::*;
 
@@ -1009,7 +1010,9 @@ fn summarize(
 }
 
 /// Player actions on ventilation devices (frame-based, like door modes).
+#[allow(clippy::too_many_arguments)]
 pub fn vent_action_system(
+    lang: Res<Lang>,
     mut events: EventReader<crate::jobs::Action>,
     mut vents: Query<(Entity, &TilePos, &mut Vent)>,
     mut blowers: Query<(Entity, &TilePos, &mut Blower)>,
@@ -1019,6 +1022,7 @@ pub fn vent_action_system(
     clock: Res<crate::simtime::SimClock>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     for action in events.read() {
         match *action {
             crate::jobs::Action::SetVentMode { vent, mode } => {
@@ -1028,7 +1032,12 @@ pub fn vent_action_system(
                     log.push(
                         now,
                         crate::log::LogKind::Info,
-                        format!("Vent at ({},{}) -> {}", pos.x, pos.y, mode.label()),
+                        crate::tfmt!(
+                            l.fmt_log_vent_mode,
+                            x = pos.x,
+                            y = pos.y,
+                            mode = crate::loc::vent_mode_label(mode, l)
+                        ),
                     );
                 }
             }
@@ -1039,11 +1048,11 @@ pub fn vent_action_system(
                     log.push(
                         now,
                         crate::log::LogKind::Info,
-                        format!(
-                            "Vent at ({},{}) {}",
-                            pos.x,
-                            pos.y,
-                            if open { "opened" } else { "closed" }
+                        crate::tfmt!(
+                            l.fmt_log_vent_open,
+                            x = pos.x,
+                            y = pos.y,
+                            state = if open { l.val_opened } else { l.val_closed2 }
                         ),
                     );
                 }
@@ -1055,7 +1064,12 @@ pub fn vent_action_system(
                     log.push(
                         now,
                         crate::log::LogKind::Info,
-                        format!("Blower at ({},{}) -> {}", pos.x, pos.y, dir.label()),
+                        crate::tfmt!(
+                            l.fmt_log_blower_dir,
+                            x = pos.x,
+                            y = pos.y,
+                            dir = crate::loc::dir4_label(dir, l)
+                        ),
                     );
                 }
             }
@@ -1066,11 +1080,11 @@ pub fn vent_action_system(
                     log.push(
                         now,
                         crate::log::LogKind::Info,
-                        format!(
-                            "Blower at ({},{}) {}",
-                            pos.x,
-                            pos.y,
-                            if on { "on" } else { "off" }
+                        crate::tfmt!(
+                            l.fmt_log_blower_on,
+                            x = pos.x,
+                            y = pos.y,
+                            state = if on { l.val_on } else { l.val_off }
                         ),
                     );
                 }
@@ -1082,11 +1096,11 @@ pub fn vent_action_system(
                     log.push(
                         now,
                         crate::log::LogKind::Info,
-                        format!(
-                            "Tank at ({},{}) valve {}",
-                            pos.x,
-                            pos.y,
-                            if open { "opened" } else { "closed" }
+                        crate::tfmt!(
+                            l.fmt_log_tank_valve,
+                            x = pos.x,
+                            y = pos.y,
+                            state = if open { l.val_opened } else { l.val_closed2 }
                         ),
                     );
                 }

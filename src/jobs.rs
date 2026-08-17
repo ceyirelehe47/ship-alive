@@ -15,6 +15,7 @@ use crate::crew::{
     WorkPhase,
 };
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
+use crate::loc::{self, strings, Lang};
 use crate::log::{EventLog, LogKind};
 use crate::map::{find_drop_tile, ShipMap, TilePos};
 use crate::power::{CableGrid, PowerRole, PowerStatus};
@@ -178,6 +179,14 @@ pub enum Action {
         tank: Entity,
         open: bool,
     },
+    // ---- Slice 8: settings / language --------------------------------------
+    /// Switch the UI language (consumed by the settings plugin, which also
+    /// persists it to settings.ini).
+    SetLang {
+        to: crate::loc::Lang,
+    },
+    /// UI-only: show/hide the settings panel.
+    ToggleSettings,
 }
 
 pub struct JobsPlugin;
@@ -217,6 +226,7 @@ pub fn actions_system(
     mut events: EventReader<Action>,
     mut commands: Commands,
     map: Res<ShipMap>,
+    lang: Res<Lang>,
     mut log: ResMut<EventLog>,
     clock: Res<SimClock>,
     mut crews: Query<(Entity, &mut Crew, &mut CrewTask, &TilePos, &mut Movement), Without<Item>>,
@@ -235,6 +245,7 @@ pub fn actions_system(
     cable_tiles: Query<(Entity, &TilePos), (With<Building>, With<MarkedForDeconstruct>)>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     let racks_list: Vec<(TilePos, Entity)> = rack_tiles
         .iter()
         .map(|p| (*p, Entity::PLACEHOLDER))
@@ -246,6 +257,7 @@ pub fn actions_system(
                 if let Ok((_, _, marked)) = items.get(item) {
                     if marked.is_some() {
                         end_hauls_for_item(
+                            l,
                             &mut crews,
                             &mut commands,
                             &map,
@@ -310,6 +322,7 @@ pub fn actions_system(
                         };
                         let name = crew.name.clone();
                         end_haul(
+                            l,
                             &mut task,
                             &mut mov,
                             &mut commands,
@@ -332,6 +345,7 @@ pub fn actions_system(
             Action::DeleteItem { item } => {
                 if items.get(item).is_ok() {
                     end_hauls_for_item(
+                        l,
                         &mut crews,
                         &mut commands,
                         &map,
@@ -394,6 +408,7 @@ pub fn actions_system(
                 if let Ok((_, foot, bp)) = blueprints.get(blueprint) {
                     let (foot, delivered, kind) = (*foot, bp.delivered, bp.kind);
                     cancel_blueprint(
+                        l,
                         &mut commands,
                         &mut crews,
                         &map,
@@ -423,7 +438,7 @@ pub fn actions_system(
                             commands.entity(building).remove::<ReservedBy>();
                             let name = crew.name.clone();
                             *task = CrewTask::Idle(IdleCause::JobCanceled {
-                                detail: "deconstruction unmarked".into(),
+                                detail: l.fail_demo_unmarked.into(),
                             });
                             mov.path.clear();
                             log.push(
@@ -613,6 +628,9 @@ pub fn actions_system(
             | Action::SetTankValve { .. } => {
                 // Consumed by ventilation::vent_action_system.
             }
+            Action::SetLang { .. } | Action::ToggleSettings => {
+                // Consumed by settings::settings_action_system.
+            }
             Action::MarkDuctDeconstruct { pos } => {
                 let Some(ducts) = ducts.as_ref() else {
                     return;
@@ -674,6 +692,7 @@ fn random_cargo_tile(
 /// Cancel a blueprint: refund on-site materials, end all jobs targeting it.
 #[allow(clippy::too_many_arguments)]
 fn cancel_blueprint(
+    l: &crate::loc::Strings,
     commands: &mut Commands,
     crews: &mut Query<(Entity, &mut Crew, &mut CrewTask, &TilePos, &mut Movement), Without<Item>>,
     map: &ShipMap,
@@ -697,6 +716,7 @@ fn cancel_blueprint(
             if let CrewTask::Haul(hjob) = &*task {
                 let item = hjob.item;
                 end_haul(
+                    l,
                     &mut task,
                     &mut mov,
                     commands,
@@ -745,6 +765,7 @@ fn cancel_blueprint(
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 fn end_hauls_for_item(
+    l: &crate::loc::Strings,
     crews: &mut Query<(Entity, &mut Crew, &mut CrewTask, &TilePos, &mut Movement), Without<Item>>,
     commands: &mut Commands,
     map: &ShipMap,
@@ -759,6 +780,7 @@ fn end_hauls_for_item(
             if job.item == item {
                 let name = crew.name.clone();
                 end_haul(
+                    l,
                     &mut task,
                     &mut mov,
                     commands,
@@ -784,6 +806,7 @@ fn end_hauls_for_item(
 /// being carried, put the crew back to idle.
 #[allow(clippy::too_many_arguments)]
 fn end_haul(
+    l: &crate::loc::Strings,
     task: &mut CrewTask,
     mov: &mut Movement,
     commands: &mut Commands,
@@ -809,11 +832,12 @@ fn end_haul(
         log.push(
             now,
             LogKind::Fail,
-            format!(
-                "{crew_name} dropped the item at ({},{}): {}",
-                drop.x,
-                drop.y,
-                cause.label()
+            crate::tfmt!(
+                l.fmt_log_dropped,
+                name = crew_name,
+                x = drop.x,
+                y = drop.y,
+                cause = crate::loc::idle_cause_label(&cause, l)
             ),
         );
     } else {
@@ -821,7 +845,11 @@ fn end_haul(
         log.push(
             now,
             LogKind::Fail,
-            format!("{crew_name}: {}", cause.label()),
+            crate::tfmt!(
+                l.fmt_log_fail_plain,
+                name = crew_name,
+                detail = crate::loc::idle_cause_label(&cause, l)
+            ),
         );
     }
     *task = CrewTask::Idle(cause);
@@ -868,6 +896,7 @@ fn choose_rack(
 /// Fail the crew's active haul job (shared by all error paths in the task system).
 #[allow(clippy::too_many_arguments)]
 fn fail_haul(
+    l: &crate::loc::Strings,
     commands: &mut Commands,
     map: &ShipMap,
     racks: &Query<(Entity, &TilePos, &mut StorageCell), Without<Crew>>,
@@ -883,6 +912,7 @@ fn fail_haul(
     let rack_list: Vec<(TilePos, Entity)> = racks.iter().map(|(e, p, _)| (*p, e)).collect();
     let name = crew.name.clone();
     end_haul(
+        l,
         task,
         mov,
         commands,
@@ -908,6 +938,7 @@ fn at_interaction(map: &ShipMap, pos: TilePos, foot: &Footprint) -> bool {
 /// Abort a work job cleanly (releases the reservation).
 #[allow(clippy::too_many_arguments)]
 fn end_work(
+    l: &crate::loc::Strings,
     commands: &mut Commands,
     task: &mut CrewTask,
     mov: &mut Movement,
@@ -923,13 +954,18 @@ fn end_work(
     });
     mov.path.clear();
     mov.progress = 0.0;
-    log.push(now, LogKind::Fail, format!("{name}: {detail}"));
+    log.push(
+        now,
+        LogKind::Fail,
+        crate::tfmt!(l.fmt_log_fail_plain, name = name, detail = detail),
+    );
 }
 
 /// Advance every active job through its phases.
 #[allow(clippy::type_complexity)]
 #[allow(clippy::too_many_arguments)]
 pub fn crew_task_system(
+    lang: Res<Lang>,
     // Dense world grids the job effects write to, nested into one system
     // param (Bevy caps flat params at 16).
     (
@@ -1008,6 +1044,7 @@ pub fn crew_task_system(
 ) {
     let dt = clock.dt() as f32;
     let now = clock.now();
+    let l = strings(*lang);
     let crew_positions: Vec<(Entity, TilePos)> =
         crews.iter().map(|(e, _, _, p, _)| (e, *p)).collect();
     let ground_now: Vec<TilePos> = items.iter().map(|(_, p, ..)| *p).collect();
@@ -1026,7 +1063,7 @@ pub fn crew_task_system(
                 log.push(
                     now,
                     LogKind::Fail,
-                    format!("{name}: job canceled — target vanished"),
+                    crate::tfmt!(l.fmt_log_target_vanished, name = name),
                 );
                 continue;
             };
@@ -1048,7 +1085,7 @@ pub fn crew_task_system(
                 log.push(
                     now,
                     LogKind::Fail,
-                    format!("{name}: job canceled — item unmarked"),
+                    crate::tfmt!(l.fmt_log_item_unmarked_job, name = name),
                 );
                 continue;
             }
@@ -1064,7 +1101,7 @@ pub fn crew_task_system(
                     log.push(
                         now,
                         LogKind::Fail,
-                        format!("{name}: job canceled — item claimed elsewhere"),
+                        crate::tfmt!(l.fmt_log_claimed_elsewhere, name = name),
                     );
                     continue;
                 }
@@ -1079,6 +1116,7 @@ pub fn crew_task_system(
                         match crate::path::find_path(&map, *pos, *item_pos, |_| false) {
                             Some(p) => mov.path = p,
                             None => fail_haul(
+                                l,
                                 &mut commands,
                                 &map,
                                 &racks,
@@ -1089,7 +1127,7 @@ pub fn crew_task_system(
                                 item_entity,
                                 &mut log,
                                 now,
-                                "path to item lost",
+                                l.fail_path_item,
                             ),
                         }
                     }
@@ -1114,6 +1152,7 @@ pub fn crew_task_system(
                                         None => {
                                             job.phase = HaulPhase::ToDest;
                                             fail_haul(
+                                                l,
                                                 &mut commands,
                                                 &map,
                                                 &racks,
@@ -1124,7 +1163,7 @@ pub fn crew_task_system(
                                                 item_entity,
                                                 &mut log,
                                                 now,
-                                                "no reachable storage with space",
+                                                l.fail_no_storage,
                                             );
                                         }
                                     }
@@ -1157,6 +1196,7 @@ pub fn crew_task_system(
                                                     mov.path = path;
                                                 }
                                                 None => fail_haul(
+                                                    l,
                                                     &mut commands,
                                                     &map,
                                                     &racks,
@@ -1167,7 +1207,7 @@ pub fn crew_task_system(
                                                     item_entity,
                                                     &mut log,
                                                     now,
-                                                    "blueprint gone and no storage",
+                                                    l.fail_bp_gone_no_storage,
                                                 ),
                                             }
                                         }
@@ -1196,6 +1236,7 @@ pub fn crew_task_system(
                                                     mov.path = path;
                                                 }
                                                 None => fail_haul(
+                                                    l,
                                                     &mut commands,
                                                     &map,
                                                     &racks,
@@ -1206,7 +1247,7 @@ pub fn crew_task_system(
                                                     item_entity,
                                                     &mut log,
                                                     now,
-                                                    "machine gone and no storage",
+                                                    l.fail_machine_gone_no_storage,
                                                 ),
                                             }
                                         }
@@ -1228,6 +1269,7 @@ pub fn crew_task_system(
                                     mov.path = path;
                                 }
                                 None => fail_haul(
+                                    l,
                                     &mut commands,
                                     &map,
                                     &racks,
@@ -1238,7 +1280,7 @@ pub fn crew_task_system(
                                     item_entity,
                                     &mut log,
                                     now,
-                                    "no reachable storage with space",
+                                    l.fail_no_storage,
                                 ),
                             }
                             continue;
@@ -1250,6 +1292,7 @@ pub fn crew_task_system(
                                     mov.path = path;
                                 }
                                 None => fail_haul(
+                                    l,
                                     &mut commands,
                                     &map,
                                     &racks,
@@ -1260,7 +1303,7 @@ pub fn crew_task_system(
                                     item_entity,
                                     &mut log,
                                     now,
-                                    "storage disappeared",
+                                    l.fail_storage_gone,
                                 ),
                             }
                             continue;
@@ -1278,6 +1321,7 @@ pub fn crew_task_system(
                                         mov.path = path;
                                     }
                                     None => fail_haul(
+                                        l,
                                         &mut commands,
                                         &map,
                                         &racks,
@@ -1288,7 +1332,7 @@ pub fn crew_task_system(
                                         item_entity,
                                         &mut log,
                                         now,
-                                        "no free storage space",
+                                        l.fail_no_free_storage,
                                     ),
                                 }
                             }
@@ -1296,6 +1340,7 @@ pub fn crew_task_system(
                             match crate::path::find_path(&map, *pos, rack_pos, |_| false) {
                                 Some(p) => mov.path = p,
                                 None => fail_haul(
+                                    l,
                                     &mut commands,
                                     &map,
                                     &racks,
@@ -1306,7 +1351,7 @@ pub fn crew_task_system(
                                     item_entity,
                                     &mut log,
                                     now,
-                                    "path to storage lost",
+                                    l.fail_path_storage,
                                 ),
                             }
                         }
@@ -1325,6 +1370,7 @@ pub fn crew_task_system(
                             match building::path_to_interaction(&map, *pos, &foot) {
                                 Some(p) => mov.path = p,
                                 None => fail_haul(
+                                    l,
                                     &mut commands,
                                     &map,
                                     &racks,
@@ -1335,7 +1381,7 @@ pub fn crew_task_system(
                                     item_entity,
                                     &mut log,
                                     now,
-                                    "path to blueprint lost",
+                                    l.fail_path_blueprint,
                                 ),
                             }
                         }
@@ -1354,6 +1400,7 @@ pub fn crew_task_system(
                             match building::path_to_interaction(&map, *pos, &foot) {
                                 Some(p) => mov.path = p,
                                 None => fail_haul(
+                                    l,
                                     &mut commands,
                                     &map,
                                     &racks,
@@ -1364,7 +1411,7 @@ pub fn crew_task_system(
                                     item_entity,
                                     &mut log,
                                     now,
-                                    "path to machine lost",
+                                    l.fail_path_machine,
                                 ),
                             }
                         }
@@ -1381,6 +1428,7 @@ pub fn crew_task_system(
                                 };
                                 let Ok((_, rack_pos, mut rack_cell)) = racks.get_mut(rack_e) else {
                                     fail_haul(
+                                        l,
                                         &mut commands,
                                         &map,
                                         &racks,
@@ -1391,7 +1439,7 @@ pub fn crew_task_system(
                                         item_entity,
                                         &mut log,
                                         now,
-                                        "storage disappeared",
+                                        l.fail_storage_gone,
                                     );
                                     continue;
                                 };
@@ -1399,8 +1447,15 @@ pub fn crew_task_system(
                                     crew.delivered += 1;
                                     stats.hauls_done += 1;
                                     let name = crew.name.clone();
-                                    let kind = item.kind.label();
-                                    log.push(now, LogKind::Job, format!("{name} stored {kind}"));
+                                    log.push(
+                                        now,
+                                        LogKind::Job,
+                                        crate::tfmt!(
+                                            l.fmt_log_stored,
+                                            name = name,
+                                            kind = loc::item_label(item.kind, l)
+                                        ),
+                                    );
                                     commands.entity(item_entity).despawn();
                                     *task = CrewTask::Idle(IdleCause::Looking);
                                     crew.next_scan = now;
@@ -1413,11 +1468,14 @@ pub fn crew_task_system(
                                     bp.delivered[item.kind.index()] += 1;
                                     crew.delivered += 1;
                                     let name = crew.name.clone();
-                                    let kind = item.kind.label();
                                     log.push(
                                         now,
                                         LogKind::Job,
-                                        format!("{name} delivered {kind} to blueprint"),
+                                        crate::tfmt!(
+                                            l.fmt_log_delivered_bp,
+                                            name = name,
+                                            kind = loc::item_label(item.kind, l)
+                                        ),
                                     );
                                     commands.entity(item_entity).despawn();
                                     *task = CrewTask::Idle(IdleCause::Looking);
@@ -1432,11 +1490,14 @@ pub fn crew_task_system(
                                     f.input[item.kind.index()] += 1;
                                     crew.delivered += 1;
                                     let name = crew.name.clone();
-                                    let kind = item.kind.label();
                                     log.push(
                                         now,
                                         LogKind::Job,
-                                        format!("{name} loaded {kind} into fabricator"),
+                                        crate::tfmt!(
+                                            l.fmt_log_loaded_fab,
+                                            name = name,
+                                            kind = loc::item_label(item.kind, l)
+                                        ),
                                     );
                                     commands.entity(item_entity).despawn();
                                     *task = CrewTask::Idle(IdleCause::Looking);
@@ -1462,7 +1523,11 @@ pub fn crew_task_system(
                 });
                 mov.path.clear();
                 crew.next_scan = now + RESCAN_CANCELED as f64;
-                log.push(now, LogKind::Fail, format!("{name}: blueprint gone"));
+                log.push(
+                    now,
+                    LogKind::Fail,
+                    crate::tfmt!(l.fmt_log_bp_gone, name = name),
+                );
                 continue;
             };
             let foot = *foot;
@@ -1480,6 +1545,7 @@ pub fn crew_task_system(
                                 let name = crew.name.clone();
                                 let target = job.target;
                                 end_work(
+                                    l,
                                     &mut commands,
                                     &mut task,
                                     &mut mov,
@@ -1487,7 +1553,7 @@ pub fn crew_task_system(
                                     &mut log,
                                     now,
                                     &name,
-                                    "no path to blueprint",
+                                    l.fail_no_path_bp,
                                 );
                                 crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
@@ -1503,6 +1569,7 @@ pub fn crew_task_system(
                     bp.progress = 1.0 - (job.timer / job.total).clamp(0.0, 1.0);
                     if job.timer <= 0.0 {
                         building::complete_building(
+                            l,
                             &mut commands,
                             &mut map,
                             &mut cables,
@@ -1536,7 +1603,11 @@ pub fn crew_task_system(
                 });
                 mov.path.clear();
                 crew.next_scan = now + RESCAN_CANCELED as f64;
-                log.push(now, LogKind::Fail, format!("{name}: building gone"));
+                log.push(
+                    now,
+                    LogKind::Fail,
+                    crate::tfmt!(l.fmt_log_building_gone, name = name),
+                );
                 continue;
             };
             let foot = *foot;
@@ -1544,6 +1615,7 @@ pub fn crew_task_system(
                 let name = crew.name.clone();
                 let target = job.target;
                 end_work(
+                    l,
                     &mut commands,
                     &mut task,
                     &mut mov,
@@ -1551,7 +1623,7 @@ pub fn crew_task_system(
                     &mut log,
                     now,
                     &name,
-                    "deconstruction unmarked",
+                    l.fail_demo_unmarked,
                 );
                 crew.next_scan = now + RESCAN_CANCELED as f64;
                 continue;
@@ -1570,6 +1642,7 @@ pub fn crew_task_system(
                                 let name = crew.name.clone();
                                 let target = job.target;
                                 end_work(
+                                    l,
                                     &mut commands,
                                     &mut task,
                                     &mut mov,
@@ -1577,7 +1650,7 @@ pub fn crew_task_system(
                                     &mut log,
                                     now,
                                     &name,
-                                    "no path to building",
+                                    l.fail_no_path_building,
                                 );
                                 crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
@@ -1596,6 +1669,7 @@ pub fn crew_task_system(
                             racks.get(job.target).ok().map(|(_, _, cell)| cell.counts);
                         let tank_contents = tanks.get(job.target).ok().map(|(_, _, t)| *t);
                         building::complete_deconstruction(
+                            l,
                             &mut commands,
                             &mut map,
                             &mut cables,
@@ -1633,7 +1707,11 @@ pub fn crew_task_system(
                 });
                 mov.path.clear();
                 crew.next_scan = now + RESCAN_CANCELED as f64;
-                log.push(now, LogKind::Fail, format!("{name}: machine gone"));
+                log.push(
+                    now,
+                    LogKind::Fail,
+                    crate::tfmt!(l.fmt_log_machine_gone, name = name),
+                );
                 continue;
             };
             let foot = *foot;
@@ -1645,6 +1723,7 @@ pub fn crew_task_system(
                         let name = crew.name.clone();
                         let target = job.target;
                         end_work(
+                            l,
                             &mut commands,
                             &mut task,
                             &mut mov,
@@ -1652,7 +1731,7 @@ pub fn crew_task_system(
                             &mut log,
                             now,
                             &name,
-                            "order canceled while walking",
+                            l.fail_order_canceled,
                         );
                         crew.next_scan = now + RESCAN_CANCELED as f64;
                         continue;
@@ -1669,6 +1748,7 @@ pub fn crew_task_system(
                                 let name = crew.name.clone();
                                 let target = job.target;
                                 end_work(
+                                    l,
                                     &mut commands,
                                     &mut task,
                                     &mut mov,
@@ -1676,7 +1756,7 @@ pub fn crew_task_system(
                                     &mut log,
                                     now,
                                     &name,
-                                    "no path to machine",
+                                    l.fail_no_path_machine,
                                 );
                                 crew.next_scan = now + RESCAN_UNREACHABLE as f64;
                             }
@@ -1690,6 +1770,7 @@ pub fn crew_task_system(
                         let name = crew.name.clone();
                         let target = job.target;
                         end_work(
+                            l,
                             &mut commands,
                             &mut task,
                             &mut mov,
@@ -1697,7 +1778,7 @@ pub fn crew_task_system(
                             &mut log,
                             now,
                             &name,
-                            "power lost",
+                            l.fail_power_lost,
                         );
                         crew.next_scan = now + RESCAN_FAILED as f64;
                         continue;
@@ -1708,6 +1789,7 @@ pub fn crew_task_system(
                         let name = crew.name.clone();
                         let target = job.target;
                         end_work(
+                            l,
                             &mut commands,
                             &mut task,
                             &mut mov,
@@ -1715,7 +1797,7 @@ pub fn crew_task_system(
                             &mut log,
                             now,
                             &name,
-                            "production interrupted",
+                            l.fail_interrupted,
                         );
                         crew.next_scan = now + RESCAN_FAILED as f64;
                         continue;
@@ -1734,7 +1816,11 @@ pub fn crew_task_system(
                         log.push(
                             now,
                             LogKind::Job,
-                            format!("{name} produced {} at the fabricator", out_kind.label()),
+                            crate::tfmt!(
+                                l.fmt_log_produced,
+                                name = name,
+                                kind = loc::item_label(out_kind, l)
+                            ),
                         );
                         commands.entity(job.target).remove::<ReservedBy>();
                         *task = CrewTask::Idle(IdleCause::Looking);
@@ -1864,6 +1950,7 @@ fn best_source_for(
 #[allow(clippy::too_many_arguments)]
 pub fn crew_scan_system(
     map: Res<ShipMap>,
+    lang: Res<Lang>,
     clock: Res<SimClock>,
     mut log: ResMut<EventLog>,
     mut stats: ResMut<crate::stats::Stats>,
@@ -1904,6 +1991,7 @@ pub fn crew_scan_system(
     >,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
 
     // Inbound supply: how many haulers are already en route to each consumer.
     let mut inbound: HashMap<(Entity, usize), u32> = HashMap::new();
@@ -2153,21 +2241,17 @@ pub fn crew_scan_system(
                             stats.haul_distance += crate::path::path_length(Some(*pos), &path);
                             set_haul_task(&mut task, &mut mov, item, dest, path, crew_e);
                             let name = crew.name.clone();
-                            let dest_label = match dest {
-                                HaulDest::Storage => "storage".to_string(),
-                                HaulDest::Blueprint(_) => "a blueprint".to_string(),
-                                HaulDest::Machine(_) => "the fabricator".to_string(),
-                            };
+                            let dest_label = loc::haul_dest_label(dest, l);
                             log.push(
                                 now,
                                 LogKind::Info,
-                                format!(
-                                    "{} claimed {} at ({},{}) for {}",
-                                    name,
-                                    it.kind.label(),
-                                    item_pos.x,
-                                    item_pos.y,
-                                    dest_label
+                                crate::tfmt!(
+                                    l.fmt_log_claimed,
+                                    name = name,
+                                    kind = loc::item_label(it.kind, l),
+                                    x = item_pos.x,
+                                    y = item_pos.y,
+                                    dest = dest_label
                                 ),
                             );
                             claimed = true;
@@ -2181,11 +2265,11 @@ pub fn crew_scan_system(
                                 log.push(
                                     now,
                                     LogKind::Fail,
-                                    format!(
-                                        "{} at ({},{}) is unreachable",
-                                        it.kind.label(),
-                                        item_pos.x,
-                                        item_pos.y
+                                    crate::tfmt!(
+                                        l.fmt_log_unreachable,
+                                        kind = loc::item_label(it.kind, l),
+                                        x = item_pos.x,
+                                        y = item_pos.y
                                     ),
                                 );
                             }
@@ -2221,12 +2305,12 @@ pub fn crew_scan_system(
                             log.push(
                                 now,
                                 LogKind::Info,
-                                format!(
-                                    "{} fetched {} from the rack at ({},{})",
-                                    name,
-                                    kind.label(),
-                                    rack_pos.x,
-                                    rack_pos.y
+                                crate::tfmt!(
+                                    l.fmt_log_fetched,
+                                    name = name,
+                                    kind = loc::item_label(kind, l),
+                                    x = rack_pos.x,
+                                    y = rack_pos.y
                                 ),
                             );
                             claimed = true;
@@ -2273,10 +2357,10 @@ pub fn crew_scan_system(
                             log.push(
                                 now,
                                 LogKind::Info,
-                                format!(
-                                    "{} picked up {} from the fabricator output",
-                                    name,
-                                    kind.label()
+                                crate::tfmt!(
+                                    l.fmt_log_picked_output,
+                                    name = name,
+                                    kind = loc::item_label(kind, l)
                                 ),
                             );
                             claimed = true;
@@ -2307,7 +2391,11 @@ pub fn crew_scan_system(
                     log.push(
                         now,
                         LogKind::Info,
-                        format!("{name} started building {}", bp_c.kind.label()),
+                        crate::tfmt!(
+                            l.fmt_log_started_build,
+                            name = name,
+                            kind = loc::building_label(bp_c.kind, l)
+                        ),
                     );
                     claimed = true;
                 }
@@ -2328,7 +2416,11 @@ pub fn crew_scan_system(
                     });
                     mov.path = path;
                     let name = crew.name.clone();
-                    log.push(now, LogKind::Info, format!("{name} started deconstruction"));
+                    log.push(
+                        now,
+                        LogKind::Info,
+                        crate::tfmt!(l.log_started_demo, name = name),
+                    );
                     claimed = true;
                 }
                 Cand::Operate { fab } => {
@@ -2351,7 +2443,7 @@ pub fn crew_scan_system(
                     log.push(
                         now,
                         LogKind::Info,
-                        format!("{name} is operating the fabricator"),
+                        crate::tfmt!(l.log_operating, name = name),
                     );
                     claimed = true;
                 }

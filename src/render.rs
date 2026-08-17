@@ -12,6 +12,7 @@ use crate::building::{self, Blueprint, Building, BuildingKind, Footprint, Marked
 use crate::crew::{Crew, CrewTask, HaulDest, HaulPhase, Movement};
 use crate::input::{BuildMode, Selected, Selection, Tool};
 use crate::items::{CarriedBy, Item, ItemKind, MarkedForHaul, NoPathUntil, ReservedBy};
+use crate::loc::{self, strings, Lang};
 use crate::map::{ShipMap, TilePos};
 use crate::power::{CableGrid, PowerRole, PowerState, PowerStatus};
 use crate::production::{MachineState, RECIPE};
@@ -362,6 +363,7 @@ impl Plugin for RenderPlugin {
             (
                 ensure_visuals_system,
                 index_visuals_system,
+                room_label_lang_system,
                 sync_crew_visuals_system,
                 sync_item_visuals_system,
                 sync_rack_labels_system,
@@ -406,7 +408,7 @@ pub fn spawn_tile_visuals(mut commands: Commands, map: Res<ShipMap>, art: Res<Ar
 
 /// Room name labels and a faint tint over the storage bay, so the ship layout
 /// reads at a glance without any tutorial.
-fn spawn_room_labels(mut commands: Commands) {
+fn spawn_room_labels(mut commands: Commands, lang: Res<Lang>) {
     let rooms: [(&str, i32, i32, i32, i32); 6] = [
         ("CARGO HOLD", 1, 1, 10, 5),
         ("CREW QUARTERS", 12, 1, 21, 5),
@@ -431,7 +433,8 @@ fn spawn_room_labels(mut commands: Commands) {
             ));
         }
         commands.spawn((
-            Text2d::new(name),
+            Text2d::new(loc::room_label(name, strings(*lang))),
+            RoomLabel(name),
             TextFont {
                 font_size: 13.0,
                 ..default()
@@ -441,6 +444,22 @@ fn spawn_room_labels(mut commands: Commands) {
                 (center + Vec2::new(0.0, size.y * 0.5 - 14.0)).extend(0.02),
             ),
         ));
+    }
+}
+
+/// A world-space room annotation keyed by its canonical English name
+/// (localized on spawn and on language switches).
+#[derive(Component)]
+struct RoomLabel(&'static str);
+
+/// Rewrite room annotations when the language changes.
+fn room_label_lang_system(lang: Res<Lang>, mut q: Query<(&RoomLabel, &mut Text2d)>) {
+    let l = strings(*lang);
+    for (key, mut text) in q.iter_mut() {
+        let want = loc::room_label(key.0, l);
+        if text.0 != want {
+            text.0 = want;
+        }
     }
 }
 
@@ -1033,6 +1052,7 @@ fn sync_rack_labels_system(
 /// Building & blueprint visuals: deconstruct tint + progress, blueprint
 /// materials/progress text, fabricator state ring and label.
 #[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
 fn sync_building_visuals_system(
     blueprints: Query<(Entity, &Blueprint), Changed<Blueprint>>,
     buildings: Query<(Entity, &Building, Option<&MarkedForDeconstruct>), Changed<Building>>,
@@ -1042,15 +1062,17 @@ fn sync_building_visuals_system(
         &crate::power::PowerStatus,
     )>,
     generators: Query<(Entity, &crate::power::PowerRole, &crate::power::PowerStatus)>,
+    lang: Res<Lang>,
     index: Res<VisualIndex>,
     mut sprites: Query<&mut Sprite, Without<Text2d>>,
     mut labels: Query<(&mut Text2d, &mut TextColor)>,
 ) {
+    let l = strings(*lang);
     for (e, bp) in blueprints.iter() {
         let label = if bp.progress > 0.0 {
             format!("{}%", (bp.progress * 100.0) as u32)
         } else {
-            bp.materials_label()
+            bp.materials_label_loc(l)
         };
         if let Some(ve) = index.get(e, Role::BlueprintLabel) {
             if let Ok((mut text, _)) = labels.get_mut(ve) {
@@ -1081,34 +1103,34 @@ fn sync_building_visuals_system(
         let (ring, text, text_color) = if !power.ok() {
             (
                 crate::power::PowerStatus::color(*power),
-                format!("NO POWER — {}", power.label()),
+                crate::tfmt!(l.lbl_no_power, status = loc::power_status_label(*power, l)),
                 Color::srgb(1.0, 0.55, 0.45),
             )
         } else {
             match state {
                 MachineState::NoOrder => (
                     Color::srgba(0.6, 0.65, 0.7, 0.35),
-                    "no order".to_string(),
+                    l.lbl_no_order.to_string(),
                     Color::WHITE,
                 ),
                 MachineState::WaitingInput => (
                     Color::srgba(1.0, 0.75, 0.25, 0.6),
-                    format!("need {} ore", RECIPE.in_qty),
+                    crate::tfmt!(l.fmt_lbl_need_ore, n = RECIPE.in_qty),
                     Color::WHITE,
                 ),
                 MachineState::WaitingWorker => (
                     Color::srgba(0.35, 0.75, 1.0, 0.6),
-                    "waiting for worker".to_string(),
+                    l.lbl_wait_worker.to_string(),
                     Color::WHITE,
                 ),
                 MachineState::Working => (
                     Color::srgba(0.35, 1.0, 0.5, 0.7),
-                    format!("working {}%", (f.progress * 100.0) as u32),
+                    crate::tfmt!(l.fmt_lbl_working, p = (f.progress * 100.0) as u32),
                     Color::srgb(0.55, 1.0, 0.65),
                 ),
                 MachineState::OutputBlocked => (
                     Color::srgba(1.0, 0.35, 0.3, 0.7),
-                    "output blocked".to_string(),
+                    l.lbl_blocked.to_string(),
                     Color::srgb(1.0, 0.5, 0.4),
                 ),
             }
@@ -1139,17 +1161,20 @@ fn sync_building_visuals_system(
         let (ring, text) = if !status.ok() {
             (
                 crate::power::PowerStatus::color(*status),
-                format!("REACTOR — {}", status.label()),
+                crate::tfmt!(
+                    l.fmt_lbl_reactor_bad,
+                    status = loc::power_status_label(*status, l)
+                ),
             )
         } else if on {
             (
                 Color::srgba(0.35, 1.0, 0.55, 0.8),
-                format!("reactor {output} PU"),
+                crate::tfmt!(l.fmt_lbl_reactor_out, out = output),
             )
         } else {
             (
                 Color::srgba(0.75, 0.75, 0.8, 0.6),
-                "reactor standby".to_string(),
+                l.lbl_reactor_standby.to_string(),
             )
         };
         if let Some(ve) = index.get(e, Role::FabRing) {
@@ -1690,6 +1715,7 @@ fn compartment_overlay_system(
     mut commands: Commands,
     map: Res<ShipMap>,
     art: Res<Art>,
+    lang: Res<Lang>,
     comps: Res<crate::airtight::Compartments>,
     overlay: Res<crate::OverlayMode>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
@@ -1764,7 +1790,8 @@ fn compartment_overlay_system(
             }
             let id = commands
                 .spawn((
-                    Text2d::new("EXPOSED TO SPACE"),
+                    Text2d::new(strings(*lang).lbl_exposed_space),
+                    RoomLabel("EXPOSED TO SPACE"),
                     TextFont {
                         font_size: 13.0,
                         ..default()
@@ -1827,6 +1854,7 @@ fn atmosphere_overlay_system(
     real: Res<Time<Real>>,
     map: Res<ShipMap>,
     art: Res<Art>,
+    lang: Res<Lang>,
     atmo: Res<crate::atmosphere::AtmosphereGrid>,
     thermal: Res<crate::thermal::ThermalGrid>,
     comps: Res<crate::airtight::Compartments>,
@@ -1901,7 +1929,8 @@ fn atmosphere_overlay_system(
             }
             let id = commands
                 .spawn((
-                    Text2d::new("VENTING TO SPACE"),
+                    Text2d::new(strings(*lang).alert_venting_space),
+                    RoomLabel("VENTING TO SPACE"),
                     TextFont {
                         font_size: 13.0,
                         ..default()
@@ -2315,6 +2344,7 @@ fn sync_selection_system(
 fn ghost_system(
     map: Res<ShipMap>,
     art: Res<Art>,
+    lang: Res<Lang>,
     cables: Res<CableGrid>,
     pipes: Res<crate::coolant::PipeGrid>,
     ducts: Res<crate::ventilation::DuctGrid>,
@@ -2329,6 +2359,7 @@ fn ghost_system(
     mut marker_q: Query<(&mut Transform, &mut Sprite, &mut Visibility), Without<Text2d>>,
     mut label_q: Query<(&mut Transform, &mut Text2d, &mut Visibility)>,
 ) {
+    let l = strings(*lang);
     let over_ui = ui
         .iter()
         .any(|i| matches!(i, Interaction::Hovered | Interaction::Pressed));
@@ -2389,18 +2420,21 @@ fn ghost_system(
                     let name = if kind == BuildingKind::Door {
                         // Show the inferred passage axis on the ghost.
                         match crate::airtight::door_axis(&map, tile) {
-                            Some(axis) => format!("Door ({})", axis.label()),
-                            None => "Door".to_string(),
+                            Some(axis) => crate::tfmt!(l.fmt_lbl_door_axis, axis = axis.label()),
+                            None => l.lbl_door.to_string(),
                         }
                     } else {
-                        d.label.to_string()
+                        loc::building_label(kind, l).to_string()
                     };
                     (
                         Color::srgba(0.4, 1.0, 0.5, 0.55),
-                        format!("{name} — {cost} part"),
+                        crate::tfmt!(l.fmt_lbl_place, name = name, cost = cost),
                     )
                 }
-                Err(e) => (Color::srgba(1.0, 0.35, 0.3, 0.55), e.label().to_string()),
+                Err(e) => (
+                    Color::srgba(1.0, 0.35, 0.3, 0.55),
+                    loc::placement_error_label(e, l).to_string(),
+                ),
             };
             let p = foot_world_pos(&foot);
             if let Ok((mut tf, mut sprite, mut vis)) = marker_q.get_mut(markers.ghost) {
@@ -2431,7 +2465,7 @@ fn ghost_system(
                 *vis = Visibility::Visible;
             }
             if let Ok((mut tf, mut text2d, mut vis)) = label_q.get_mut(markers.ghost_label) {
-                text2d.0 = "deconstruct".to_string();
+                text2d.0 = l.lbl_deconstruct.to_string();
                 tf.translation = (p + Vec2::new(0.0, 14.0)).extend(0.82);
                 *vis = Visibility::Visible;
             }

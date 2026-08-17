@@ -1,6 +1,10 @@
-# Ship Alive — Playable Slice 7 / Work Priorities & the WORK Tab
+# Ship Alive — Playable Slice 8 / Settings & Localization (中英双语)
 
-> **Slice 7 新增：环世界式工作优先级列表——WORK 面板（[Tab] 打开），
+> **Slice 8 新增：设置页面与中英双语支持——[O] 打开设置面板切换语言，
+> 全部玩家可见文本（HUD/检视面板/WORK 面板/悬停卡/房间标注/事件日志）
+> 即时切换，系统 CJK 字体自动加载，选择持久化到 settings.ini。**
+
+> **Slice 7：环世界式工作优先级列表——WORK 面板（[Tab] 打开），
 > 三类工作 × 每名船员的 H/N/L/— 优先级矩阵，点击循环改档，
 > 空闲船员即时响应，运行中的任务绝不打断。**
 
@@ -90,10 +94,20 @@ Starter Ship 里生活和工作；Slice 1 让玩家第一次真正**经营和改
   （优先级只决定"下一个"任务）；优先级档位压倒距离（High 远任务胜过
   Normal 近任务，档内才比距离）；Esc 先关面板；选中船员面板的 12 个
   优先级按钮移除，统一入口 WORK 面板
+- **Slice 8 — 设置与多语言（中/英）**：`loc.rs` 双语字符串表（编译器强制
+  两语言字段一一对应；`fmt_` 模板的 `{占位符}` 集合有单测钉死）；
+  `settings.rs` 设置面板（`O` / 顶栏 Settings [O] / Esc 关闭）——语言
+  English/中文 即点即切（`SetLang` 动作）：动态行按刷新周期跟随，静态
+  标题/按钮走 `StaticLabel` 同步系统，房间标注（Text2d）随语言重写；
+  事件日志旧条目保留原语言、新条目跟随；语言选择持久化 `settings.ini`
+  （exe 目录；`SLICE8_LANG` 强制覆盖，`LANG/LC_ALL` 含 zh 自动中文，
+  否则英文）；系统 CJK 字体自动加载（Windows msyh/simhei、Linux Noto、
+  macOS PingFang；找到即应用到全部文本——中文字体自带拉丁字形；找不到
+  则退回默认字体并在控制台提示）；autotest 控制台输出保持英文基线
 
 ```bash
 cargo run                      # 启动游戏（玩法见 PLAYTEST.md）
-cargo test                     # 193 个单元/集成测试
+cargo test                     # 202 个单元/集成测试
 SLICE0_SCENARIO=A cargo run    # Slice 0/1 验收场景（A–L、P1/P2/M）
 SLICE2_SCENARIO=A cargo run    # Slice 2 电力验收场景（A–J、PW）
 SLICE3_SCENARIO=A cargo run    # Slice 3 热能验收场景（A/B/C/E/F/R + V 截图）
@@ -105,6 +119,10 @@ SLICE7_SCENARIO=A cargo run    # Slice 7 优先级验收场景（A 专职分工 
                                # F 暂停冻结+恢复，配 SLICE0_SPEED=0）
 SLICE6_VIEW=ventilation cargo run  # 直接以 Ventilation 覆盖层启动
 SLICE7_VIEW=work cargo run     # 直接以 WORK 面板打开启动（截图/检查用）
+SLICE8_SCENARIO=A cargo run    # Slice 8 语言验收场景（A 启动状态/字体/持久化 /
+                               # B 切中文+落盘 / C 切回英文 / D 文件与活语言一致）
+SLICE8_LANG=zh cargo run       # 强制语言（覆盖 settings.ini 与探测）
+SLICE8_VIEW=settings cargo run # 直接以设置面板打开启动（截图/检查用）
 SLICE5_TOOLS=1 cargo run       # 开发者大气工具：悬停 + F5 破口 / F6 降压 / F7 恢复标准 / F8 注 CO2 / F9 注污染物
 SLICE4_DOORPIN=6,6:0.5 cargo run  # 门美术检查：钉住 (x,y) 门的开启进度/模式（[:Auto|HoldOpen|LockClosed]）
 SLICE4_DEBUG_DOOR=11,10 cargo run # 门美术检查：绕过建造规则在该格生成一扇门（可放进竖墙验证 Ew 朝向）
@@ -148,6 +166,11 @@ src/
   input.rs       选择/框选/建造工具/ghost/拆除点击/快捷键/相机
   render.rs      建筑/蓝图/机器状态可视化 + 放置 ghost + 房间标注
   ui.rs          HUD（环世界式四角浮动面板）：左上状态+事件流、右上船钟+速度+警报、左下 BUILD 分类栏、中下船员条、右下检视面板
+  loc.rs         Slice 8：Lang 资源 + 双语字符串表（EN/ZH 同字段集，编译器强制
+                 覆盖）+ 领域枚举本地化访问器 + tfmt! 运行时模板宏 + 占位符
+                 对齐单测
+  settings.rs    Slice 8：设置面板（语言切换/持久化 settings.ini）、UiFont
+                 （系统 CJK 字体探测与应用）、StaticLabel 静态文本语言同步
   worktab.rs     Slice 7：WORK 面板（优先级矩阵池、档位循环按钮、Current
                  活动行、点击列头选人、Defaults 重置、[Tab]/Esc/顶栏开关）
   ui_overlay.rs  悬停 tooltip + 框选矩形
@@ -171,6 +194,8 @@ tests/
   ventilation.rs Slice 6 通风测试（有限容积/局部性/模式语义/鼓风机压头与上限/
                  罐混合与阀门/拆除守恒/破口抽管网/拓扑缓存/独立网络/暂停与
                  倍速等价/睡眠/128×128 稳定与活跃性能）
+  localization.rs Slice 8 本地化测试（settings.ini 往返/损坏回退/文件格式/
+                 系统 CJK 字体解析（无则跳过）/关键表项双语覆盖锚点）
 tools/           截图脚本（开发用）
 assets/art/      运行时加载的 PNG（缺失时自动退化为色块占位）
 art_raw/         Codex image generation 原图（洋红底）
@@ -182,9 +207,10 @@ art_raw/         Codex image generation 原图（洋红底）
 → `assets/art/`（透明背景 256×256）。游戏启动时若文件存在则加载，
 否则用程序化色块，保证仓库在任何状态下都能跑。
 
-状态：**Slice 7（Work Priorities & the WORK Tab）完成，等待试玩反馈。**
+状态：**Slice 8（Settings & Localization）完成，等待试玩反馈。**
 交付报告：`REPORT.md` / `REPORT_0B.md` / `REPORT_1.md` / `REPORT_2.md` /
 `REPORT_PATH_8WAY.md` / `REPORT_TIME.md` / `REPORT_THERMAL.md` /
-`REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md` / `REPORT_PRIORITIES.md`；
+`REPORT_ATMOSPHERE.md` / `REPORT_VENTILATION.md` / `REPORT_PRIORITIES.md` /
+`REPORT_LOCALIZATION.md`；
 性能优化轮：`REPORT_PERF.md`；
 试玩指南：`PLAYTEST.md`；代理经验：`AGENTS.md`。

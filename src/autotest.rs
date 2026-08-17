@@ -29,6 +29,7 @@ impl Plugin for AutotestPlugin {
                 slice5_driver,
                 slice6_driver,
                 slice7_driver,
+                slice8_driver,
                 slice5_dev_tools,
                 slice4_dev_pins,
             )
@@ -4135,6 +4136,155 @@ fn slice7_driver(
                     "S7_F_RESUMED t={t:.1} tasks={:?} reserved={}",
                     task_list(&roster),
                     reserved.iter().count()
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        _ => {}
+    }
+}
+
+// =====================================================================================
+// SLICE8_SCENARIO. Settings / localization acceptance driver:
+// A (boot state: language resolution + CJK font + persistence file),
+// B (switch to Chinese: HUD chrome + WORK tab + room labels flip),
+// C (switch back to English), D (settings.ini persistence round trip).
+// =====================================================================================
+
+fn slice8_cjk_count(texts: &Query<&Text>) -> usize {
+    texts
+        .iter()
+        .map(|t| {
+            t.0.chars()
+                .filter(|c| (*c as u32) >= 0x4E00 && (*c as u32) <= 0x9FFF)
+                .count()
+        })
+        .sum()
+}
+
+fn slice8_sample(texts: &Query<&Text>, want_cjk: bool) -> String {
+    texts
+        .iter()
+        .map(|t| t.0.clone())
+        .filter(|s| s.len() > 12)
+        .find(|s| {
+            let cjk = s
+                .chars()
+                .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF);
+            cjk == want_cjk && !s.contains(|c: char| c.is_control())
+        })
+        .unwrap_or_default()
+}
+
+fn slice8_text2d_cjk(texts2d: &Query<&Text2d>) -> usize {
+    texts2d
+        .iter()
+        .map(|t| {
+            t.0.chars()
+                .filter(|c| (*c as u32) >= 0x4E00 && (*c as u32) <= 0x9FFF)
+                .count()
+        })
+        .sum()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn slice8_driver(
+    (mut actions, mut exit): (EventWriter<Action>, EventWriter<AppExit>),
+    lang: Res<crate::loc::Lang>,
+    ui_font: Res<crate::settings::UiFont>,
+    texts: Query<&Text>,
+    texts2d: Query<&Text2d>,
+    mut frame: Local<u32>,
+) {
+    let Some(scenario) = std::env::var("SLICE8_SCENARIO").ok() else {
+        return;
+    };
+    *frame += 1;
+
+    match scenario.as_str() {
+        // A - boot state: which language resolved, did the CJK font load,
+        // what does the settings file say.
+        "A" => {
+            if *frame == 30 {
+                let path = crate::settings::settings_path();
+                let file = std::fs::read_to_string(&path).unwrap_or_else(|_| "<none>".into());
+                println!(
+                    "S8_A_BOOT lang={} font={} cjk_chars_ui={} cjk_chars_world={} settings_file={} [{}]",
+                    lang.code(),
+                    if ui_font.0.is_some() { "loaded" } else { "default-only" },
+                    slice8_cjk_count(&texts),
+                    slice8_text2d_cjk(&texts2d),
+                    path.display(),
+                    file.trim(),
+                );
+            }
+            if *frame == 90 {
+                println!("S8_A_SAMPLE_EN {:?}", slice8_sample(&texts, false));
+                exit.write(AppExit::Success);
+            }
+        }
+        // B - switch to Chinese mid-run: chrome, room labels and new log
+        // entries all flip; old log entries keep their language.
+        "B" => {
+            if *frame == 20 {
+                println!(
+                    "S8_B_PRE lang={} cjk={}",
+                    lang.code(),
+                    slice8_cjk_count(&texts)
+                );
+                let _ = actions.write(Action::SetLang {
+                    to: crate::loc::Lang::Zh,
+                });
+                let _ = actions.write(Action::MarkAll);
+            }
+            if *frame == 150 {
+                println!(
+                    "S8_B_POST cjk_chars_ui={} cjk_chars_world={} sample={:?}",
+                    slice8_cjk_count(&texts),
+                    slice8_text2d_cjk(&texts2d),
+                    slice8_sample(&texts, true)
+                );
+                let path = crate::settings::settings_path();
+                let file = std::fs::read_to_string(&path).unwrap_or_else(|_| "<none>".into());
+                println!("S8_B_PERSIST file=[{}]", file.trim());
+                exit.write(AppExit::Success);
+            }
+        }
+        // C - switch back to English (proves toggling is not one-way).
+        "C" => {
+            if *frame == 20 {
+                let _ = actions.write(Action::SetLang {
+                    to: crate::loc::Lang::Zh,
+                });
+            }
+            if *frame == 60 {
+                let mid = slice8_cjk_count(&texts);
+                let _ = actions.write(Action::SetLang {
+                    to: crate::loc::Lang::En,
+                });
+                println!("S8_C_MID zh_cjk={mid}");
+            }
+            if *frame == 140 {
+                println!(
+                    "S8_C_BACK lang={} cjk={} sample={:?}",
+                    lang.code(),
+                    slice8_cjk_count(&texts),
+                    slice8_sample(&texts, false)
+                );
+                exit.write(AppExit::Success);
+            }
+        }
+        // D - no scenario action: the persistence round trip itself is unit
+        // tested; here we just confirm the file matches the live language.
+        "D" => {
+            if *frame == 30 {
+                let path = crate::settings::settings_path();
+                let file = std::fs::read_to_string(&path).unwrap_or_else(|_| "<none>".into());
+                println!(
+                    "S8_D live={} file=[{}] match={}",
+                    lang.code(),
+                    file.trim(),
+                    file.trim().ends_with(lang.code())
                 );
                 exit.write(AppExit::Success);
             }

@@ -6,6 +6,7 @@
 //! speed.
 
 use crate::jobs::Action;
+use crate::loc::{self, strings, Lang};
 use crate::log::{EventLog, LogKind};
 use crate::simtime::{speed_label, SPEED_SCALES};
 use bevy::prelude::*;
@@ -66,11 +67,13 @@ fn speed_keys_system(keys: Res<ButtonInput<KeyCode>>, mut actions: EventWriter<A
 /// TogglePause (Space) flips between Pause and that remembered speed.
 pub fn speed_action_system(
     mut events: EventReader<Action>,
+    lang: Res<Lang>,
     mut speed: ResMut<GameSpeed>,
     mut log: ResMut<EventLog>,
     clock: Res<crate::simtime::SimClock>,
 ) {
     let now = clock.now();
+    let l = strings(*lang);
     for action in events.read() {
         match *action {
             Action::SetSpeed { index } => {
@@ -87,7 +90,14 @@ pub fn speed_action_system(
                     speed.index = index;
                     speed.last_nonzero = index;
                 }
-                log.push(now, LogKind::Info, format!("Speed: {}", speed.label()));
+                log.push(
+                    now,
+                    LogKind::Info,
+                    crate::tfmt!(
+                        l.fmt_speed_set,
+                        label = loc::speed_label_loc(speed.index, l)
+                    ),
+                );
             }
             Action::TogglePause => {
                 if speed.index == 0 {
@@ -95,7 +105,14 @@ pub fn speed_action_system(
                 } else {
                     speed.index = 0;
                 }
-                log.push(now, LogKind::Info, format!("Speed: {}", speed.label()));
+                log.push(
+                    now,
+                    LogKind::Info,
+                    crate::tfmt!(
+                        l.fmt_speed_set,
+                        label = loc::speed_label_loc(speed.index, l)
+                    ),
+                );
             }
             _ => {}
         }

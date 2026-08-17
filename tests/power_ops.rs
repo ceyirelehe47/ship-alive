@@ -75,6 +75,7 @@ impl Harness {
         let (w, h) = (map.width, map.height);
         world.insert_resource(map);
         world.insert_resource(EventLog::default());
+        world.insert_resource(ship_alive::loc::Lang::default());
         world.insert_resource(ship_alive::stats::Stats::default());
         world.insert_resource(CableGrid::new(w, h));
         world.insert_resource(ship_alive::coolant::PipeGrid::new(w, h));
